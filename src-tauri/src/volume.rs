@@ -4,12 +4,16 @@
 //! does not exist is treated as "not mounted", which is the normal state for a
 //! root on an external drive that is unplugged.
 //!
-//! TODO(M5): also read the volume UUID (`diskutil info -plist`) so a renamed or
-//! remounted drive keeps its `[[volume]]` override. M2 matches by mount point only.
+//! Each volume's UUID comes from `diskutil info -plist`, so a `[[volume]]`
+//! override can follow a drive that is renamed or mounted somewhere else.
 
+use std::collections::HashMap;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::disk;
 
@@ -33,6 +37,8 @@ pub struct Volume {
     pub mount: PathBuf,
     pub name: String,
     pub roots: Vec<PathBuf>,
+    /// Filled by `attach_uuids`; `None` if diskutil could not say.
+    pub uuid: Option<String>,
 }
 
 /// A root that cannot be checked right now, with a short reason for the menu.
@@ -80,6 +86,7 @@ pub fn map_roots(roots: &[PathBuf], locate: impl Fn(&Path) -> Location) -> Volum
                         name: display_name(&mount),
                         mount,
                         roots: vec![root.clone()],
+                        uuid: None,
                     });
                 }
             }
@@ -99,6 +106,80 @@ pub fn map_roots(roots: &[PathBuf], locate: impl Fn(&Path) -> Location) -> Volum
         }
     }
     map
+}
+
+const DISKUTIL: &str = "/usr/sbin/diskutil";
+const DISKUTIL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Remembers volume UUIDs. `diskutil` takes about 0.4 s per call, too slow for
+/// every poll. The key includes `st_dev`, which changes when a different drive
+/// is mounted at the same path, so a stale entry is never reused.
+#[derive(Default)]
+pub struct UuidCache {
+    known: Mutex<HashMap<(u64, PathBuf), Option<String>>>,
+}
+
+impl UuidCache {
+    fn get_or_read(&self, dev: u64, mount: &Path) -> Option<String> {
+        let key = (dev, mount.to_path_buf());
+        if let Some(hit) = self.lock().get(&key) {
+            return hit.clone();
+        }
+        let uuid = read_uuid(mount);
+        self.lock().insert(key, uuid.clone());
+        uuid
+    }
+
+    // A poisoned lock only means another thread panicked mid-insert; the map is
+    // still a valid cache.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(u64, PathBuf), Option<String>>> {
+        self.known.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// Fills in each volume's UUID, from the cache when possible.
+pub fn attach_uuids(volumes: &mut [Volume], cache: &UuidCache) {
+    for v in volumes {
+        v.uuid = cache.get_or_read(v.dev, &v.mount);
+    }
+}
+
+fn read_uuid(mount: &Path) -> Option<String> {
+    let mut cmd = Command::new(DISKUTIL);
+    cmd.args(["info", "-plist"]).arg(mount);
+    match crate::proc::run(cmd, DISKUTIL_TIMEOUT, 1024 * 1024) {
+        Ok(out) if out.success() => {
+            let uuid = parse_volume_uuid(&out.stdout);
+            if uuid.is_none() {
+                log::warn!("diskutil gave no VolumeUUID for {}", mount.display());
+            }
+            uuid
+        }
+        Ok(out) => {
+            log::warn!(
+                "diskutil info {} failed: {}",
+                mount.display(),
+                out.failure_summary(DISKUTIL_TIMEOUT)
+            );
+            None
+        }
+        Err(e) => {
+            log::warn!("running {DISKUTIL} failed: {e}");
+            None
+        }
+    }
+}
+
+/// Pulls `VolumeUUID` out of `diskutil info -plist` XML.
+fn parse_volume_uuid(plist: &str) -> Option<String> {
+    let after_key = plist.split("<key>VolumeUUID</key>").nth(1)?;
+    let value = after_key
+        .trim_start()
+        .strip_prefix("<string>")?
+        .split("</string>")
+        .next()?
+        .trim();
+    (!value.is_empty()).then(|| value.to_ascii_uppercase())
 }
 
 /// A short name for the menu. The startup disk is mounted at `/` or, for the
@@ -181,6 +262,36 @@ mod tests {
         let roots = vec![PathBuf::from("/secret")];
         let map = map_roots(&roots, |_| Location::Unreadable("denied".into()));
         assert_eq!(map.unavailable[0].reason, "unreadable, see log");
+    }
+
+    #[test]
+    fn parses_volume_uuid_from_plist() {
+        let plist = "<dict>\n\t<key>VolumeName</key>\n\t<string>Data</string>\n\t<key>VolumeUUID</key>\n\t<string>fb353fa3-3bed-4846-a56f-58de36374c7f</string>\n</dict>";
+        assert_eq!(
+            parse_volume_uuid(plist).as_deref(),
+            Some("FB353FA3-3BED-4846-A56F-58DE36374C7F")
+        );
+        assert_eq!(parse_volume_uuid("<dict></dict>"), None);
+        assert_eq!(
+            parse_volume_uuid("<key>VolumeUUID</key><string></string>"),
+            None
+        );
+    }
+
+    #[test]
+    fn real_root_volume_has_a_cached_uuid() {
+        let mut vols = map_roots(&[PathBuf::from("/")], locate).volumes;
+        let cache = UuidCache::default();
+        attach_uuids(&mut vols, &cache);
+        let uuid = vols[0]
+            .uuid
+            .clone()
+            .expect("diskutil should report a UUID for /");
+        assert_eq!(uuid.len(), 36);
+        // A second lookup comes from the cache and agrees.
+        attach_uuids(&mut vols, &cache);
+        assert_eq!(vols[0].uuid.as_deref(), Some(uuid.as_str()));
+        assert_eq!(cache.lock().len(), 1);
     }
 
     #[test]

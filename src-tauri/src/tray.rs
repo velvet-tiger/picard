@@ -113,6 +113,7 @@ mod tests {
             mount: PathBuf::from("/"),
             name: name.to_string(),
             roots: vec![],
+            uuid: None,
         }
     }
 

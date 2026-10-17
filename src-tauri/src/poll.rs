@@ -21,7 +21,7 @@ use crate::monitor::{self, States};
 use crate::runner::{self, DataPaths};
 use crate::tasks::SizeCache;
 use crate::tray::{MenuView, Tray};
-use crate::volume::{self, UnavailableRoot, Volume};
+use crate::volume::{self, UnavailableRoot, UuidCache, Volume};
 
 /// Why the loop woke up early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,8 +102,9 @@ struct Scan {
 }
 
 /// Maps roots to volumes and reads each volume's free space. Blocking I/O.
-fn scan(roots: &[PathBuf]) -> Scan {
-    let map = volume::map_roots(roots, volume::locate);
+fn scan(roots: &[PathBuf], uuids: &UuidCache) -> Scan {
+    let mut map = volume::map_roots(roots, volume::locate);
+    volume::attach_uuids(&mut map.volumes, uuids);
     let mut unavailable = map.unavailable;
     let mut readings = Vec::new();
     for v in map.volumes {
@@ -136,6 +137,7 @@ pub struct Poller<R: Runtime> {
     config_error: bool,
     states: States,
     sizes: Arc<SizeCache>,
+    uuids: Arc<UuidCache>,
     /// Resolved once when the loop starts; asking the login shell takes about a second.
     tools: Option<Arc<ToolEnv>>,
 }
@@ -151,6 +153,7 @@ impl<R: Runtime> Poller<R> {
             config_error: false,
             states: States::new(),
             sizes: Arc::new(SizeCache::default()),
+            uuids: Arc::new(UuidCache::default()),
             tools: None,
         }
     }
@@ -266,7 +269,8 @@ impl<R: Runtime> Poller<R> {
 
     async fn scan_volumes(&self, config: &Config) -> Option<Scan> {
         let roots = config.roots.clone();
-        match tauri::async_runtime::spawn_blocking(move || scan(&roots)).await {
+        let uuids = Arc::clone(&self.uuids);
+        match tauri::async_runtime::spawn_blocking(move || scan(&roots, &uuids)).await {
             Ok(s) => Some(s),
             Err(e) => {
                 log::error!("disk scan task failed: {e}");
@@ -363,10 +367,13 @@ mod tests {
 
     #[test]
     fn scan_reports_missing_root_as_not_mounted() {
-        let s = scan(&[
-            std::env::temp_dir(),
-            PathBuf::from("/Volumes/picard-no-such-drive/x"),
-        ]);
+        let s = scan(
+            &[
+                std::env::temp_dir(),
+                PathBuf::from("/Volumes/picard-no-such-drive/x"),
+            ],
+            &UuidCache::default(),
+        );
         assert_eq!(s.readings.len(), 1);
         assert_eq!(s.unavailable.len(), 1);
         assert_eq!(s.unavailable[0].name, "picard-no-such-drive");

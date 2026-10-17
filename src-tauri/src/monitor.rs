@@ -110,7 +110,9 @@ pub fn evaluate(
     let mut alerts = Vec::new();
     for (volume, space) in readings {
         let policy = Policy {
-            threshold_bytes: config.threshold_for(&volume.mount).bytes(space.total_bytes),
+            threshold_bytes: config
+                .threshold_for(&volume.mount, volume.uuid.as_deref())
+                .bytes(space.total_bytes),
             margin_bytes: config.recover_margin_bytes,
             cooldown: Duration::from_secs(config.cooldown_minutes.saturating_mul(60)),
             mode: config.mode,
@@ -220,6 +222,7 @@ mod tests {
             mount: PathBuf::from(mount),
             name: name.to_string(),
             roots: vec![],
+            uuid: None,
         }
     }
 

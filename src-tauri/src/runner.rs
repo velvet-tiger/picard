@@ -190,7 +190,7 @@ pub fn clean_volume(
     let _lock = RunLock::acquire(&paths.lock)?;
     let space = disk::query(&volume.mount)?;
     let target_free = config
-        .threshold_for(&volume.mount)
+        .threshold_for(&volume.mount, volume.uuid.as_deref())
         .bytes(space.total_bytes)
         .saturating_add(config.recover_margin_bytes);
     let exclude = tasks::build_exclude(&config.exclude)?;

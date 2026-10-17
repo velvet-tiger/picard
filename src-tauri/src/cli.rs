@@ -113,7 +113,8 @@ fn load(config_path: Option<PathBuf>) -> Result<(Config, PathBuf, ToolEnv)> {
 
 /// Volumes holding roots, with their current free space. Prints the ones it skips.
 fn mounted_volumes(config: &Config) -> Vec<(Volume, DiskSpace)> {
-    let map = volume::map_roots(&config.roots, volume::locate);
+    let mut map = volume::map_roots(&config.roots, volume::locate);
+    volume::attach_uuids(&mut map.volumes, &volume::UuidCache::default());
     for u in &map.unavailable {
         println!("{}: {} ({})", u.name, u.reason, u.root.display());
     }

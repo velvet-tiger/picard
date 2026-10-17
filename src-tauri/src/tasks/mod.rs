@@ -318,6 +318,7 @@ pub(crate) mod test_support {
                 mount: PathBuf::from("/"),
                 name: "test".into(),
                 roots: vec![self.root.clone()],
+                uuid: None,
             };
             Ctx::for_volume(&volume, &self.exclude, SystemTime::now(), &self.sizes)
         }

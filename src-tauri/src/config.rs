@@ -151,8 +151,27 @@ impl ToolOverrides {
 /// A per-volume threshold override, matched by mount point.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VolumeOverride {
-    pub mount: PathBuf,
+    pub mount: Option<PathBuf>,
+    /// Upper-case volume UUID, as `diskutil info` prints it.
+    pub uuid: Option<String>,
     pub threshold: Threshold,
+}
+
+impl VolumeOverride {
+    /// Whether this override applies to the volume at `mount` with `uuid`.
+    ///
+    /// When both sides know a UUID, it decides: a different drive mounted at
+    /// the same path does not match, and a renamed drive still does. Otherwise
+    /// the mount point decides, treating `/` and the APFS Data volume as one.
+    fn matches(&self, mount: &Path, uuid: Option<&str>) -> bool {
+        if let (Some(mine), Some(theirs)) = (&self.uuid, uuid) {
+            return mine.eq_ignore_ascii_case(theirs);
+        }
+        let is_startup = |p: &Path| p == Path::new("/") || p == Path::new(STARTUP_DATA_MOUNT);
+        self.mount
+            .as_deref()
+            .is_some_and(|m| m == mount || (is_startup(m) && is_startup(mount)))
+    }
 }
 
 /// How `cargo_clean` chooses what to clean.
@@ -250,11 +269,10 @@ impl Config {
     /// `/System/Volumes/Data`, but users think of the startup disk as `/`. Both
     /// share one container and report the same free space, so an override for
     /// `/` also applies to the Data volume.
-    pub fn threshold_for(&self, mount: &Path) -> Threshold {
-        let is_startup = |p: &Path| p == Path::new("/") || p == Path::new(STARTUP_DATA_MOUNT);
+    pub fn threshold_for(&self, mount: &Path, uuid: Option<&str>) -> Threshold {
         self.volumes
             .iter()
-            .find(|v| v.mount == mount || (is_startup(&v.mount) && is_startup(mount)))
+            .find(|v| v.matches(mount, uuid))
             .map_or(self.threshold, |v| v.threshold)
     }
 }
@@ -292,7 +310,8 @@ struct RawTools {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVolume {
-    mount: String,
+    mount: Option<String>,
+    uuid: Option<String>,
     min_free_gb: Option<f64>,
     min_free_pct: Option<f64>,
 }
@@ -367,11 +386,46 @@ fn parse_tools(raw: &RawTools, home: &Path) -> Result<ToolOverrides> {
 }
 
 fn parse_volume(v: &RawVolume, home: &Path) -> Result<VolumeOverride> {
-    let scope = format!("[[volume]] {}", v.mount);
+    let label = v
+        .mount
+        .as_deref()
+        .or(v.uuid.as_deref())
+        .unwrap_or("(no mount or uuid)");
+    let scope = format!("[[volume]] {label}");
+    if v.mount.is_none() && v.uuid.is_none() {
+        bail!("{scope}: set mount, uuid, or both");
+    }
     let threshold = Threshold::from_keys(v.min_free_gb, v.min_free_pct, &scope)?
         .with_context(|| format!("{scope}: set min_free_gb or min_free_pct"))?;
-    let mount = expand_path(&v.mount, home).with_context(|| format!("{scope}: mount"))?;
-    Ok(VolumeOverride { mount, threshold })
+    let mount = v
+        .mount
+        .as_deref()
+        .map(|m| expand_path(m, home).with_context(|| format!("{scope}: mount")))
+        .transpose()?;
+    let uuid = v
+        .uuid
+        .as_deref()
+        .map(|u| parse_uuid(u).with_context(|| format!("{scope}: uuid")))
+        .transpose()?;
+    Ok(VolumeOverride {
+        mount,
+        uuid,
+        threshold,
+    })
+}
+
+/// Accepts a UUID in the 8-4-4-4-12 form and returns it upper-cased.
+fn parse_uuid(raw: &str) -> Result<String> {
+    let groups: Vec<&str> = raw.trim().split('-').collect();
+    let well_formed = groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(g, len)| g.len() == len && g.chars().all(|c| c.is_ascii_hexdigit()));
+    if !well_formed {
+        bail!("{raw:?} is not a UUID like 2628355E-9A10-43A3-A8F9-B992912277BA");
+    }
+    Ok(raw.trim().to_ascii_uppercase())
 }
 
 /// Expands a leading `~` and requires the result to be absolute.
@@ -519,10 +573,10 @@ mod tests {
             "min_free_gb = 30\nroots = [\"/a\"]\n[[volume]]\nmount = \"/Volumes/Projects\"\nmin_free_pct = 5\n",
         );
         assert_eq!(
-            c.threshold_for(Path::new("/Volumes/Projects")),
+            c.threshold_for(Path::new("/Volumes/Projects"), None),
             Threshold::Pct(5.0)
         );
-        assert_eq!(c.threshold_for(Path::new("/")), Threshold::Gb(30.0));
+        assert_eq!(c.threshold_for(Path::new("/"), None), Threshold::Gb(30.0));
     }
 
     #[test]
@@ -531,11 +585,11 @@ mod tests {
             "min_free_gb = 30\nroots = [\"/a\"]\n[[volume]]\nmount = \"/\"\nmin_free_gb = 5\n",
         );
         assert_eq!(
-            c.threshold_for(Path::new("/System/Volumes/Data")),
+            c.threshold_for(Path::new("/System/Volumes/Data"), None),
             Threshold::Gb(5.0)
         );
         assert_eq!(
-            c.threshold_for(Path::new("/Volumes/X")),
+            c.threshold_for(Path::new("/Volumes/X"), None),
             Threshold::Gb(30.0)
         );
     }
@@ -636,6 +690,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn uuid_override_follows_the_drive_not_the_path() {
+        let c = parse_ok(
+            "min_free_gb = 30\nroots = [\"/a\"]\n[[volume]]\nmount = \"/Volumes/P\"\nuuid = \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"\nmin_free_pct = 5\n",
+        );
+        let ours = Some("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE");
+        let other = Some("11111111-2222-3333-4444-555555555555");
+        // Renamed drive: new mount, same UUID.
+        assert_eq!(
+            c.threshold_for(Path::new("/Volumes/Renamed"), ours),
+            Threshold::Pct(5.0)
+        );
+        // A different drive at the old mount point.
+        assert_eq!(
+            c.threshold_for(Path::new("/Volumes/P"), other),
+            Threshold::Gb(30.0)
+        );
+        // UUID unknown: fall back to the mount point.
+        assert_eq!(
+            c.threshold_for(Path::new("/Volumes/P"), None),
+            Threshold::Pct(5.0)
+        );
+    }
+
+    #[test]
+    fn uuid_only_override_and_bad_uuid() {
+        let c = parse_ok(
+            "min_free_gb = 30\nroots = [\"/a\"]\n[[volume]]\nuuid = \"AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE\"\nmin_free_gb = 2\n",
+        );
+        assert_eq!(
+            c.threshold_for(Path::new("/Volumes/P"), None),
+            Threshold::Gb(30.0)
+        );
+        assert_eq!(
+            c.threshold_for(
+                Path::new("/Volumes/P"),
+                Some("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")
+            ),
+            Threshold::Gb(2.0)
+        );
+        assert!(
+            parse_err(
+                "min_free_gb = 1\nroots = [\"/a\"]\n[[volume]]\nuuid = \"nope\"\nmin_free_gb = 1\n"
+            )
+            .contains("not a UUID")
+        );
+        assert!(
+            parse_err("min_free_gb = 1\nroots = [\"/a\"]\n[[volume]]\nmin_free_gb = 1\n")
+                .contains("mount, uuid")
+        );
     }
 
     #[test]
