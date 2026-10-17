@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use globset::Glob;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Written on first launch when no config file exists.
 pub const DEFAULT_TOML: &str = r#"# Picard config. Picard reloads this file when it changes.
@@ -146,7 +146,7 @@ pub fn config_path(home: &Path) -> PathBuf {
 }
 
 /// What Picard does when a volume runs low.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Run the tasks, then report what was freed.
@@ -242,7 +242,7 @@ impl VolumeOverride {
 }
 
 /// How `cargo_clean` chooses what to clean.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CargoMode {
     /// Only projects whose sources have not changed in `stale_days`.
@@ -252,7 +252,7 @@ pub enum CargoMode {
 }
 
 /// One `[[task]]` entry. Tasks run in the order listed.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskConfig {
     GitWorktrees {
@@ -281,6 +281,7 @@ pub enum TaskConfig {
         mode: CargoMode,
         #[serde(default = "default_worktree_stale_days")]
         stale_days: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         depth: Option<u32>,
     },
     Command {

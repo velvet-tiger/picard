@@ -96,13 +96,13 @@ pub fn start_watchers(config_path: &Path, tx: mpsc::Sender<Wake>) -> Result<Reco
 }
 
 /// Everything one check found.
-struct Scan {
-    readings: Vec<(Volume, DiskSpace)>,
-    unavailable: Vec<UnavailableRoot>,
+pub(crate) struct Scan {
+    pub(crate) readings: Vec<(Volume, DiskSpace)>,
+    pub(crate) unavailable: Vec<UnavailableRoot>,
 }
 
 /// Maps roots to volumes and reads each volume's free space. Blocking I/O.
-fn scan(roots: &[PathBuf], uuids: &UuidCache) -> Scan {
+pub(crate) fn scan(roots: &[PathBuf], uuids: &UuidCache) -> Scan {
     let mut map = volume::map_roots(roots, volume::locate);
     volume::attach_uuids(&mut map.volumes, uuids);
     let mut unavailable = map.unavailable;

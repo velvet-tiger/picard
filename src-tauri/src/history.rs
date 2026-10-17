@@ -10,9 +10,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub time: DateTime<Utc>,
     pub task: String,
@@ -43,6 +43,30 @@ pub fn append(log_path: &Path, entries: &[Entry]) -> Result<()> {
         .with_context(|| format!("writing {}", log_path.display()))
 }
 
+/// The newest `limit` entries, newest first. A missing log means nothing has
+/// been removed yet, so it reads as empty. Lines that do not parse are skipped
+/// and logged rather than hiding the rest of the history.
+pub fn read_recent(log_path: &Path, limit: usize) -> Result<Vec<Entry>> {
+    let text = match std::fs::read_to_string(log_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", log_path.display())),
+    };
+    Ok(text
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| match serde_json::from_str(l) {
+            Ok(e) => Some(e),
+            Err(err) => {
+                log::warn!("skipping unreadable history line: {err}");
+                None
+            }
+        })
+        .take(limit)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +81,23 @@ mod tests {
             path: path.into(),
             bytes: 42,
         }
+    }
+
+    #[test]
+    fn reads_recent_entries_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("history.jsonl");
+        assert!(read_recent(&log, 5).unwrap().is_empty());
+        append(&log, &[entry("/a"), entry("/b"), entry("/c")]).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"not json\n")
+            .unwrap();
+        let recent = read_recent(&log, 2).unwrap();
+        let paths: Vec<_> = recent.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["/c", "/b"]);
     }
 
     #[test]

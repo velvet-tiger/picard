@@ -1,0 +1,420 @@
+//! Commands the Settings and Preview windows call.
+//!
+//! These are thin: the work lives in `runner`, `settings` and `poll::scan`,
+//! which are tested on their own. Blocking work runs on blocking threads.
+//! Errors go back to the window as text, because that is what it shows.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use tauri::State;
+
+use crate::config::{self, Config, Mode};
+use crate::disk::{self, DiskSpace};
+use crate::history::{self, Entry};
+use crate::poll;
+use crate::runner::{self, TaskScan, VolumeRun};
+use crate::settings::{self, Settings};
+use crate::state::Shared;
+use crate::volume::Volume;
+
+type SharedState<'a> = State<'a, Arc<Shared>>;
+
+const STILL_STARTING: &str = "Picard is still starting up. Try again in a moment.";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VolumeStatus {
+    pub name: String,
+    pub mount: String,
+    pub free_text: String,
+    pub low: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Status {
+    pub mode: Mode,
+    pub volumes: Vec<VolumeStatus>,
+    /// "Projects: not mounted", one per unavailable root.
+    pub unavailable: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewItem {
+    pub path: String,
+    pub bytes: u64,
+    pub size_text: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewTask {
+    pub task: String,
+    pub items: Vec<PreviewItem>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VolumePreview {
+    pub name: String,
+    pub mount: String,
+    pub free_text: String,
+    pub tasks: Vec<PreviewTask>,
+    pub total_bytes: u64,
+    pub total_text: String,
+}
+
+/// Paths the user ticked on one volume.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Selection {
+    pub mount: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunItem {
+    pub task: String,
+    pub path: String,
+    pub size_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunFailure {
+    pub task: String,
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunResult {
+    pub name: String,
+    pub freed_text: String,
+    pub removed: Vec<RunItem>,
+    pub failed: Vec<RunFailure>,
+    pub stopped: Option<String>,
+    /// Set when the whole volume could not be cleaned, for example because
+    /// another cleanup was already running.
+    pub error: Option<String>,
+}
+
+fn err(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
+fn load_config(shared: &Shared) -> Result<Config, String> {
+    config::load(&shared.config_path, &shared.home).map_err(|e| format!("{e:#}"))
+}
+
+/// Runs blocking work off the async runtime.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("background task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn get_status(state: SharedState<'_>) -> Result<Status, String> {
+    let shared = Arc::clone(&state);
+    blocking(move || {
+        let config = load_config(&shared)?;
+        let found = poll::scan(&config.roots, &shared.uuids);
+        Ok(status_view(&config, &found.readings, &found.unavailable))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_settings(state: SharedState<'_>) -> Result<Settings, String> {
+    let shared = Arc::clone(&state);
+    blocking(move || {
+        let text = read_config_text(&shared)?;
+        settings::read(&text, &shared.home).map_err(|e| format!("{e:#}"))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn save_settings(state: SharedState<'_>, settings: Settings) -> Result<(), String> {
+    let shared = Arc::clone(&state);
+    blocking(move || {
+        let text = read_config_text(&shared)?;
+        let updated =
+            settings::apply(&text, &settings, &shared.home).map_err(|e| format!("{e:#}"))?;
+        settings::write_private(&shared.config_path, &updated).map_err(|e| format!("{e:#}"))?;
+        log::info!("settings saved to {}", shared.config_path.display());
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn preview(state: SharedState<'_>) -> Result<Vec<VolumePreview>, String> {
+    let shared = Arc::clone(&state);
+    blocking(move || {
+        let config = load_config(&shared)?;
+        let tools = shared.tools().ok_or(STILL_STARTING)?;
+        let found = poll::scan(&config.roots, &shared.uuids);
+        let mut out = Vec::new();
+        for (volume, space) in &found.readings {
+            let scans = runner::preview_volume(&config, volume, &shared.sizes, &tools)
+                .map_err(|e| format!("{}: {e:#}", volume.name))?;
+            out.push(preview_view(volume, *space, &scans));
+        }
+        Ok(out)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn run_selected(
+    state: SharedState<'_>,
+    selections: Vec<Selection>,
+) -> Result<Vec<RunResult>, String> {
+    let shared = Arc::clone(&state);
+    blocking(move || {
+        let config = load_config(&shared)?;
+        let tools = shared.tools().ok_or(STILL_STARTING)?;
+        let found = poll::scan(&config.roots, &shared.uuids);
+        let mut out = Vec::new();
+        for selection in selections {
+            let Some((volume, _)) = found
+                .readings
+                .iter()
+                .find(|(v, _)| v.mount.to_string_lossy() == selection.mount)
+            else {
+                return Err(format!("{} is no longer mounted", selection.mount));
+            };
+            let chosen: HashSet<PathBuf> = selection.paths.iter().map(PathBuf::from).collect();
+            let result = runner::clean_volume(
+                &config,
+                volume,
+                &shared.sizes,
+                &shared.paths,
+                &tools,
+                Some(chosen),
+            );
+            out.push(run_view(&volume.name, result.map_err(|e| format!("{e:#}"))));
+        }
+        Ok(out)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_history(state: SharedState<'_>, limit: usize) -> Result<Vec<Entry>, String> {
+    let shared = Arc::clone(&state);
+    blocking(move || history::read_recent(&shared.paths.history, limit.min(500)).map_err(err)).await
+}
+
+/// Reads the config file through the same privacy check `config::load` uses.
+fn read_config_text(shared: &Shared) -> Result<String, String> {
+    use std::io::Read;
+    let mut file = config::open_private(&shared.config_path)
+        .map_err(|why| format!("not using {}: {why}", shared.config_path.display()))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(err)?;
+    Ok(text)
+}
+
+fn status_view(
+    config: &Config,
+    readings: &[(Volume, DiskSpace)],
+    unavailable: &[crate::volume::UnavailableRoot],
+) -> Status {
+    Status {
+        mode: config.mode,
+        volumes: readings
+            .iter()
+            .map(|(v, space)| VolumeStatus {
+                name: v.name.clone(),
+                mount: v.mount.display().to_string(),
+                free_text: disk::format_free(*space),
+                low: space.free_bytes
+                    < config
+                        .threshold_for(&v.mount, v.uuid.as_deref())
+                        .bytes(space.total_bytes),
+            })
+            .collect(),
+        unavailable: unavailable
+            .iter()
+            .map(|u| format!("{}: {}", u.name, u.reason))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn preview_view(volume: &Volume, space: DiskSpace, scans: &[TaskScan]) -> VolumePreview {
+    let tasks: Vec<PreviewTask> = scans
+        .iter()
+        .map(|s| match &s.result {
+            Ok(cands) => PreviewTask {
+                task: s.task.to_string(),
+                items: cands
+                    .iter()
+                    .map(|c| PreviewItem {
+                        path: c.path.display().to_string(),
+                        bytes: c.bytes,
+                        size_text: disk::format_bytes(c.bytes),
+                        reason: c.reason.clone(),
+                    })
+                    .collect(),
+                error: None,
+            },
+            Err(e) => PreviewTask {
+                task: s.task.to_string(),
+                items: Vec::new(),
+                error: Some(e.clone()),
+            },
+        })
+        .collect();
+    let total_bytes = tasks.iter().flat_map(|t| &t.items).map(|i| i.bytes).sum();
+    VolumePreview {
+        name: volume.name.clone(),
+        mount: volume.mount.display().to_string(),
+        free_text: disk::format_free(space),
+        tasks,
+        total_bytes,
+        total_text: disk::format_bytes(total_bytes),
+    }
+}
+
+fn run_view(name: &str, result: Result<VolumeRun, String>) -> RunResult {
+    match result {
+        Ok(run) => RunResult {
+            name: name.to_string(),
+            freed_text: disk::format_bytes(run.freed_bytes()),
+            removed: run
+                .removed
+                .iter()
+                .map(|(task, r)| RunItem {
+                    task: task.to_string(),
+                    path: r.path.display().to_string(),
+                    size_text: disk::format_bytes(r.bytes),
+                })
+                .collect(),
+            failed: run
+                .failed
+                .iter()
+                .map(|(task, path, why)| RunFailure {
+                    task: task.to_string(),
+                    path: path.display().to_string(),
+                    reason: why.clone(),
+                })
+                .collect(),
+            stopped: run.stopped,
+            error: None,
+        },
+        Err(e) => RunResult {
+            name: name.to_string(),
+            freed_text: disk::format_bytes(0),
+            removed: Vec::new(),
+            failed: Vec::new(),
+            stopped: None,
+            error: Some(e),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::{Candidate, Removed};
+
+    fn volume() -> Volume {
+        Volume {
+            dev: 1,
+            mount: PathBuf::from("/System/Volumes/Data"),
+            name: "Startup disk".into(),
+            roots: vec![],
+            uuid: None,
+        }
+    }
+
+    const SPACE: DiskSpace = DiskSpace {
+        free_bytes: 20_000_000_000,
+        total_bytes: 994_000_000_000,
+    };
+
+    #[test]
+    fn preview_groups_by_task_with_total_and_errors() {
+        let scans = vec![
+            TaskScan {
+                task: "node_modules",
+                result: Ok(vec![
+                    Candidate {
+                        path: PathBuf::from("/w/a/node_modules"),
+                        bytes: 2_000_000_000,
+                        reason: "untouched for 40 days".into(),
+                    },
+                    Candidate {
+                        path: PathBuf::from("/w/b/node_modules"),
+                        bytes: 500_000_000,
+                        reason: "untouched for 31 days".into(),
+                    },
+                ]),
+            },
+            TaskScan {
+                task: "git_worktrees",
+                result: Err("lsof broke".into()),
+            },
+        ];
+        let view = preview_view(&volume(), SPACE, &scans);
+        assert_eq!(view.total_bytes, 2_500_000_000);
+        assert_eq!(view.total_text, "2.5 GB");
+        assert_eq!(view.free_text, "20 GB free (2%)");
+        assert_eq!(view.tasks[0].items[1].size_text, "500 MB");
+        assert_eq!(view.tasks[1].error.as_deref(), Some("lsof broke"));
+    }
+
+    #[test]
+    fn run_view_reports_success_and_whole_volume_errors() {
+        let run = VolumeRun {
+            removed: vec![(
+                "node_modules",
+                Removed {
+                    path: PathBuf::from("/w/a/node_modules"),
+                    bytes: 2_000_000_000,
+                },
+            )],
+            failed: vec![(
+                "git_worktrees",
+                PathBuf::from("/w/r/wt"),
+                "now in use".into(),
+            )],
+            stopped: None,
+        };
+        let ok = run_view("Startup disk", Ok(run));
+        assert_eq!(ok.freed_text, "2.0 GB");
+        assert_eq!(ok.failed[0].reason, "now in use");
+        let failed = run_view(
+            "Startup disk",
+            Err("another cleanup is already running".into()),
+        );
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("another cleanup is already running")
+        );
+    }
+
+    #[test]
+    fn status_marks_low_volumes_and_dedupes_unavailable() {
+        let config = config::parse(
+            "min_free_gb = 30\nroots = [\"/a\"]\n",
+            std::path::Path::new("/u"),
+        )
+        .unwrap();
+        let un = |root: &str| crate::volume::UnavailableRoot {
+            root: PathBuf::from(root),
+            name: "Projects".into(),
+            reason: "not mounted".into(),
+        };
+        let status = status_view(&config, &[(volume(), SPACE)], &[un("/V/P/a"), un("/V/P/b")]);
+        assert!(status.volumes[0].low);
+        assert_eq!(status.unavailable, vec!["Projects: not mounted"]);
+        assert_eq!(status.mode, Mode::Ask);
+    }
+}

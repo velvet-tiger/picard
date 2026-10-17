@@ -1,4 +1,5 @@
 pub mod cli;
+mod commands;
 mod config;
 mod disk;
 mod env;
@@ -7,6 +8,7 @@ mod monitor;
 mod poll;
 mod proc;
 mod runner;
+mod settings;
 mod state;
 mod tasks;
 mod tray;
@@ -27,6 +29,14 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
+        .invoke_handler(tauri::generate_handler![
+            commands::get_status,
+            commands::get_settings,
+            commands::save_settings,
+            commands::preview,
+            commands::run_selected,
+            commands::get_history,
+        ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
