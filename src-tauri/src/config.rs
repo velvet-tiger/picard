@@ -42,6 +42,11 @@ stale_days = 14
 [[task]]
 type = "python_venv"
 stale_days = 30
+
+[[task]]
+type = "build_output"     # only folders git ignores and tracks nothing in
+stale_days = 30
+dirs = ["dist", "build", ".next", "vendor"]
 "#;
 
 const BYTES_PER_GB: f64 = 1_000_000_000.0;
@@ -295,6 +300,16 @@ pub enum TaskConfig {
         #[serde(default = "default_node_modules_stale_days")]
         stale_days: u32,
     },
+    /// Build output folders that git ignores, in idle projects.
+    BuildOutput {
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default = "default_node_modules_stale_days")]
+        stale_days: u32,
+        /// Folder names to look for. Each must be a plain name, not a path.
+        #[serde(default = "default_build_output_dirs")]
+        dirs: Vec<String>,
+    },
     Command {
         #[serde(default = "default_true")]
         enabled: bool,
@@ -319,6 +334,11 @@ fn default_node_modules_stale_days() -> u32 {
 }
 fn default_cargo_mode() -> CargoMode {
     CargoMode::Stale
+}
+fn default_build_output_dirs() -> Vec<String> {
+    ["dist", "build", ".next", "vendor"]
+        .map(String::from)
+        .to_vec()
 }
 fn default_command_timeout_secs() -> u64 {
     600
@@ -430,6 +450,10 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
             .with_context(|| format!("exclude pattern {pattern:?} is not a valid glob"))?;
     }
 
+    for task in &raw.task {
+        validate_task(task)?;
+    }
+
     let volumes = raw
         .volume
         .iter()
@@ -448,6 +472,21 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
         tasks: raw.task,
         tools: parse_tools(&raw.tools, home)?,
     })
+}
+
+/// Checks task options that serde cannot.
+fn validate_task(task: &TaskConfig) -> Result<()> {
+    if let TaskConfig::BuildOutput { dirs, .. } = task {
+        if dirs.is_empty() {
+            bail!("build_output dirs is empty; list folder names such as \"dist\"");
+        }
+        for d in dirs {
+            if d.is_empty() || d == "." || d == ".." || d == ".git" || d.contains('/') {
+                bail!("build_output dirs entry {d:?} must be a plain folder name, not a path");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_tools(raw: &RawTools, home: &Path) -> Result<ToolOverrides> {
@@ -547,7 +586,7 @@ mod tests {
         assert_eq!(c.cooldown_minutes, 60);
         assert_eq!(c.mode, Mode::Ask);
         assert_eq!(c.roots, vec![PathBuf::from("/Users/test/working")]);
-        assert_eq!(c.tasks.len(), 4);
+        assert_eq!(c.tasks.len(), 5);
         assert_eq!(
             c.tasks[2],
             TaskConfig::CargoClean {
@@ -562,6 +601,19 @@ mod tests {
             TaskConfig::PythonVenv {
                 enabled: true,
                 stale_days: 30
+            }
+        );
+        assert_eq!(
+            c.tasks[4],
+            TaskConfig::BuildOutput {
+                enabled: true,
+                stale_days: 30,
+                dirs: vec![
+                    "dist".into(),
+                    "build".into(),
+                    ".next".into(),
+                    "vendor".into()
+                ]
             }
         );
     }
@@ -827,6 +879,19 @@ mod tests {
             err.contains("not using") && err.contains("writable"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn build_output_dirs_must_be_plain_names() {
+        let base = "min_free_gb = 1\nroots = [\"/a\"]\n[[task]]\ntype = \"build_output\"\n";
+        assert!(matches!(
+            &parse_ok(base).tasks[0],
+            TaskConfig::BuildOutput { dirs, .. } if dirs.len() == 4
+        ));
+        for bad in ["[]", "[\"\"]", "[\"..\"]", "[\".git\"]", "[\"a/dist\"]"] {
+            let err = parse_err(&format!("{base}dirs = {bad}\n"));
+            assert!(err.contains("build_output dirs"), "{bad}: {err}");
+        }
     }
 
     #[test]

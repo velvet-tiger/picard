@@ -13,6 +13,7 @@ export type Task =
   | { type: 'node_modules'; enabled: boolean; stale_days: number; prune_package_caches: boolean }
   | { type: 'cargo_clean'; enabled: boolean; mode: CargoMode; stale_days: number; depth?: number }
   | { type: 'python_venv'; enabled: boolean; stale_days: number }
+  | { type: 'build_output'; enabled: boolean; stale_days: number; dirs: string[] }
   | { type: 'command'; enabled: boolean; name: string; run: string; timeout_secs: number }
 
 export type TaskType = Task['type']
@@ -89,6 +90,7 @@ export const TASK_LABELS: Record<TaskType, string> = {
   node_modules: 'node_modules',
   cargo_clean: 'Cargo target folders',
   python_venv: 'Python virtualenvs',
+  build_output: 'Ignored build output',
   command: 'Custom command',
 }
 
@@ -103,6 +105,8 @@ export function newTask(type: TaskType): Task {
       return { type, enabled: true, mode: 'stale', stale_days: 14 }
     case 'python_venv':
       return { type, enabled: true, stale_days: 30 }
+    case 'build_output':
+      return { type, enabled: true, stale_days: 30, dirs: ['dist', 'build', '.next', 'vendor'] }
     case 'command':
       return { type, enabled: false, name: 'My cleanup', run: '', timeout_secs: 600 }
   }
@@ -137,7 +141,7 @@ export function itemTitle(task: TaskType, path: string): string {
   const parts = path.split('/').filter(Boolean)
   if (task === 'command') return path.replace(/^command: /, '')
   if (task === 'git_worktrees') return parts.at(-1) ?? path
-  // node_modules, target and virtualenvs live directly inside the project folder; its
+  // node_modules, target, virtualenvs and build output live directly inside the project folder; its
   // parent is included because names like `ts` or `web` say little alone.
   return parts.slice(-3, -1).join('/') || path
 }

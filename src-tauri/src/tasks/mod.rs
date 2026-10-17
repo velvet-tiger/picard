@@ -5,6 +5,7 @@
 //! `scan`. Every path is re-checked by `check_target` immediately before it is
 //! removed, because the filesystem can change between scan and run.
 
+mod build_output;
 mod cache_prune;
 mod command;
 mod git;
@@ -171,6 +172,21 @@ pub fn from_config(
                 enabled: true,
                 stale_days,
             } => out.push(Box::new(stale_dirs::python_venv(*stale_days))),
+            TaskConfig::BuildOutput {
+                enabled: true,
+                stale_days,
+                dirs,
+            } => match env.resolve("git", overrides) {
+                Some(git) => out.push(Box::new(build_output::BuildOutput::new(
+                    git::GitCmd::new(git, env.path_var()),
+                    dirs.clone(),
+                    *stale_days,
+                ))),
+                None => log::error!(
+                    "build_output skipped: git not found on {} (set [tools] git)",
+                    env.path_var()
+                ),
+            },
             TaskConfig::GitWorktrees {
                 enabled: true,
                 stale_days,

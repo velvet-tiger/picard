@@ -276,6 +276,30 @@
                   <span class="unit">days</span>
                 </span>
               </div>
+            {:else if task.type === 'build_output'}
+              <div class="field">
+                <span>Projects untouched for</span>
+                <span class="control">
+                  <input type="number" min="0" bind:value={task.stale_days} />
+                  <span class="unit">days</span>
+                </span>
+              </div>
+              <div class="field">
+                <span>Folder names</span>
+                <input
+                  class="wide path"
+                  bind:value={
+                    () => task.dirs.join(', '),
+                    (v: string) =>
+                      (task.dirs = v
+                        .split(',')
+                        .map((d) => d.trim())
+                        .filter(Boolean))
+                  }
+                  placeholder="dist, build, .next, vendor"
+                />
+              </div>
+              <p class="muted">Only folders git ignores and tracks nothing in.</p>
             {:else if task.type === 'command'}
               <div class="field">
                 <span>Name</span>
