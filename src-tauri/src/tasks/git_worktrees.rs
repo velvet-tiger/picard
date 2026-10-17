@@ -73,18 +73,16 @@ impl GitWorktrees {
             );
             return Ok(None);
         }
-        let filters = self.git.untrusted_filters(&wt.path)?;
-        if !filters.is_empty() {
-            log::warn!(
-                "worktree {}: skipped because its repo config defines filters that git could run: {}",
-                wt.path.display(),
-                filters.join(", ")
-            );
+        if let Some(why) = self.git.unsafe_to_inspect(&wt.path)? {
+            log::warn!("worktree {}: skipped: {why}", wt.path.display());
             return Ok(None);
         }
         if !self
             .git
-            .output(&wt.path, &["status", "--porcelain"])?
+            .output(
+                &wt.path,
+                &["status", "--porcelain", "--ignore-submodules=all"],
+            )?
             .trim()
             .is_empty()
         {
@@ -225,19 +223,19 @@ impl GitWorktrees {
         if in_use.contains(&c.path) {
             return Err("now in use by a running process".to_string());
         }
-        let filters = self
+        if let Some(why) = self
             .git
-            .untrusted_filters(&c.path)
-            .map_err(|e| format!("{e:#}"))?;
-        if !filters.is_empty() {
-            return Err(format!(
-                "repo config defines filters: {}",
-                filters.join(", ")
-            ));
+            .unsafe_to_inspect(&c.path)
+            .map_err(|e| format!("{e:#}"))?
+        {
+            return Err(why);
         }
         let dirty = self
             .git
-            .output(&c.path, &["status", "--porcelain"])
+            .output(
+                &c.path,
+                &["status", "--porcelain", "--ignore-submodules=all"],
+            )
             .map_err(|e| format!("{e:#}"))?;
         if !dirty.trim().is_empty() {
             return Err("now has uncommitted changes".to_string());
@@ -683,6 +681,53 @@ mod tests {
         let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
         assert!(found.is_empty(), "{found:?}");
         assert!(!marker.exists(), "repo-configured filter was executed");
+    }
+
+    #[test]
+    fn worktree_with_submodule_is_skipped_and_submodule_filter_never_runs() {
+        let fx = Fixture::new(&[]);
+        let marker = fx.dir.path().join("submodule-filter-ran");
+        let script = tripwire(fx.dir.path(), &marker);
+
+        // A library repo whose files go through a filter named "evil".
+        let lib = fx.dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        git(&lib, &["init", "-q"]);
+        std::fs::write(lib.join(".gitattributes"), "* filter=evil\n").unwrap();
+        commit(&lib, "lib.txt");
+
+        let r = repo(&fx);
+        let file_ok = ["-c", "protocol.file.allow=always"];
+        git(
+            &r,
+            &[
+                &file_ok[..],
+                &[
+                    "submodule",
+                    "add",
+                    "-q",
+                    lib.to_str().unwrap(),
+                    "vendor/lib",
+                ],
+            ]
+            .concat(),
+        );
+        git(&r, &["commit", "-qm", "add submodule"]);
+        let wt = worktree(&r, "with-sub");
+        git(
+            &wt,
+            &[&file_ok[..], &["submodule", "update", "-q", "--init"]].concat(),
+        );
+        // The filter lives only in the submodule's own config.
+        git(
+            &wt.join("vendor/lib"),
+            &["config", "filter.evil.clean", script.to_str().unwrap()],
+        );
+        age(&fx, &wt, 1);
+
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(!marker.exists(), "submodule-configured filter was executed");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

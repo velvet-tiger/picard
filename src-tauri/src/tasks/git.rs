@@ -91,6 +91,37 @@ impl GitCmd {
     }
 }
 
+impl GitCmd {
+    /// Why git must not run `status` or `worktree remove` in `dir`, if anything.
+    ///
+    /// Both commands can run a clean filter. Filters defined in the repo's own
+    /// config are refused. Submodules are refused too, because `status` recurses
+    /// into them and each has its own config that this check does not read.
+    /// `git worktree remove` refuses worktrees with submodules anyway, so
+    /// skipping them loses nothing. Every check here only reads, and runs nothing.
+    pub fn unsafe_to_inspect(&self, dir: &Path) -> Result<Option<String>> {
+        let filters = self.untrusted_filters(dir)?;
+        if !filters.is_empty() {
+            return Ok(Some(format!(
+                "repo config defines filters that git could run: {}",
+                filters.join(", ")
+            )));
+        }
+        let has_gitmodules = std::fs::symlink_metadata(dir.join(".gitmodules")).is_ok();
+        let index = self.output(dir, &["ls-files", "--stage", "-z"])?;
+        if has_gitmodules || index_has_gitlinks(&index) {
+            return Ok(Some("contains submodules".to_string()));
+        }
+        Ok(None)
+    }
+}
+
+/// True if `git ls-files --stage -z` output lists a gitlink (mode 160000), which
+/// is how a submodule appears in the index.
+pub fn index_has_gitlinks(raw: &str) -> bool {
+    raw.split('\0').any(|entry| entry.starts_with("160000 "))
+}
+
 /// Parses `git config --list --show-scope -z` and returns `filter.*` keys set in
 /// local or worktree scope. Each record is `scope NUL key NEWLINE value NUL`.
 pub fn repo_scoped_filters(raw: &str) -> Vec<String> {
@@ -200,6 +231,14 @@ mod tests {
             repo_scoped_filters(raw),
             vec!["filter.evil.clean", "filter.wt.smudge"]
         );
+    }
+
+    #[test]
+    fn detects_gitlinks_in_the_index() {
+        let plain = "100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0\tREADME\0";
+        let with_sub = "100644 aaa 0\tREADME\x00160000 bbb 0\tvendor/lib\0";
+        assert!(!index_has_gitlinks(plain));
+        assert!(index_has_gitlinks(with_sub));
     }
 
     #[test]
