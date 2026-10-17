@@ -5,7 +5,9 @@
 //! tested without touching disk. Reading, writing and watching the file happen
 //! in `lib.rs` and the monitor loop.
 
-use std::os::unix::fs::MetadataExt;
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -50,47 +52,64 @@ pub const STARTUP_DATA_MOUNT: &str = "/System/Volumes/Data";
 /// who could edit it could make Picard delete or run whatever they like, so a
 /// config that others can change is not used at all.
 pub fn load(path: &Path, home: &Path) -> Result<Config> {
-    config_is_private(path).map_err(|why| {
+    let mut file = open_private(path).map_err(|why| {
         anyhow::anyhow!(
             "not using {}: {why}. Only you should be able to change it and the folders above it (for example: chmod go-w <path>)",
             path.display()
         )
     })?;
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .with_context(|| format!("reading {}", path.display()))?;
     parse(&text, home).with_context(|| format!("in {}", path.display()))
 }
 
-/// Checks the file and every folder above it, as written and after resolving
-/// symlinks, following OpenSSH's rules for its own config. Returns why not.
-pub fn config_is_private(path: &Path) -> Result<(), String> {
+/// Opens the config for reading only if just this user can change it.
+///
+/// Every folder above the file, as written and after resolving symlinks, must
+/// pass `dir_problem` (OpenSSH's rule). The resolved file is then opened once
+/// with `O_NOFOLLOW`, and its owner and mode are checked on that open handle
+/// with `fstat`. The caller reads from the same handle, so the file that was
+/// checked is the file that is read, even if something changes in between.
+pub fn open_private(path: &Path) -> Result<File, String> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
-    let stat = |p: &Path| -> Result<(u32, u32), String> {
-        std::fs::metadata(p)
-            .map(|m| (m.uid(), m.mode()))
-            .map_err(|e| format!("cannot read {}: {e}", p.display()))
-    };
     let resolved = path
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
     for file in [path, resolved.as_path()] {
-        let (owner, mode) = stat(file)?;
-        if let Some(why) = file_problem(owner, mode, me) {
-            return Err(format!("{} {why}", file.display()));
-        }
         for dir in file
             .ancestors()
             .skip(1)
             .filter(|d| !d.as_os_str().is_empty())
         {
-            let (owner, mode) = stat(dir)?;
-            if let Some(why) = dir_problem(owner, mode, me) {
+            let meta = std::fs::metadata(dir)
+                .map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+            if let Some(why) = dir_problem(meta.uid(), meta.mode(), me) {
                 return Err(format!("{} {why}", dir.display()));
             }
         }
     }
-    Ok(())
+    let file =
+        open_nofollow(&resolved).map_err(|e| format!("cannot open {}: {e}", resolved.display()))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot read {}: {e}", resolved.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", resolved.display()));
+    }
+    if let Some(why) = file_problem(meta.uid(), meta.mode(), me) {
+        return Err(format!("{} {why}", resolved.display()));
+    }
+    Ok(file)
+}
+
+/// Opens read-only, failing (ELOOP) if the last path component is a symlink.
+fn open_nofollow(path: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
 }
 
 const GROUP_OR_OTHER_WRITE: u32 = 0o022;
@@ -675,6 +694,30 @@ mod tests {
         );
     }
 
+    fn private(p: &Path) -> Result<(), String> {
+        open_private(p).map(|_| ())
+    }
+
+    #[test]
+    fn open_nofollow_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "x").unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(open_nofollow(&real).is_ok());
+        let err = open_nofollow(&link).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+    }
+
+    #[test]
+    fn a_folder_path_is_not_a_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("config.toml");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(private(&sub).is_err());
+    }
+
     #[test]
     fn file_must_be_mine_and_not_group_or_world_writable() {
         assert_eq!(file_problem(501, 0o100600, 501), None);
@@ -709,17 +752,13 @@ mod tests {
         let f = dir.path().join("config.toml");
         std::fs::write(&f, "x").unwrap();
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(config_is_private(&f), Ok(()));
+        assert_eq!(private(&f), Ok(()));
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o664)).unwrap();
-        assert!(
-            config_is_private(&f)
-                .unwrap_err()
-                .contains("writable by group")
-        );
+        assert!(private(&f).unwrap_err().contains("writable by group"));
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(
-            config_is_private(&f).is_err(),
+            private(&f).is_err(),
             "a world-writable folder lets others replace the file"
         );
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -734,10 +773,10 @@ mod tests {
         let f = inner.join("config.toml");
         std::fs::write(&f, "x").unwrap();
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(config_is_private(&f), Ok(()));
+        assert_eq!(private(&f), Ok(()));
         let a = top.path().join("a");
         std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let err = config_is_private(&f).unwrap_err();
+        let err = private(&f).unwrap_err();
         assert!(err.contains("/a ") && err.contains("writable"), "{err}");
         std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -752,7 +791,7 @@ mod tests {
         let link_dir = tempfile::tempdir().unwrap();
         let link = link_dir.path().join("config.toml");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(config_is_private(&link).unwrap_err().contains("writable"));
+        assert!(private(&link).unwrap_err().contains("writable"));
     }
 
     #[test]
