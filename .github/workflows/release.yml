@@ -36,7 +36,7 @@ jobs:
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ env.TAG }}
 
@@ -53,28 +53,28 @@ jobs:
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: pnpm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: "src-tauri -> target"
 
       - run: pnpm install --frozen-lockfile
 
-      # Secrets that are not set arrive as empty strings. They are only
-      # exported when present, because the Makefile's `?=` default for
-      # APPLE_SIGNING_IDENTITY does not apply to a variable that is set but empty.
+      # The secrets are passed to this step and the build step only, so later
+      # steps and the actions' post steps never see them.
       - name: Choose signing mode
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -90,10 +90,6 @@ jobs:
             [[ -n "${!name}" ]] || missing+=("$name")
           done
           if [[ ${#missing[@]} -eq 0 ]]; then
-            for name in "${names[@]}"; do
-              delimiter="EOF_$(uuidgen)"
-              printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "${!name}" "$delimiter" >> "$GITHUB_ENV"
-            done
             echo "SIGNED=true" >> "$GITHUB_ENV"
             echo "Signing with a Developer ID and notarising."
           elif [[ ${#missing[@]} -eq ${#names[@]} ]]; then
@@ -104,8 +100,22 @@ jobs:
             exit 1
           fi
 
+      # Secrets that are not set arrive as empty strings. They are unset for
+      # an ad-hoc build, because the Makefile's `?=` default for
+      # APPLE_SIGNING_IDENTITY does not apply to a variable that is set but empty.
       - name: Check and build
-        run: make dmg
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ "$SIGNED" != "true" ]]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+          make dmg
 
       - name: Verify the build
         run: make verify
