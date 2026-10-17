@@ -391,8 +391,33 @@ mod tests {
         assert!(fx.root.join("rs/target").exists());
     }
 
+    const LOCK_TEST: &str = "runner::tests::lock_blocks_a_second_holder_until_released";
+    const LOCK_TEST_CHILD: &str = "PICARD_LOCK_TEST_CHILD";
+
+    // On macOS every process spawn briefly copies the parent's file table,
+    // close-on-exec descriptors included, until the child execs. A flock lock
+    // belongs to the open file, so it outlives `drop` while a spawn from another
+    // test thread is in flight, and the re-acquire fails. The check therefore
+    // runs alone in a fresh copy of this test binary, where nothing else spawns.
     #[test]
     fn lock_blocks_a_second_holder_until_released() {
+        if std::env::var_os(LOCK_TEST_CHILD).is_some() {
+            check_lock_blocks_until_released();
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([LOCK_TEST, "--exact", "--test-threads=1", "--nocapture"])
+            .env(LOCK_TEST_CHILD, "1")
+            .output()
+            .expect("running the lock test in a child process");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+        // A wrong test name would run nothing and still exit 0.
+        assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
+    }
+
+    fn check_lock_blocks_until_released() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run.lock");
         let first = RunLock::acquire(&path).unwrap();
