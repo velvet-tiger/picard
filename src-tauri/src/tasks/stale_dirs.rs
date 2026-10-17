@@ -16,8 +16,11 @@ use super::cache_prune::CachePrune;
 use super::{Candidate, CleanupTask, Ctx, Report, check_target, remove_dirs};
 
 /// Folders never descended into while searching for projects or reading mtimes.
-/// They are either the build output itself or too large to walk usefully.
-const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git"];
+/// They are build output or too large to walk usefully. `.next` is Next.js
+/// output: it holds a `package.json` and `node_modules` of its own, which would
+/// otherwise show up as near-empty candidates, and a rebuild there is not
+/// activity in the project.
+const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git", ".next"];
 
 /// How deep to search under each root unless a task says otherwise.
 const DEFAULT_SEARCH_DEPTH: usize = 8;
@@ -286,6 +289,19 @@ mod tests {
         node_project(&fx, "other", 10, 90);
         let found = node_modules(30).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["other/node_modules"]);
+    }
+
+    #[test]
+    fn next_build_output_is_not_a_project() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "site", 10, 60);
+        fx.file("site/.next/package.json", 1);
+        fx.file("site/.next/node_modules/x.js", 1);
+        fx.age("site", 60);
+        // A fresh build inside .next does not make the site look active.
+        fx.file("site/.next/server/page.js", 1);
+        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["site/node_modules"]);
     }
 
     #[test]

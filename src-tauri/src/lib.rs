@@ -59,6 +59,10 @@ pub fn run() {
             }
 
             let tray = tray::Tray::install(app.handle())?;
+            // Without the button, alerts still work; only the shortcut to Clean is lost.
+            if let Err(e) = poll::register_clean_action(app.handle()) {
+                log::error!("{e:#}");
+            }
 
             // Capacity 16 is plenty: the loop drains the queue on every wake.
             let (tx, rx) = mpsc::channel(16);

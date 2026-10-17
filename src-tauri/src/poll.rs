@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Runtime};
-use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_notification::{Action, ActionType, NotificationExt};
+
+use crate::windows::{self, Window};
 use tokio::sync::mpsc;
 
 use crate::config::{self, Config, Mode};
@@ -22,6 +24,37 @@ use crate::runner;
 use crate::state::Shared;
 use crate::tray::{MenuView, Tray};
 use crate::volume::{self, UnavailableRoot, UuidCache, Volume};
+
+/// The notification action type registered in `register_clean_action`.
+const LOW_SPACE_ACTIONS: &str = "picard-low-space";
+const CLEAN_ACTION: &str = "clean";
+/// What the plugin reports for a click on the notification itself.
+const TAP_ACTION: &str = "tap";
+
+/// Adds a Clean… button to Picard's notifications. The button, or a click on
+/// the notification itself, opens the Preview window, so nothing is deleted
+/// without the user seeing the list first.
+pub fn register_clean_action<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
+    let notifications = app.notification();
+    let clean = Action::builder(CLEAN_ACTION, "Clean…").build();
+    notifications
+        .register_action_types(vec![
+            ActionType::builder(LOW_SPACE_ACTIONS)
+                .actions(vec![clean])
+                .build(),
+        ])
+        .context("registering notification actions")?;
+    let handle = app.clone();
+    notifications
+        .on_action(move |performed| {
+            if matches!(performed.action_id(), CLEAN_ACTION | TAP_ACTION)
+                && let Err(e) = windows::open(&handle, Window::Preview)
+            {
+                log::error!("could not open the Clean window from a notification: {e}");
+            }
+        })
+        .context("listening for notification actions")
+}
 
 /// Why the loop woke up early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,8 +274,12 @@ impl<R: Runtime> Poller<R> {
                     continue;
                 }
             }
-            // TODO(M6): in ask mode, add the cleanable estimate and a Clean button.
-            let (title, body) = alert.message();
+            let volume = found.readings.iter().find(|(v, _)| v.mount == alert.mount);
+            let cleanable = match volume {
+                Some((v, _)) => self.cleanable(&config, v.clone()).await,
+                None => None,
+            };
+            let (title, body) = alert.message(cleanable);
             self.notify(&title, &body);
         }
         // Show the space after cleaning, not the reading that triggered it.
@@ -263,6 +300,36 @@ impl<R: Runtime> Poller<R> {
             Ok(s) => Some(s),
             Err(e) => {
                 log::error!("disk scan task failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// How much a preview scan finds on `volume`, for the ask-mode estimate.
+    /// `None` if the scan cannot run yet or fails; the reason is logged.
+    async fn cleanable(&self, config: &Config, volume: Volume) -> Option<u64> {
+        let tools = self.shared.tools()?;
+        let config = config.clone();
+        let sizes = Arc::clone(&self.shared.sizes);
+        let scanned = tauri::async_runtime::spawn_blocking(move || {
+            runner::preview_volume(&config, &volume, &sizes, &tools)
+        })
+        .await;
+        match scanned {
+            Ok(Ok(scans)) => Some(
+                scans
+                    .iter()
+                    .filter_map(|s| s.result.as_ref().ok())
+                    .flatten()
+                    .map(|c| c.bytes)
+                    .sum(),
+            ),
+            Ok(Err(e)) => {
+                log::warn!("estimate for the low-space alert failed: {e:#}");
+                None
+            }
+            Err(e) => {
+                log::warn!("estimate task failed: {e}");
                 None
             }
         }
@@ -317,6 +384,7 @@ impl<R: Runtime> Poller<R> {
             .builder()
             .title(title)
             .body(body)
+            .action_type_id(LOW_SPACE_ACTIONS)
             .show()
         {
             log::error!("could not show notification {title:?}: {e}");

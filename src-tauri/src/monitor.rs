@@ -69,12 +69,21 @@ pub struct Alert {
 
 impl Alert {
     /// Notification title and body, for example "Startup disk is low" and
-    /// "19 GB free (2%)".
-    pub fn message(&self) -> (String, String) {
-        (
-            format!("{} is low", self.name),
-            crate::disk::format_free(self.space),
-        )
+    /// "19 GB free (2%). About 8.5 GB can be cleaned."
+    ///
+    /// `cleanable` is the preview total, or `None` if the scan could not run;
+    /// then the body gives only the free space rather than a guess.
+    pub fn message(&self, cleanable: Option<u64>) -> (String, String) {
+        let free = crate::disk::format_free(self.space);
+        let body = match cleanable {
+            None => free,
+            Some(0) => format!("{free}. Nothing Picard can clean right now."),
+            Some(bytes) => format!(
+                "{free}. About {} can be cleaned.",
+                crate::disk::format_bytes(bytes)
+            ),
+        };
+        (format!("{} is low", self.name), body)
     }
 }
 
@@ -274,12 +283,21 @@ mod tests {
             mount: PathBuf::from("/"),
             space: space(19, 994),
         };
+        let title = "Startup disk is low".to_string();
         assert_eq!(
-            alert.message(),
+            alert.message(None),
+            (title.clone(), "19 GB free (2%)".to_string())
+        );
+        assert_eq!(
+            alert.message(Some(8_500_000_000)),
             (
-                "Startup disk is low".to_string(),
-                "19 GB free (2%)".to_string()
+                title.clone(),
+                "19 GB free (2%). About 8.5 GB can be cleaned.".to_string()
             )
+        );
+        assert_eq!(
+            alert.message(Some(0)).1,
+            "19 GB free (2%). Nothing Picard can clean right now."
         );
     }
 
