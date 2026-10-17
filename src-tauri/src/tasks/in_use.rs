@@ -6,8 +6,16 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+
+use crate::proc;
+
+const LSOF_TIMEOUT: Duration = Duration::from_secs(10);
+// A few hundred processes produce tens of kilobytes; anything near this is a
+// sign of trouble, and a cut listing could hide a working folder.
+const LSOF_OUTPUT_CAP: usize = 16 * 1024 * 1024;
 
 /// `lsof` ships with macOS at this path, so no PATH lookup is needed.
 const LSOF: &str = "/usr/sbin/lsof";
@@ -31,16 +39,19 @@ impl InUse {
     /// empty listing is an error, because every session has at least Picard's
     /// own working folder and silence would wrongly mean "nothing in use".
     pub fn load() -> Result<Self> {
-        let out = Command::new(LSOF)
-            .args(["-nP", "-d", "cwd", "-Fn"])
-            .output()
+        let mut cmd = Command::new(LSOF);
+        cmd.args(["-nP", "-d", "cwd", "-Fn"]);
+        let out = proc::run(cmd, LSOF_TIMEOUT, LSOF_OUTPUT_CAP)
             .with_context(|| format!("running {LSOF}"))?;
-        let parsed = parse_lsof(&String::from_utf8_lossy(&out.stdout));
+        if out.timed_out || out.truncated {
+            bail!("{LSOF} timed out or produced too much output");
+        }
+        let parsed = parse_lsof(&out.stdout);
         if parsed.cwds.is_empty() {
             bail!(
                 "{LSOF} listed no working folders (exit {:?}): {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim()
+                out.code,
+                out.stderr.trim()
             );
         }
         Ok(parsed)

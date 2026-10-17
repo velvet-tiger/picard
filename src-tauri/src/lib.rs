@@ -4,6 +4,7 @@ mod disk;
 mod history;
 mod monitor;
 mod poll;
+mod proc;
 mod runner;
 mod tasks;
 mod tray;

@@ -2,22 +2,33 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-/// How to invoke git.
-///
-/// TODO(M5): build this from the resolved login-shell PATH so a Finder- or
-/// login-launched app finds Homebrew's git. Until then `git` must be on PATH.
+use crate::proc::{self, Output};
+
+/// Generous, because `git status` on a large repo with a cold cache is slow,
+/// but bounded so a hung git (a stuck network filesystem) cannot stall a scan.
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Picard parses git listings to make safety decisions, so it must see all of
+/// them. Output past this size is treated as an error rather than trusted.
+const GIT_OUTPUT_CAP: usize = 256 * 1024 * 1024;
+
+/// How to invoke git: which binary, and the PATH it runs with.
 #[derive(Debug, Clone)]
 pub struct GitCmd {
     program: PathBuf,
+    path_var: Option<String>,
 }
 
 impl Default for GitCmd {
+    /// `git` from the current PATH. Used by tests and as a last resort.
     fn default() -> Self {
         Self {
             program: PathBuf::from("git"),
+            path_var: None,
         }
     }
 }
@@ -40,41 +51,70 @@ impl GitCmd {
         // Picard only reads, apart from `worktree remove`. Skipping optional
         // locks stops `git status` from contending with a live session's git.
         cmd.env("GIT_OPTIONAL_LOCKS", "0");
+        if let Some(path) = &self.path_var {
+            cmd.env("PATH", path);
+        }
         cmd
+    }
+
+    pub fn new(program: PathBuf, path_var: String) -> Self {
+        Self {
+            program,
+            path_var: Some(path_var),
+        }
+    }
+
+    fn exec(&self, dir: &Path, args: &[&str]) -> Result<Output> {
+        let out =
+            proc::run(self.command(dir, args), GIT_TIMEOUT, GIT_OUTPUT_CAP).with_context(|| {
+                format!(
+                    "running {} {} in {}",
+                    self.program.display(),
+                    args.join(" "),
+                    dir.display()
+                )
+            })?;
+        if out.timed_out || out.truncated {
+            bail!(
+                "git {} in {}: {}",
+                args.join(" "),
+                dir.display(),
+                if out.timed_out {
+                    "timed out"
+                } else {
+                    "output too large to check"
+                }
+            );
+        }
+        Ok(out)
     }
 
     /// Runs git in `dir` and returns stdout. Fails with stderr on a non-zero exit.
     pub fn output(&self, dir: &Path, args: &[&str]) -> Result<String> {
-        let out = self
-            .command(dir, args)
-            .output()
-            .with_context(|| format!("running git {} in {}", args.join(" "), dir.display()))?;
-        if !out.status.success() {
+        let out = self.exec(dir, args)?;
+        if !out.success() {
             bail!(
                 "git {} in {} failed: {}",
                 args.join(" "),
                 dir.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
+                out.stderr.trim()
             );
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(out.stdout)
     }
 
     /// Runs a git command whose exit status is the answer, like
     /// `merge-base --is-ancestor`: 0 is yes, 1 is no, anything else is an error.
     pub fn check(&self, dir: &Path, args: &[&str]) -> Result<bool> {
-        let out = self
-            .command(dir, args)
-            .output()
-            .with_context(|| format!("running git {} in {}", args.join(" "), dir.display()))?;
-        match out.status.code() {
+        let out = self.exec(dir, args)?;
+        match out.code {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
             _ => bail!(
                 "git {} in {} failed: {}",
                 args.join(" "),
                 dir.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
+                out.stderr.trim()
             ),
         }
     }
