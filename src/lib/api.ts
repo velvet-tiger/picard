@@ -1,6 +1,7 @@
 // Typed wrappers for the Rust commands in src-tauri/src/commands.rs.
 // The shapes here mirror the serde structs there; keep them in step.
 import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 
 export type Mode = 'auto' | 'ask' | 'off'
 export type CargoMode = 'stale' | 'all'
@@ -102,6 +103,9 @@ export function newTask(type: TaskType): Task {
       return { type, enabled: false, name: 'My cleanup', run: '', timeout_secs: 600 }
   }
 }
+
+/** Closes the window this page is in. */
+export const closeWindow = () => getCurrentWindow().close()
 
 /** Errors from invoke arrive as strings; anything else is shown as-is. */
 export function errorText(e: unknown): string {

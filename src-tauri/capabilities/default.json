@@ -5,6 +5,7 @@
   "windows": ["settings", "preview"],
   "permissions": [
     "core:default",
+    "core:window:allow-close",
     "allow-get-status",
     "allow-get-settings",
     "allow-save-settings",

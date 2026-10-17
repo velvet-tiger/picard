@@ -5,6 +5,7 @@
     getLaunchAtLogin,
     setLaunchAtLogin,
     pickFolder,
+    closeWindow,
     errorText,
     newTask,
     TASK_LABELS,
@@ -19,6 +20,10 @@
   let saved = $state(false)
   let saving = $state(false)
   let addType = $state<TaskType>('git_worktrees')
+  // The settings as last loaded or saved, to tell whether closing loses edits.
+  let savedJson = $state('')
+  let confirmingClose = $state(false)
+  const dirty = $derived(settings !== null && JSON.stringify(settings) !== savedJson)
 
   const MODES = [
     { value: 'ask', label: 'Ask', help: 'Notify and wait for you to choose Clean.' },
@@ -29,6 +34,7 @@
   async function load() {
     try {
       settings = await getSettings()
+      savedJson = JSON.stringify(settings)
       launchAtLogin = await getLaunchAtLogin()
     } catch (e) {
       loadError = errorText(e)
@@ -58,6 +64,7 @@
       await saveSettings(clean)
       settings.roots = clean.roots
       settings.exclude = clean.exclude
+      savedJson = JSON.stringify(settings)
       saved = true
     } catch (e) {
       saveError = errorText(e)
@@ -76,6 +83,27 @@
     }
   }
 
+  async function close(discard = false) {
+    if (dirty && !discard) {
+      confirmingClose = true
+      return
+    }
+    try {
+      await closeWindow()
+    } catch (e) {
+      saveError = errorText(e)
+    }
+  }
+
+  // A menu bar app has no Window menu, so ⌘W does nothing unless handled here.
+  function onKey(e: KeyboardEvent) {
+    if (e.key === 'Escape' || (e.metaKey && e.key.toLowerCase() === 'w')) {
+      e.preventDefault()
+      if (confirmingClose) confirmingClose = false
+      else close()
+    }
+  }
+
   function move(i: number, by: number) {
     if (!settings) return
     const j = i + by
@@ -91,6 +119,8 @@
 
   load()
 </script>
+
+<svelte:window onkeydown={onKey} />
 
 <main>
   <h1>Settings</h1>
@@ -280,10 +310,20 @@
     </section>
 
     <div class="row footer">
-      {#if saveError}<span class="error">{saveError}</span>{/if}
-      {#if saved}<span class="ok">Saved. Picard has reloaded the settings.</span>{/if}
-      <span class="spacer"></span>
-      <button class="primary" onclick={save} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
+      {#if confirmingClose}
+        <span>You have unsaved changes.</span>
+        <span class="spacer"></span>
+        <button onclick={() => (confirmingClose = false)}>Keep editing</button>
+        <button onclick={() => close(true)}>Discard and close</button>
+      {:else}
+        {#if saveError}<span class="error">{saveError}</span>{/if}
+        {#if saved && !dirty}<span class="ok">Saved. Picard has reloaded the settings.</span>{/if}
+        <span class="spacer"></span>
+        <button onclick={() => close()}>Close</button>
+        <button class="primary" onclick={save} disabled={saving}
+          >{saving ? 'Saving…' : 'Save'}</button
+        >
+      {/if}
     </div>
   {/if}
 </main>
