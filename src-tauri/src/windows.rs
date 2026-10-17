@@ -1,53 +1,45 @@
-//! Opens the Settings and Preview windows on demand.
+//! Opens Picard's window on its Clean or Settings tab.
 //!
-//! Windows are created when asked for and destroyed when closed, so Picard
-//! holds no webview while it sits in the menu bar. Both load the same frontend,
-//! which picks its view from the URL hash.
+//! The window is created when asked for and destroyed when closed, so Picard
+//! holds no webview while it sits in the menu bar. The URL hash picks the first
+//! tab; an open window is told to switch tabs with the `show-tab` event.
 
-use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
+
+/// Must match the window label granted in capabilities/default.json.
+const WINDOW_LABEL: &str = "main";
+
+/// Must match the event name App.svelte listens for.
+const SHOW_TAB_EVENT: &str = "show-tab";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Window {
+pub enum Tab {
+    Clean,
     Settings,
-    Preview,
 }
 
-impl Window {
-    /// Must match the window labels granted in capabilities/default.json.
-    pub fn label(self) -> &'static str {
+impl Tab {
+    /// Must match the tab ids in App.svelte.
+    fn id(self) -> &'static str {
         match self {
-            Window::Settings => "settings",
-            Window::Preview => "preview",
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Window::Settings => "Picard Settings",
-            Window::Preview => "Picard: Clean",
-        }
-    }
-
-    fn size(self) -> (f64, f64) {
-        match self {
-            Window::Settings => (620.0, 720.0),
-            Window::Preview => (760.0, 640.0),
+            Tab::Clean => "clean",
+            Tab::Settings => "settings",
         }
     }
 }
 
-/// Shows the window, creating it if needed, and brings it to the front.
-pub fn open<R: Runtime>(app: &AppHandle<R>, which: Window) -> tauri::Result<()> {
-    if let Some(existing) = app.get_webview_window(which.label()) {
+/// Shows the window on `tab`, creating it if needed, and brings it to the front.
+pub fn open<R: Runtime>(app: &AppHandle<R>, tab: Tab) -> tauri::Result<()> {
+    if let Some(existing) = app.get_webview_window(WINDOW_LABEL) {
+        existing.emit_to(WINDOW_LABEL, SHOW_TAB_EVENT, tab.id())?;
         existing.unminimize()?;
         existing.show()?;
         return existing.set_focus();
     }
-    let (w, h) = which.size();
-    let url = WebviewUrl::App(format!("index.html#/{}", which.label()).into());
-    let window = WebviewWindowBuilder::new(app, which.label(), url)
-        .title(which.title())
-        .inner_size(w, h)
+    let url = WebviewUrl::App(format!("index.html#/{}", tab.id()).into());
+    let window = WebviewWindowBuilder::new(app, WINDOW_LABEL, url)
+        .title("Picard")
+        .inner_size(760.0, 720.0)
         .min_inner_size(480.0, 400.0)
         .center()
         .build()?;

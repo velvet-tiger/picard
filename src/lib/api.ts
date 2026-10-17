@@ -2,6 +2,7 @@
 // The shapes here mirror the serde structs there; keep them in step.
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 
 export type Mode = 'auto' | 'ask' | 'off'
 export type CargoMode = 'stale' | 'all'
@@ -125,6 +126,13 @@ export function newTask(type: TaskType): Task {
 
 /** Closes the window this page is in. */
 export const closeWindow = () => getCurrentWindow().close()
+
+/**
+ * Calls `handler` with a tab id when the menu bar asks the open window to
+ * switch tabs (see src-tauri/src/windows.rs). Resolves to an unlisten function.
+ */
+export const onShowTab = (handler: (tab: string) => void) =>
+  getCurrentWebviewWindow().listen<string>('show-tab', (e) => handler(e.payload))
 
 /** Errors from invoke arrive as strings; anything else is shown as-is. */
 export function errorText(e: unknown): string {
