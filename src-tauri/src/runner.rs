@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
-use crate::config::{self, Config};
+use crate::config::Config;
 use crate::disk;
 use crate::env::ToolEnv;
 use crate::history::{self, Entry};
@@ -23,7 +23,6 @@ use crate::volume::Volume;
 /// Files Picard keeps next to its config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataPaths {
-    pub config: PathBuf,
     pub history: PathBuf,
     pub lock: PathBuf,
 }
@@ -32,7 +31,6 @@ impl DataPaths {
     pub fn beside(config_path: &Path) -> Self {
         let dir = config_path.parent().unwrap_or(Path::new("."));
         Self {
-            config: config_path.to_path_buf(),
             history: dir.join("history.jsonl"),
             lock: dir.join("run.lock"),
         }
@@ -196,8 +194,7 @@ pub fn clean_volume(
     let exclude = tasks::build_exclude(&config.exclude)?;
     let ctx = Ctx::for_volume(volume, &exclude, SystemTime::now(), sizes)
         .with_search_roots(&config.roots);
-    let commands = config::config_is_private(&paths.config);
-    let tasks = tasks::from_config(&config.tasks, env, &config.tools, &commands);
+    let tasks = tasks::from_config(&config.tasks, env, &config.tools);
     let read_free = || disk::query(&volume.mount).map(|s| s.free_bytes);
     let mut record = |task: &'static str, removed: &[Removed]| {
         let entries: Vec<Entry> = removed
@@ -354,7 +351,6 @@ mod tests {
     #[test]
     fn data_paths_sit_beside_the_config() {
         let p = DataPaths::beside(Path::new("/x/Picard/config.toml"));
-        assert_eq!(p.config, PathBuf::from("/x/Picard/config.toml"));
         assert_eq!(p.history, PathBuf::from("/x/Picard/history.jsonl"));
         assert_eq!(p.lock, PathBuf::from("/x/Picard/run.lock"));
     }

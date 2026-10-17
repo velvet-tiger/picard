@@ -43,30 +43,78 @@ const BYTES_PER_GB: f64 = 1_000_000_000.0;
 /// Where macOS mounts the APFS Data volume that holds home folders.
 pub const STARTUP_DATA_MOUNT: &str = "/System/Volumes/Data";
 
-/// Checks that only the current user can change the config file.
+/// Reads and parses the config, refusing it unless only this user can change it.
 ///
-/// `command` tasks run arbitrary shell code unattended, so anyone who can edit
-/// `config.toml` could make Picard run their code. Like SSH with its config, the
-/// file and its folder must be owned by the user and not writable by group or
-/// others. Returns why not, if not.
+/// The config decides what Picard deletes (`roots`), which programs it runs
+/// (`[tools]`, `command` tasks) and whether it acts unattended (`mode`). Anyone
+/// who could edit it could make Picard delete or run whatever they like, so a
+/// config that others can change is not used at all.
+pub fn load(path: &Path, home: &Path) -> Result<Config> {
+    config_is_private(path).map_err(|why| {
+        anyhow::anyhow!(
+            "not using {}: {why}. Only you should be able to change it and the folders above it (for example: chmod go-w <path>)",
+            path.display()
+        )
+    })?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    parse(&text, home).with_context(|| format!("in {}", path.display()))
+}
+
+/// Checks the file and every folder above it, as written and after resolving
+/// symlinks, following OpenSSH's rules for its own config. Returns why not.
 pub fn config_is_private(path: &Path) -> Result<(), String> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
-    let dir = path.parent().unwrap_or(Path::new("."));
-    for p in [path, dir] {
-        let meta = std::fs::metadata(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-        if let Some(why) = private_problem(meta.uid(), meta.mode(), me) {
-            return Err(format!("{} {why}", p.display()));
+    let stat = |p: &Path| -> Result<(u32, u32), String> {
+        std::fs::metadata(p)
+            .map(|m| (m.uid(), m.mode()))
+            .map_err(|e| format!("cannot read {}: {e}", p.display()))
+    };
+    let resolved = path
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
+    for file in [path, resolved.as_path()] {
+        let (owner, mode) = stat(file)?;
+        if let Some(why) = file_problem(owner, mode, me) {
+            return Err(format!("{} {why}", file.display()));
+        }
+        for dir in file
+            .ancestors()
+            .skip(1)
+            .filter(|d| !d.as_os_str().is_empty())
+        {
+            let (owner, mode) = stat(dir)?;
+            if let Some(why) = dir_problem(owner, mode, me) {
+                return Err(format!("{} {why}", dir.display()));
+            }
         }
     }
     Ok(())
 }
 
-/// Why a file with this owner and mode is not private to `me`, if it is not.
-fn private_problem(owner: u32, mode: u32, me: u32) -> Option<&'static str> {
+const GROUP_OR_OTHER_WRITE: u32 = 0o022;
+const STICKY: u32 = 0o1000;
+const ROOT: u32 = 0;
+
+/// The config file itself must be the user's and writable only by them.
+fn file_problem(owner: u32, mode: u32, me: u32) -> Option<&'static str> {
     if owner != me {
         Some("is owned by another user")
-    } else if mode & 0o022 != 0 {
+    } else if mode & GROUP_OR_OTHER_WRITE != 0 {
+        Some("is writable by group or others")
+    } else {
+        None
+    }
+}
+
+/// A folder above the config may belong to the user or root. It must not let
+/// others replace entries, unless it is sticky (like /tmp), where only an
+/// entry's owner can rename or delete it.
+fn dir_problem(owner: u32, mode: u32, me: u32) -> Option<&'static str> {
+    if owner != me && owner != ROOT {
+        Some("is owned by another user")
+    } else if mode & GROUP_OR_OTHER_WRITE != 0 && mode & STICKY == 0 {
         Some("is writable by group or others")
     } else {
         None
@@ -628,22 +676,26 @@ mod tests {
     }
 
     #[test]
-    fn private_means_mine_and_not_group_or_world_writable() {
-        assert_eq!(private_problem(501, 0o100600, 501), None);
-        assert_eq!(private_problem(501, 0o100644, 501), None);
-        assert_eq!(private_problem(501, 0o040755, 501), None);
+    fn file_must_be_mine_and_not_group_or_world_writable() {
+        assert_eq!(file_problem(501, 0o100600, 501), None);
+        assert_eq!(file_problem(501, 0o100644, 501), None);
+        assert!(file_problem(501, 0o100664, 501).unwrap().contains("group"));
         assert!(
-            private_problem(501, 0o100664, 501)
+            file_problem(0, 0o100644, 501)
                 .unwrap()
-                .contains("group")
+                .contains("another user")
         );
+    }
+
+    #[test]
+    fn folders_may_be_root_owned_or_sticky() {
+        assert_eq!(dir_problem(501, 0o040755, 501), None);
+        assert_eq!(dir_problem(0, 0o040755, 501), None);
+        assert_eq!(dir_problem(0, 0o041777, 501), None, "sticky /tmp is fine");
+        assert!(dir_problem(0, 0o040777, 501).unwrap().contains("group"));
+        assert!(dir_problem(501, 0o040775, 501).unwrap().contains("group"));
         assert!(
-            private_problem(501, 0o040777, 501)
-                .unwrap()
-                .contains("group")
-        );
-        assert!(
-            private_problem(0, 0o100644, 501)
+            dir_problem(502, 0o040755, 501)
                 .unwrap()
                 .contains("another user")
         );
@@ -671,6 +723,52 @@ mod tests {
             "a world-writable folder lets others replace the file"
         );
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn writable_grandparent_folder_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let top = tempfile::tempdir().unwrap();
+        let inner = top.path().join("a/b");
+        std::fs::create_dir_all(&inner).unwrap();
+        let f = inner.join("config.toml");
+        std::fs::write(&f, "x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(config_is_private(&f), Ok(()));
+        let a = top.path().join("a");
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = config_is_private(&f).unwrap_err();
+        assert!(err.contains("/a ") && err.contains("writable"), "{err}");
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn symlinked_config_is_checked_where_it_really_lives() {
+        use std::os::unix::fs::PermissionsExt;
+        let real_dir = tempfile::tempdir().unwrap();
+        let real = real_dir.path().join("real.toml");
+        std::fs::write(&real, "x").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let link = link_dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(config_is_private(&link).unwrap_err().contains("writable"));
+    }
+
+    #[test]
+    fn load_refuses_a_shared_config_and_reads_a_private_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("config.toml");
+        std::fs::write(&f, "min_free_gb = 1\nroots = [\"/a\"]\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load(&f, Path::new("/Users/t")).is_ok());
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let err = format!("{:#}", load(&f, Path::new("/Users/t")).unwrap_err());
+        assert!(
+            err.contains("not using") && err.contains("writable"),
+            "{err}"
+        );
     }
 
     #[test]

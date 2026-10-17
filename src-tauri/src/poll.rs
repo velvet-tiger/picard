@@ -196,9 +196,7 @@ impl<R: Runtime> Poller<R> {
 
     /// Re-reads the config file. A bad file keeps the last good config running.
     fn reload_config(&mut self) {
-        let loaded = std::fs::read_to_string(&self.config_path)
-            .with_context(|| format!("reading {}", self.config_path.display()))
-            .and_then(|text| config::parse(&text, &self.home));
+        let loaded = config::load(&self.config_path, &self.home);
         match loaded {
             Ok(c) => {
                 log::info!(

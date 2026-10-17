@@ -61,7 +61,7 @@ pub fn main(args: &[String]) -> i32 {
             eprintln!("picard: run removes files; add --yes to confirm\n{USAGE}");
             return 2;
         }
-        Command::Scan => load(parsed.config).map(|(c, path, env)| scan(&c, &path, &env)),
+        Command::Scan => load(parsed.config).map(|(c, _, env)| scan(&c, &env)),
         Command::Run => load(parsed.config).and_then(|(c, path, env)| run(&c, &path, &env)),
     };
     match result {
@@ -104,9 +104,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
 fn load(config_path: Option<PathBuf>) -> Result<(Config, PathBuf, ToolEnv)> {
     let home = std::env::home_dir().context("cannot find the home folder")?;
     let path = config_path.unwrap_or_else(|| config::config_path(&home));
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let config = config::parse(&text, &home).with_context(|| format!("in {}", path.display()))?;
+    let config = config::load(&path, &home)?;
     let env = ToolEnv::detect(&home, std::env::var_os("SHELL"));
     Ok((config, path, env))
 }
@@ -130,7 +128,7 @@ fn mounted_volumes(config: &Config) -> Vec<(Volume, DiskSpace)> {
         .collect()
 }
 
-fn scan(config: &Config, config_path: &std::path::Path, env: &ToolEnv) -> i32 {
+fn scan(config: &Config, env: &ToolEnv) -> i32 {
     let exclude = match tasks::build_exclude(&config.exclude) {
         Ok(e) => e,
         Err(e) => {
@@ -139,11 +137,7 @@ fn scan(config: &Config, config_path: &std::path::Path, env: &ToolEnv) -> i32 {
         }
     };
     let sizes = SizeCache::default();
-    let commands = config::config_is_private(config_path);
-    if let Err(why) = &commands {
-        println!("command tasks are off: config.toml must be private to you ({why})");
-    }
-    let tasks = tasks::from_config(&config.tasks, env, &config.tools, &commands);
+    let tasks = tasks::from_config(&config.tasks, env, &config.tools);
     for (volume, space) in mounted_volumes(config) {
         let ctx = Ctx::for_volume(&volume, &exclude, SystemTime::now(), &sizes)
             .with_search_roots(&config.roots);
