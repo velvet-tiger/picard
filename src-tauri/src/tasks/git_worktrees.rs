@@ -67,7 +67,7 @@ impl GitWorktrees {
             return Ok(None);
         }
         if in_use.contains(&wt.path) {
-            log::info!(
+            log::debug!(
                 "worktree {}: in use by a running process",
                 wt.path.display()
             );
@@ -86,7 +86,7 @@ impl GitWorktrees {
             .trim()
             .is_empty()
         {
-            log::info!("worktree {}: has uncommitted changes", wt.path.display());
+            log::debug!("worktree {}: has uncommitted changes", wt.path.display());
             return Ok(None);
         }
         let merged = self.git.check(
@@ -98,7 +98,7 @@ impl GitWorktrees {
             _ => false,
         };
         if !merged && !pushed {
-            log::info!(
+            log::debug!(
                 "worktree {}: has commits that are not in {default_branch} or pushed",
                 wt.path.display()
             );
@@ -187,7 +187,7 @@ impl GitWorktrees {
 
     fn scan_repo(&self, repo: &Path, ctx: &Ctx, in_use: &InUse) -> Result<Vec<(PathBuf, String)>> {
         let Some(default_branch) = self.default_branch(repo) else {
-            log::info!("{}: no main or master branch; skipping", repo.display());
+            log::debug!("{}: no main or master branch; skipping", repo.display());
             return Ok(Vec::new());
         };
         let raw = self
@@ -261,12 +261,20 @@ impl CleanupTask for GitWorktrees {
         // Without a working in-use list nothing is safe to remove, so the scan fails.
         let in_use = (self.in_use)().context("checking which worktrees are in use")?;
         let mut found = Vec::new();
-        for repo in find_repos(ctx) {
-            match self.scan_repo(&repo, ctx, &in_use) {
+        let repos = find_repos(ctx);
+        for repo in &repos {
+            match self.scan_repo(repo, ctx, &in_use) {
                 Ok(mut f) => found.append(&mut f),
                 Err(e) => log::warn!("{}: {e:#}", repo.display()),
             }
         }
+        // Per-worktree reasons for skipping are at debug level; with many
+        // worktrees they would otherwise flood the log on every scan.
+        log::info!(
+            "git_worktrees: {} candidate(s) in {} repo(s)",
+            found.len(),
+            repos.len()
+        );
         let paths: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
         let sizes = ctx.sizes.measure_all(&paths);
         Ok(found
