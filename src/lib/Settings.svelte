@@ -96,28 +96,39 @@
 
     <section class="panel">
       <h2>Threshold</h2>
-      <div class="row">
-        <span>Low when free space drops below</span>
-        <input type="number" min="0" step="any" bind:value={settings.threshold.value} />
-        <select
-          value={settings.threshold.unit}
-          onchange={(e) => setUnit(e.currentTarget.value as 'gb' | 'pct')}
-        >
-          <option value="gb">GB</option>
-          <option value="pct">%</option>
-        </select>
+      <div class="field">
+        <span>Low when free space is below</span>
+        <span class="control">
+          <input type="number" min="0" step="any" bind:value={settings.threshold.value} />
+          <select
+            value={settings.threshold.unit}
+            onchange={(e) => setUnit(e.currentTarget.value as 'gb' | 'pct')}
+          >
+            <option value="gb">GB</option>
+            <option value="pct">%</option>
+          </select>
+        </span>
       </div>
-      <div class="row">
-        <span>Stop cleaning once this much more is free (GB)</span>
-        <input type="number" min="0" step="any" bind:value={settings.recover_margin_gb} />
+      <div class="field">
+        <span>Stop cleaning once this much more is free</span>
+        <span class="control">
+          <input type="number" min="0" step="any" bind:value={settings.recover_margin_gb} />
+          <span class="unit">GB</span>
+        </span>
       </div>
-      <div class="row">
-        <span>Wait before alerting again (minutes)</span>
-        <input type="number" min="0" bind:value={settings.cooldown_minutes} />
+      <div class="field">
+        <span>Wait before alerting again</span>
+        <span class="control">
+          <input type="number" min="0" bind:value={settings.cooldown_minutes} />
+          <span class="unit">minutes</span>
+        </span>
       </div>
-      <div class="row">
-        <span>Check every (minutes)</span>
-        <input type="number" min="1" bind:value={settings.poll_minutes} />
+      <div class="field">
+        <span>Check free space every</span>
+        <span class="control">
+          <input type="number" min="1" bind:value={settings.poll_minutes} />
+          <span class="unit">minutes</span>
+        </span>
       </div>
     </section>
 
@@ -161,53 +172,73 @@
             >
             <button onclick={() => settings!.tasks.splice(i, 1)}>Remove</button>
           </div>
-          {#if task.type === 'git_worktrees'}
-            <div class="row opts">
-              <span>Remove merged worktrees idle for</span>
-              <input type="number" min="0" bind:value={task.min_idle_minutes} /> <span>minutes;
-                others idle for</span>
-              <input type="number" min="0" bind:value={task.stale_days} /> <span>days</span>
-            </div>
-          {:else if task.type === 'node_modules'}
-            <div class="row opts">
-              <span>Projects untouched for</span>
-              <input type="number" min="0" bind:value={task.stale_days} /> <span>days</span>
-              <label class="row"
-                ><input type="checkbox" bind:checked={task.prune_package_caches} /> Also prune npm
-                and pnpm caches</label
-              >
-            </div>
-          {:else if task.type === 'cargo_clean'}
-            <div class="row opts">
-              <select bind:value={task.mode}>
-                <option value="stale">Only projects untouched for</option>
-                <option value="all">Every project</option>
-              </select>
+          <div class="opts">
+            {#if task.type === 'git_worktrees'}
+              <div class="field">
+                <span>Merged worktrees, once idle for</span>
+                <span class="control">
+                  <input type="number" min="0" bind:value={task.min_idle_minutes} />
+                  <span class="unit">minutes</span>
+                </span>
+              </div>
+              <div class="field">
+                <span>Other worktrees, once idle for</span>
+                <span class="control">
+                  <input type="number" min="0" bind:value={task.stale_days} />
+                  <span class="unit">days</span>
+                </span>
+              </div>
+            {:else if task.type === 'node_modules'}
+              <div class="field">
+                <span>Projects untouched for</span>
+                <span class="control">
+                  <input type="number" min="0" bind:value={task.stale_days} />
+                  <span class="unit">days</span>
+                </span>
+              </div>
+              <label class="field check">
+                <span>Also prune npm and pnpm caches</span>
+                <span class="control">
+                  <input type="checkbox" bind:checked={task.prune_package_caches} />
+                </span>
+              </label>
+            {:else if task.type === 'cargo_clean'}
+              <div class="field">
+                <span>Clean</span>
+                <span class="control">
+                  <select bind:value={task.mode}>
+                    <option value="stale">Idle projects</option>
+                    <option value="all">Every project</option>
+                  </select>
+                </span>
+              </div>
               {#if task.mode === 'stale'}
-                <input type="number" min="0" bind:value={task.stale_days} /> <span>days</span>
+                <div class="field">
+                  <span>Projects untouched for</span>
+                  <span class="control">
+                    <input type="number" min="0" bind:value={task.stale_days} />
+                    <span class="unit">days</span>
+                  </span>
+                </div>
               {/if}
-            </div>
-          {:else if task.type === 'command'}
-            <div class="opts">
-              <div class="row">
-                <span>Name</span><input class="wide" bind:value={task.name} />
+            {:else if task.type === 'command'}
+              <div class="field">
+                <span>Name</span>
+                <input class="wide" bind:value={task.name} />
               </div>
-              <div class="row">
-                <span>Command</span><input
-                  class="wide path"
-                  bind:value={task.run}
-                  placeholder="docker system prune -f"
-                />
+              <div class="field">
+                <span>Command</span>
+                <input class="wide path" bind:value={task.run} placeholder="docker system prune -f" />
               </div>
-              <div class="row">
-                <span>Time limit (seconds)</span><input
-                  type="number"
-                  min="1"
-                  bind:value={task.timeout_secs}
-                />
+              <div class="field">
+                <span>Time limit</span>
+                <span class="control">
+                  <input type="number" min="1" bind:value={task.timeout_secs} />
+                  <span class="unit">seconds</span>
+                </span>
               </div>
-            </div>
-          {/if}
+            {/if}
+          </div>
         </div>
       {/each}
       <div class="row">
@@ -243,6 +274,34 @@
 <style>
   section .row {
     margin: 6px 0;
+  }
+  /* One option per row: label on the left, input and unit kept together on the right. */
+  .field {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 12px;
+    margin: 6px 0;
+  }
+  .field .wide {
+    width: 100%;
+    min-width: 0;
+  }
+  .field:has(.wide) {
+    grid-template-columns: 120px minmax(0, 1fr);
+  }
+  .control {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    justify-self: end;
+  }
+  .unit {
+    color: var(--muted);
+    min-width: 52px;
+  }
+  .check {
+    cursor: pointer;
   }
   .choice {
     display: block;

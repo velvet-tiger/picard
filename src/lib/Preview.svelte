@@ -5,6 +5,9 @@
     getHistory,
     errorText,
     formatBytes,
+    itemTitle,
+    shortPath,
+    tildePath,
     TASK_LABELS,
     type VolumePreview,
     type RunResult,
@@ -110,7 +113,9 @@
         {#if r.error}<p class="error">{r.error}</p>{/if}
         {#if r.stopped}<p class="muted">Stopped: {r.stopped}</p>{/if}
         {#each r.failed as f}
-          <p class="error"><span class="path">{f.path}</span>: {f.reason}</p>
+          <p class="error" title={tildePath(f.path)}>
+            {itemTitle(f.task, f.path)}: {f.reason}
+          </p>
         {/each}
       </div>
     {/each}
@@ -139,12 +144,17 @@
             <ul>
               {#each t.items as i}
                 <li>
-                  <label class="row">
+                  <label class="item" title={tildePath(i.path)}>
                     <input type="checkbox" bind:checked={checked[key(v.mount, i.path)]} />
+                    <span class="text">
+                      <span class="title"
+                        >{itemTitle(t.task, i.path)}
+                        <span class="muted reason">{i.reason}</span></span
+                      >
+                      <span class="path muted">{shortPath(i.path)}</span>
+                    </span>
                     <span class="size">{i.size_text}</span>
-                    <span class="path" title={i.path}>{i.path}</span>
                   </label>
-                  <div class="muted reason">{i.reason}</div>
                 </li>
               {/each}
             </ul>
@@ -169,9 +179,10 @@
       <h2>Recently removed</h2>
       <ul class="history">
         {#each history as h}
-          <li>
+          <li class="history-row" title={tildePath(h.path)}>
             <span class="muted">{new Date(h.time).toLocaleString()}</span>
-            {formatBytes(h.bytes)} <span class="path">{h.path}</span>
+            <span class="text">{itemTitle(h.task, h.path)}</span>
+            <span class="size">{formatBytes(h.bytes)}</span>
           </li>
         {/each}
       </ul>
@@ -199,14 +210,54 @@
   li:last-child {
     border-bottom: none;
   }
-  .size {
-    min-width: 64px;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
+  /* checkbox | name, reason and path | size */
+  .item {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    column-gap: 10px;
+    align-items: start;
+    cursor: pointer;
+  }
+  .item input {
+    margin-top: 2px;
+  }
+  .text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .title {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .reason {
-    margin-left: 96px;
+    font-weight: normal;
     font-size: 12px;
+    margin-left: 6px;
+  }
+  .item .path {
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .size {
+    text-align: right;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .history-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    column-gap: 10px;
+  }
+  .history-row .text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: block;
   }
   .footer {
     margin-top: 14px;

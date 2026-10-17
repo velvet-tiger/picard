@@ -106,6 +106,32 @@ export function errorText(e: unknown): string {
   return typeof e === 'string' ? e : e instanceof Error ? e.message : JSON.stringify(e)
 }
 
+/** Replaces the home folder with `~`. */
+export function tildePath(path: string): string {
+  return path.replace(/^\/Users\/[^/]+(?=\/|$)/, '~')
+}
+
+/**
+ * A path short enough for one line: the first two parts after the home
+ * folder, then `…`, then the last four, which keep the repo or project name
+ * (for example `harmony-proxy/.claude/worktrees/agent-…`).
+ */
+export function shortPath(path: string): string {
+  const parts = tildePath(path).split('/')
+  if (parts.length <= 7) return parts.join('/')
+  return [...parts.slice(0, 2), '…', ...parts.slice(-4)].join('/')
+}
+
+/** The most telling name for a candidate: its project, or the worktree itself. */
+export function itemTitle(task: TaskType, path: string): string {
+  const parts = path.split('/').filter(Boolean)
+  if (task === 'command') return path.replace(/^command: /, '')
+  if (task === 'git_worktrees') return parts.at(-1) ?? path
+  // node_modules and target live directly inside the project folder; its
+  // parent is included because names like `ts` or `web` say little alone.
+  return parts.slice(-3, -1).join('/') || path
+}
+
 export function formatBytes(bytes: number): string {
   const GB = 1e9
   if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`
