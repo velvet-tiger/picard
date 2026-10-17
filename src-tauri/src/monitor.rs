@@ -67,6 +67,17 @@ pub struct Alert {
     pub space: DiskSpace,
 }
 
+impl Alert {
+    /// Notification title and body, for example "Startup disk is low" and
+    /// "19 GB free (2%)".
+    pub fn message(&self) -> (String, String) {
+        (
+            format!("{} is low", self.name),
+            crate::disk::format_free(self.space),
+        )
+    }
+}
+
 /// Per-volume states, keyed by mount point. Mount point is used rather than
 /// `st_dev` because device numbers can be reused after a drive is remounted.
 pub type States = HashMap<PathBuf, State>;
@@ -229,6 +240,22 @@ mod tests {
         // Second pass: still low, but already fired, so nothing new.
         let (_, alerts) = evaluate(&states, &readings, &config, now + Duration::from_secs(300));
         assert!(alerts.is_empty());
+    }
+
+    #[test]
+    fn alert_message_names_the_volume() {
+        let alert = Alert {
+            name: "Startup disk".into(),
+            mount: PathBuf::from("/"),
+            space: space(19, 994),
+        };
+        assert_eq!(
+            alert.message(),
+            (
+                "Startup disk is low".to_string(),
+                "19 GB free (2%)".to_string()
+            )
+        );
     }
 
     #[test]

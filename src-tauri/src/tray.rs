@@ -1,76 +1,165 @@
 //! Menu bar icon and menu.
 //!
-//! The menu holds a disabled status line ("112 GB free (23%)"), a separator and
-//! Quit. The status line is refreshed on a fixed timer.
-
-use std::path::PathBuf;
-use std::time::Duration;
+//! The menu shows one disabled status line per volume, then Quit. The poll loop
+//! calls `Tray::show` after every check. The menu is rebuilt each time because it
+//! is small and the set of volumes changes as drives come and go.
 
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Runtime};
 
-use crate::disk;
+use crate::disk::{self, DiskSpace};
+use crate::volume::{UnavailableRoot, Volume};
 
 const TRAY_ID: &str = "picard";
 const MENU_QUIT: &str = "quit";
 
-// TODO(M2): replace with `poll_minutes` from config.toml once config.rs exists.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-
 // TODO(M7): placeholder monochrome icon. Replace with the final ok/low/cleaning set.
 const TRAY_ICON: &[u8] = include_bytes!("../icons/tray-template.png");
 
-/// Creates the tray icon and starts the timer that refreshes its status line.
-///
-/// `watched` is the path whose volume is reported. In M1 that is the home folder.
-pub fn install<R: Runtime>(app: &AppHandle<R>, watched: PathBuf) -> tauri::Result<()> {
-    let status = MenuItem::with_id(app, "status", "Reading disk…", false, None::<&str>)?;
-    let quit = MenuItem::with_id(app, MENU_QUIT, "Quit Picard", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&status, &PredefinedMenuItem::separator(app)?, &quit])?;
-
-    TrayIconBuilder::with_id(TRAY_ID)
-        .icon(Image::from_bytes(TRAY_ICON)?)
-        .icon_as_template(true)
-        .tooltip("Picard")
-        .menu(&menu)
-        .show_menu_on_left_click(true)
-        .on_menu_event(|app, event| {
-            if event.id() == MENU_QUIT {
-                app.exit(0);
-            }
-        })
-        .build(app)?;
-
-    tauri::async_runtime::spawn(refresh_status(status, watched));
-    Ok(())
+/// What the menu should say, built by the poll loop.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MenuView {
+    pub readings: Vec<(Volume, DiskSpace)>,
+    pub unavailable: Vec<UnavailableRoot>,
+    pub config_error: bool,
 }
 
-/// Updates the status line now and then on every tick, for the life of the app.
-async fn refresh_status<R: Runtime>(status: MenuItem<R>, watched: PathBuf) {
-    let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
-    loop {
-        ticker.tick().await;
-        let text = status_text(&watched);
-        if let Err(e) = status.set_text(&text) {
-            log::error!("could not update tray status line to {text:?}: {e}");
-        }
+/// Handle to the tray icon, used to replace its menu.
+pub struct Tray<R: Runtime> {
+    app: AppHandle<R>,
+    icon: TrayIcon<R>,
+}
+
+impl<R: Runtime> Tray<R> {
+    /// Creates the tray icon with a placeholder menu until the first check.
+    pub fn install(app: &AppHandle<R>) -> tauri::Result<Self> {
+        let menu = build_menu(app, &["Checking disks…".to_string()])?;
+        let icon = TrayIconBuilder::with_id(TRAY_ID)
+            .icon(Image::from_bytes(TRAY_ICON)?)
+            .icon_as_template(true)
+            .tooltip("Picard")
+            .menu(&menu)
+            .show_menu_on_left_click(true)
+            .on_menu_event(|app, event| {
+                if event.id() == MENU_QUIT {
+                    app.exit(0);
+                }
+            })
+            .build(app)?;
+        Ok(Self {
+            app: app.clone(),
+            icon,
+        })
+    }
+
+    /// Replaces the menu with one built from `view`.
+    pub fn show(&self, view: &MenuView) -> tauri::Result<()> {
+        let menu = build_menu(&self.app, &status_lines(view))?;
+        self.icon.set_menu(Some(menu))
     }
 }
 
-/// Reads the volume and formats the status line. A failed read is shown in the
-/// menu and logged, so a broken reading is never mistaken for a real number.
-fn status_text(watched: &std::path::Path) -> String {
-    match disk::query(watched) {
-        Ok(space) => {
-            let text = disk::format_free(space);
-            log::info!("{}: {text}", watched.display());
-            text
+fn build_menu<R: Runtime>(app: &AppHandle<R>, lines: &[String]) -> tauri::Result<Menu<R>> {
+    let menu = Menu::new(app)?;
+    for line in lines {
+        menu.append(&MenuItem::new(app, line, false, None::<&str>)?)?;
+    }
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        MENU_QUIT,
+        "Quit Picard",
+        true,
+        None::<&str>,
+    )?)?;
+    Ok(menu)
+}
+
+/// The disabled status lines at the top of the menu.
+///
+/// Mounted volumes come first, then roots that cannot be checked. Several
+/// roots on one unplugged drive share a name, so each name is listed once.
+pub fn status_lines(view: &MenuView) -> Vec<String> {
+    let mut lines = Vec::new();
+    if view.config_error {
+        lines.push("Config error, see log".to_string());
+    }
+    for (volume, space) in &view.readings {
+        lines.push(format!("{}: {}", volume.name, disk::format_free(*space)));
+    }
+    let mut seen = Vec::new();
+    for root in &view.unavailable {
+        if !seen.contains(&&root.name) {
+            seen.push(&root.name);
+            lines.push(format!("{}: {}", root.name, root.reason));
         }
-        Err(e) => {
-            log::error!("free-space query failed: {e}");
-            "Free space unavailable".to_string()
+    }
+    if lines.is_empty() {
+        lines.push("No roots configured".to_string());
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn volume(name: &str) -> Volume {
+        Volume {
+            dev: 1,
+            mount: PathBuf::from("/"),
+            name: name.to_string(),
+            roots: vec![],
         }
+    }
+
+    fn unavailable(name: &str, root: &str) -> UnavailableRoot {
+        UnavailableRoot {
+            root: PathBuf::from(root),
+            name: name.to_string(),
+            reason: "not mounted".to_string(),
+        }
+    }
+
+    #[test]
+    fn lists_volumes_then_unavailable_roots_once_each() {
+        let view = MenuView {
+            readings: vec![(
+                volume("Startup disk"),
+                DiskSpace {
+                    free_bytes: 19_000_000_000,
+                    total_bytes: 994_000_000_000,
+                },
+            )],
+            unavailable: vec![
+                unavailable("Projects", "/Volumes/Projects/a"),
+                unavailable("Projects", "/Volumes/Projects/b"),
+            ],
+            config_error: false,
+        };
+        assert_eq!(
+            status_lines(&view),
+            vec!["Startup disk: 19 GB free (2%)", "Projects: not mounted"]
+        );
+    }
+
+    #[test]
+    fn config_error_comes_first() {
+        let view = MenuView {
+            config_error: true,
+            ..MenuView::default()
+        };
+        assert_eq!(status_lines(&view), vec!["Config error, see log"]);
+    }
+
+    #[test]
+    fn empty_view_says_so() {
+        assert_eq!(
+            status_lines(&MenuView::default()),
+            vec!["No roots configured"]
+        );
     }
 }
