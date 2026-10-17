@@ -1,5 +1,6 @@
 mod config;
 mod disk;
+mod monitor;
 mod tray;
 mod volume;
 
