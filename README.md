@@ -203,3 +203,7 @@ make dmg APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
 `security find-identity -v -p codesigning` lists your identities. Builds are for Apple Silicon only, and they are not notarised. Notarising is needed only to share the `.dmg` with other Macs.
 
 The menu bar icons are drawn by `src-tauri/icons/make_tray_icons.py`. The app icon comes from `src-tauri/icons/app-icon.svg` through `pnpm tauri icon`.
+
+## Licence
+
+Picard is released under the [MIT License](LICENSE).
