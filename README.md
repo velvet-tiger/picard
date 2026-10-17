@@ -1,6 +1,6 @@
 # Picard
 
-Picard is a macOS menu bar app that watches free disk space. When a drive runs low, it finds build output and finished work you can safely remove: stale `node_modules`, Cargo `target/` folders, and merged git worktrees. It also runs any cleanup scripts you add.
+Picard is a macOS menu bar app that watches free disk space. When a drive runs low, it finds build output and finished work you can safely remove: stale `node_modules`, Cargo `target/` folders, Python virtualenvs, git-ignored build folders, and merged git worktrees. It can also ask uv, Homebrew, the iOS Simulator and bun to prune their caches, and it runs any cleanup scripts you add.
 
 It lives only in the menu bar. There is no Dock icon and no main window.
 
@@ -13,18 +13,21 @@ Picard only works inside the folders you list as **roots**, such as `~/working`.
 | `git_worktrees` | Linked git worktrees | Clean, not locked, not in use by any running process, and their commits are already in `main` (or `master`) or fully pushed. Merged ones go after `min_idle_minutes`, others after `stale_days`. |
 | `node_modules` | `node_modules` next to a `package.json` | The project has not changed for `stale_days`. |
 | `cargo_clean` | `target/` next to a `Cargo.toml` | The project has not changed for `stale_days`, or every project with `mode = "all"`. |
+| `python_venv` | `.venv` or `venv` holding a `pyvenv.cfg`, next to a `pyproject.toml`, `requirements.txt`, `setup.py`, `setup.cfg` or `Pipfile` | The project has not changed for `stale_days`. |
+| `build_output` | Folders named in `dirs` (`dist`, `build`, `.next`, `vendor` by default) | The project has not changed for `stale_days`, git ignores the folder, git tracks nothing inside it, and it holds no git repo of its own. |
+| `tool_caches` | Whatever each tool's own prune command removes | The tool is installed, switched on, and keeps its cache on the low drive. Off unless you add it. |
 | `command` | Whatever your script removes | It is enabled. |
 
 These rules always hold:
 
-- Nothing outside your roots is removed, and symlinks are never followed out of them.
+- Nothing outside your roots is removed, and symlinks are never followed out of them. Tool caches are the exception: Picard never deletes them itself. It asks each tool to prune its own cache.
 - Git branches are never deleted. Worktrees are removed with `git worktree remove`, never with `--force`.
 - A worktree with uncommitted or untracked changes is never removed.
 - Every item is checked again just before it is removed.
 - Every removal is logged to `history.jsonl`.
 - Only one cleanup runs at a time.
 
-One thing to know: removing a worktree also deletes files git ignores inside it, such as a local `.env`. Git's own `git worktree remove` behaves the same way.
+One thing to know: removing a worktree also deletes files git ignores inside it, such as a local `.env`. Git's own `git worktree remove` behaves the same way. The same goes for `build_output`: it trusts your `.gitignore`. If you keep files you cannot rebuild in an ignored `build` folder, add that folder to `exclude`.
 
 ## Modes
 
@@ -72,12 +75,28 @@ min_idle_minutes = 30
 [[task]]
 type = "node_modules"
 stale_days = 30
-prune_package_caches = false   # also run npm cache clean and pnpm store prune
+prune_package_caches = false   # also prune the npm and pnpm caches on the low drive
 
 [[task]]
 type = "cargo_clean"
 mode = "stale"            # or "all"
 stale_days = 14
+
+[[task]]
+type = "python_venv"
+stale_days = 30
+
+[[task]]
+type = "build_output"      # only folders git ignores and tracks nothing in
+stale_days = 30
+dirs = ["dist", "build", ".next", "vendor"]
+
+[[task]]
+type = "tool_caches"       # not in the default config; add it to opt in
+uv = true                 # uv cache prune
+homebrew = true           # brew cleanup --prune=all
+simulators = true         # xcrun simctl delete unavailable
+bun = true                # bun pm cache rm
 
 [[task]]
 type = "command"
@@ -88,6 +107,10 @@ enabled = false
 ```
 
 Every task also accepts `enabled = false`.
+
+`dirs` entries must be plain folder names. Picard refuses paths, `.git`, and names with glob characters such as `*`.
+
+Preview lists each `tool_caches` step with its cache's current size, but counts it as 0 bytes. Each tool keeps what is still in use, so Picard cannot know in advance how much a prune frees. Picard measures the space freed after the run. Docker is not part of `tool_caches`. Use a `command` task for it, as in the example above.
 
 ### Drives
 
@@ -121,6 +144,10 @@ Apps started from Finder do not see your shell's `PATH`. Picard asks your login 
 git = "/opt/homebrew/bin/git"
 npm = "~/.nvm/versions/node/v24.19.0/bin/npm"
 pnpm = "/opt/homebrew/bin/pnpm"
+uv = "~/.local/bin/uv"
+brew = "/opt/homebrew/bin/brew"
+bun = "~/.bun/bin/bun"
+xcrun = "/usr/bin/xcrun"
 ```
 
 ## Command line

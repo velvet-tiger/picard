@@ -38,6 +38,15 @@ stale_days = 30
 type = "cargo_clean"
 mode = "stale"
 stale_days = 14
+
+[[task]]
+type = "python_venv"
+stale_days = 30
+
+[[task]]
+type = "build_output"     # only folders git ignores and tracks nothing in
+stale_days = 30
+dirs = ["dist", "build", ".next", "vendor"]
 "#;
 
 const BYTES_PER_GB: f64 = 1_000_000_000.0;
@@ -202,6 +211,10 @@ pub struct ToolOverrides {
     pub git: Option<PathBuf>,
     pub npm: Option<PathBuf>,
     pub pnpm: Option<PathBuf>,
+    pub uv: Option<PathBuf>,
+    pub brew: Option<PathBuf>,
+    pub bun: Option<PathBuf>,
+    pub xcrun: Option<PathBuf>,
 }
 
 impl ToolOverrides {
@@ -210,6 +223,10 @@ impl ToolOverrides {
             "git" => self.git.as_deref(),
             "npm" => self.npm.as_deref(),
             "pnpm" => self.pnpm.as_deref(),
+            "uv" => self.uv.as_deref(),
+            "brew" => self.brew.as_deref(),
+            "bun" => self.bun.as_deref(),
+            "xcrun" => self.xcrun.as_deref(),
             _ => None,
         }
     }
@@ -284,6 +301,37 @@ pub enum TaskConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         depth: Option<u32>,
     },
+    /// Python virtualenvs (`.venv`, `venv`) in idle projects.
+    PythonVenv {
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default = "default_node_modules_stale_days")]
+        stale_days: u32,
+    },
+    /// Build output folders that git ignores, in idle projects.
+    BuildOutput {
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default = "default_node_modules_stale_days")]
+        stale_days: u32,
+        /// Folder names to look for. Each must be a plain name, not a path.
+        #[serde(default = "default_build_output_dirs")]
+        dirs: Vec<String>,
+    },
+    /// Asks developer tools to prune their own caches. Each switch turns one
+    /// tool on; a tool that is not installed is skipped.
+    ToolCaches {
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default = "default_true")]
+        uv: bool,
+        #[serde(default = "default_true")]
+        homebrew: bool,
+        #[serde(default = "default_true")]
+        simulators: bool,
+        #[serde(default = "default_true")]
+        bun: bool,
+    },
     Command {
         #[serde(default = "default_true")]
         enabled: bool,
@@ -308,6 +356,11 @@ fn default_node_modules_stale_days() -> u32 {
 }
 fn default_cargo_mode() -> CargoMode {
     CargoMode::Stale
+}
+fn default_build_output_dirs() -> Vec<String> {
+    ["dist", "build", ".next", "vendor"]
+        .map(String::from)
+        .to_vec()
 }
 fn default_command_timeout_secs() -> u64 {
     600
@@ -373,6 +426,10 @@ struct RawTools {
     git: Option<String>,
     npm: Option<String>,
     pnpm: Option<String>,
+    uv: Option<String>,
+    brew: Option<String>,
+    bun: Option<String>,
+    xcrun: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -419,6 +476,10 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
             .with_context(|| format!("exclude pattern {pattern:?} is not a valid glob"))?;
     }
 
+    for task in &raw.task {
+        validate_task(task)?;
+    }
+
     let volumes = raw
         .volume
         .iter()
@@ -439,6 +500,30 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
     })
 }
 
+/// Checks task options that serde cannot.
+fn validate_task(task: &TaskConfig) -> Result<()> {
+    if let TaskConfig::BuildOutput { dirs, .. } = task {
+        if dirs.is_empty() {
+            bail!("build_output dirs is empty; list folder names such as \"dist\"");
+        }
+        for d in dirs {
+            if d.is_empty()
+                || d == "."
+                || d == ".."
+                || d == ".git"
+                || d.contains('/')
+                || d.starts_with(':')
+                || d.chars().any(|c| c.is_control() || "*?[]\\".contains(c))
+            {
+                bail!(
+                    "build_output dirs entry {d:?} must be a plain folder name, not a path or pattern"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_tools(raw: &RawTools, home: &Path) -> Result<ToolOverrides> {
     let one = |name: &str, value: &Option<String>| -> Result<Option<PathBuf>> {
         value
@@ -450,6 +535,10 @@ fn parse_tools(raw: &RawTools, home: &Path) -> Result<ToolOverrides> {
         git: one("git", &raw.git)?,
         npm: one("npm", &raw.npm)?,
         pnpm: one("pnpm", &raw.pnpm)?,
+        uv: one("uv", &raw.uv)?,
+        brew: one("brew", &raw.brew)?,
+        bun: one("bun", &raw.bun)?,
+        xcrun: one("xcrun", &raw.xcrun)?,
     })
 }
 
@@ -536,7 +625,7 @@ mod tests {
         assert_eq!(c.cooldown_minutes, 60);
         assert_eq!(c.mode, Mode::Ask);
         assert_eq!(c.roots, vec![PathBuf::from("/Users/test/working")]);
-        assert_eq!(c.tasks.len(), 3);
+        assert_eq!(c.tasks.len(), 5);
         assert_eq!(
             c.tasks[2],
             TaskConfig::CargoClean {
@@ -544,6 +633,26 @@ mod tests {
                 mode: CargoMode::Stale,
                 stale_days: 14,
                 depth: None
+            }
+        );
+        assert_eq!(
+            c.tasks[3],
+            TaskConfig::PythonVenv {
+                enabled: true,
+                stale_days: 30
+            }
+        );
+        assert_eq!(
+            c.tasks[4],
+            TaskConfig::BuildOutput {
+                enabled: true,
+                stale_days: 30,
+                dirs: vec![
+                    "dist".into(),
+                    "build".into(),
+                    ".next".into(),
+                    "vendor".into()
+                ]
             }
         );
     }
@@ -685,6 +794,19 @@ mod tests {
         assert_eq!(c.tools.get("git"), Some(Path::new("/opt/homebrew/bin/git")));
         assert_eq!(c.tools.get("npm"), Some(Path::new("/Users/test/bin/npm")));
         assert_eq!(c.tools.get("pnpm"), None);
+        let c = parse_ok(
+            "min_free_gb = 1\nroots = [\"/a\"]\n[tools]\nuv = \"~/.local/bin/uv\"\nbrew = \"/opt/homebrew/bin/brew\"\nbun = \"/b/bun\"\nxcrun = \"/usr/bin/xcrun\"\n",
+        );
+        assert_eq!(
+            c.tools.get("uv"),
+            Some(Path::new("/Users/test/.local/bin/uv"))
+        );
+        assert_eq!(
+            c.tools.get("brew"),
+            Some(Path::new("/opt/homebrew/bin/brew"))
+        );
+        assert_eq!(c.tools.get("bun"), Some(Path::new("/b/bun")));
+        assert_eq!(c.tools.get("xcrun"), Some(Path::new("/usr/bin/xcrun")));
         assert!(
             parse_err("min_free_gb = 1\nroots = [\"/a\"]\n[tools]\ncargo = \"/x\"")
                 .contains("cargo")
@@ -809,6 +931,53 @@ mod tests {
             err.contains("not using") && err.contains("writable"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn build_output_dirs_must_be_plain_names() {
+        let base = "min_free_gb = 1\nroots = [\"/a\"]\n[[task]]\ntype = \"build_output\"\n";
+        assert!(matches!(
+            &parse_ok(base).tasks[0],
+            TaskConfig::BuildOutput { dirs, .. } if dirs.len() == 4
+        ));
+        for bad in [
+            "[]",
+            "[\"\"]",
+            "[\"..\"]",
+            "[\".git\"]",
+            "[\"a/dist\"]",
+            "[\"dist\\n\"]",
+            "[\":dist\"]",
+            "[\"dist*\"]",
+            "[\"[ab]\"]",
+        ] {
+            let err = parse_err(&format!("{base}dirs = {bad}\n"));
+            assert!(err.contains("build_output dirs"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn tool_caches_turns_every_tool_on_by_default() {
+        let base = "min_free_gb = 1\nroots = [\"/a\"]\n[[task]]\ntype = \"tool_caches\"\n";
+        assert_eq!(
+            parse_ok(base).tasks[0],
+            TaskConfig::ToolCaches {
+                enabled: true,
+                uv: true,
+                homebrew: true,
+                simulators: true,
+                bun: true
+            }
+        );
+        assert!(matches!(
+            parse_ok(&format!("{base}homebrew = false\n")).tasks[0],
+            TaskConfig::ToolCaches {
+                homebrew: false,
+                uv: true,
+                ..
+            }
+        ));
+        assert!(parse_err(&format!("{base}docker = true\n")).contains("docker"));
     }
 
     #[test]

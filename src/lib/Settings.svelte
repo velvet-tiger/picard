@@ -273,6 +273,56 @@
                   </span>
                 </div>
               {/if}
+            {:else if task.type === 'python_venv'}
+              <div class="field">
+                <span>Projects untouched for</span>
+                <span class="control">
+                  <input type="number" min="0" bind:value={task.stale_days} />
+                  <span class="unit">days</span>
+                </span>
+              </div>
+            {:else if task.type === 'build_output'}
+              <div class="field">
+                <span>Projects untouched for</span>
+                <span class="control">
+                  <input type="number" min="0" bind:value={task.stale_days} />
+                  <span class="unit">days</span>
+                </span>
+              </div>
+              <div class="field">
+                <span>Folder names</span>
+                <input
+                  class="wide path"
+                  bind:value={
+                    () => task.dirs.join(', '),
+                    (v: string) =>
+                      (task.dirs = v
+                        .split(',')
+                        .map((d) => d.trim())
+                        .filter(Boolean))
+                  }
+                  placeholder="dist, build, .next, vendor"
+                />
+              </div>
+              <p class="muted">Only folders git ignores and tracks nothing in.</p>
+            {:else if task.type === 'tool_caches'}
+              <p class="muted">Runs each tool's own prune command. Missing tools are skipped.</p>
+              <label class="field check">
+                <span>uv (uv cache prune)</span>
+                <span class="control"><input type="checkbox" bind:checked={task.uv} /></span>
+              </label>
+              <label class="field check">
+                <span>Homebrew (brew cleanup --prune=all)</span>
+                <span class="control"><input type="checkbox" bind:checked={task.homebrew} /></span>
+              </label>
+              <label class="field check">
+                <span>Unavailable iOS Simulators</span>
+                <span class="control"><input type="checkbox" bind:checked={task.simulators} /></span>
+              </label>
+              <label class="field check">
+                <span>bun (bun pm cache rm)</span>
+                <span class="control"><input type="checkbox" bind:checked={task.bun} /></span>
+              </label>
             {:else if task.type === 'command'}
               <div class="field">
                 <span>Name</span>
