@@ -738,6 +738,76 @@ mod tests {
         assert!(found.is_empty(), "{found:?}");
     }
 
+    /// Claude Code's agent worktrees have a submodule in the index but never
+    /// check it out, so its folder is empty and git can remove the worktree.
+    #[test]
+    fn worktree_with_unchecked_out_submodule_is_removed() {
+        let fx = Fixture::new(&[]);
+        let lib = fx.dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        git(&lib, &["init", "-q"]);
+        commit(&lib, "lib.txt");
+
+        let r = repo(&fx);
+        git(
+            &r,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                lib.to_str().unwrap(),
+                "vendor/lib",
+            ],
+        );
+        git(&r, &["commit", "-qm", "add submodule"]);
+        let wt = worktree(&r, "agent-sub");
+        assert!(wt.join(".gitmodules").exists());
+        assert_eq!(std::fs::read_dir(wt.join("vendor/lib")).unwrap().count(), 0);
+        age(&fx, &wt, 1);
+
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["agent-sub"]);
+        let report = t.run(&ctx, &found);
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(!wt.exists());
+    }
+
+    /// Files in a gitlink folder that is not checked out do not show in `git
+    /// status`, and `git worktree remove` would delete them.
+    #[test]
+    fn worktree_with_files_in_unchecked_out_submodule_folder_is_kept() {
+        let fx = Fixture::new(&[]);
+        let lib = fx.dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        git(&lib, &["init", "-q"]);
+        commit(&lib, "lib.txt");
+
+        let r = repo(&fx);
+        git(
+            &r,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                lib.to_str().unwrap(),
+                "vendor/lib",
+            ],
+        );
+        git(&r, &["commit", "-qm", "add submodule"]);
+        let wt = worktree(&r, "stray-files");
+        std::fs::write(wt.join("vendor/lib/notes.txt"), "mine").unwrap();
+        age(&fx, &wt, 1);
+
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
     #[test]
     fn formats_idle() {
         assert_eq!(format_idle(Duration::from_secs(45 * 60)), "45 min");
