@@ -300,6 +300,24 @@
                 />
               </div>
               <p class="muted">Only folders git ignores and tracks nothing in.</p>
+            {:else if task.type === 'tool_caches'}
+              <p class="muted">Runs each tool's own prune command. Missing tools are skipped.</p>
+              <label class="field check">
+                <span>uv (uv cache prune)</span>
+                <span class="control"><input type="checkbox" bind:checked={task.uv} /></span>
+              </label>
+              <label class="field check">
+                <span>Homebrew (brew cleanup --prune=all)</span>
+                <span class="control"><input type="checkbox" bind:checked={task.homebrew} /></span>
+              </label>
+              <label class="field check">
+                <span>Unavailable iOS Simulators</span>
+                <span class="control"><input type="checkbox" bind:checked={task.simulators} /></span>
+              </label>
+              <label class="field check">
+                <span>bun (bun pm cache rm)</span>
+                <span class="control"><input type="checkbox" bind:checked={task.bun} /></span>
+              </label>
             {:else if task.type === 'command'}
               <div class="field">
                 <span>Name</span>

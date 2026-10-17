@@ -211,6 +211,10 @@ pub struct ToolOverrides {
     pub git: Option<PathBuf>,
     pub npm: Option<PathBuf>,
     pub pnpm: Option<PathBuf>,
+    pub uv: Option<PathBuf>,
+    pub brew: Option<PathBuf>,
+    pub bun: Option<PathBuf>,
+    pub xcrun: Option<PathBuf>,
 }
 
 impl ToolOverrides {
@@ -219,6 +223,10 @@ impl ToolOverrides {
             "git" => self.git.as_deref(),
             "npm" => self.npm.as_deref(),
             "pnpm" => self.pnpm.as_deref(),
+            "uv" => self.uv.as_deref(),
+            "brew" => self.brew.as_deref(),
+            "bun" => self.bun.as_deref(),
+            "xcrun" => self.xcrun.as_deref(),
             _ => None,
         }
     }
@@ -309,6 +317,20 @@ pub enum TaskConfig {
         /// Folder names to look for. Each must be a plain name, not a path.
         #[serde(default = "default_build_output_dirs")]
         dirs: Vec<String>,
+    },
+    /// Asks developer tools to prune their own caches. Each switch turns one
+    /// tool on; a tool that is not installed is skipped.
+    ToolCaches {
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default = "default_true")]
+        uv: bool,
+        #[serde(default = "default_true")]
+        homebrew: bool,
+        #[serde(default = "default_true")]
+        simulators: bool,
+        #[serde(default = "default_true")]
+        bun: bool,
     },
     Command {
         #[serde(default = "default_true")]
@@ -404,6 +426,10 @@ struct RawTools {
     git: Option<String>,
     npm: Option<String>,
     pnpm: Option<String>,
+    uv: Option<String>,
+    brew: Option<String>,
+    bun: Option<String>,
+    xcrun: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -509,6 +535,10 @@ fn parse_tools(raw: &RawTools, home: &Path) -> Result<ToolOverrides> {
         git: one("git", &raw.git)?,
         npm: one("npm", &raw.npm)?,
         pnpm: one("pnpm", &raw.pnpm)?,
+        uv: one("uv", &raw.uv)?,
+        brew: one("brew", &raw.brew)?,
+        bun: one("bun", &raw.bun)?,
+        xcrun: one("xcrun", &raw.xcrun)?,
     })
 }
 
@@ -764,6 +794,19 @@ mod tests {
         assert_eq!(c.tools.get("git"), Some(Path::new("/opt/homebrew/bin/git")));
         assert_eq!(c.tools.get("npm"), Some(Path::new("/Users/test/bin/npm")));
         assert_eq!(c.tools.get("pnpm"), None);
+        let c = parse_ok(
+            "min_free_gb = 1\nroots = [\"/a\"]\n[tools]\nuv = \"~/.local/bin/uv\"\nbrew = \"/opt/homebrew/bin/brew\"\nbun = \"/b/bun\"\nxcrun = \"/usr/bin/xcrun\"\n",
+        );
+        assert_eq!(
+            c.tools.get("uv"),
+            Some(Path::new("/Users/test/.local/bin/uv"))
+        );
+        assert_eq!(
+            c.tools.get("brew"),
+            Some(Path::new("/opt/homebrew/bin/brew"))
+        );
+        assert_eq!(c.tools.get("bun"), Some(Path::new("/b/bun")));
+        assert_eq!(c.tools.get("xcrun"), Some(Path::new("/usr/bin/xcrun")));
         assert!(
             parse_err("min_free_gb = 1\nroots = [\"/a\"]\n[tools]\ncargo = \"/x\"")
                 .contains("cargo")
@@ -911,6 +954,30 @@ mod tests {
             let err = parse_err(&format!("{base}dirs = {bad}\n"));
             assert!(err.contains("build_output dirs"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn tool_caches_turns_every_tool_on_by_default() {
+        let base = "min_free_gb = 1\nroots = [\"/a\"]\n[[task]]\ntype = \"tool_caches\"\n";
+        assert_eq!(
+            parse_ok(base).tasks[0],
+            TaskConfig::ToolCaches {
+                enabled: true,
+                uv: true,
+                homebrew: true,
+                simulators: true,
+                bun: true
+            }
+        );
+        assert!(matches!(
+            parse_ok(&format!("{base}homebrew = false\n")).tasks[0],
+            TaskConfig::ToolCaches {
+                homebrew: false,
+                uv: true,
+                ..
+            }
+        ));
+        assert!(parse_err(&format!("{base}docker = true\n")).contains("docker"));
     }
 
     #[test]

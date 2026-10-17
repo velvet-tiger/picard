@@ -13,6 +13,7 @@ mod git_worktrees;
 mod in_use;
 mod size;
 pub mod stale_dirs;
+mod tool_caches;
 
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -142,9 +143,14 @@ pub fn from_config(
             } => {
                 let mut task = stale_dirs::node_modules(*stale_days);
                 if *prune_package_caches {
+                    let steps = [
+                        env.resolve("npm", overrides)
+                            .map(cache_prune::PruneStep::npm),
+                        env.resolve("pnpm", overrides)
+                            .map(cache_prune::PruneStep::pnpm),
+                    ];
                     let prune = cache_prune::CachePrune::new(
-                        env.resolve("npm", overrides),
-                        env.resolve("pnpm", overrides),
+                        steps.into_iter().flatten().collect(),
                         env.path_var(),
                         env.home().to_path_buf(),
                     );
@@ -172,6 +178,26 @@ pub fn from_config(
                 enabled: true,
                 stale_days,
             } => out.push(Box::new(stale_dirs::python_venv(*stale_days))),
+            TaskConfig::ToolCaches {
+                enabled: true,
+                uv,
+                homebrew,
+                simulators,
+                bun,
+            } => {
+                let steps = tool_cache_steps(env, overrides, *uv, *homebrew, *simulators, *bun);
+                if steps.is_empty() {
+                    log::warn!("tool_caches skipped: none of its tools were found or turned on");
+                } else {
+                    out.push(Box::new(tool_caches::ToolCaches::new(
+                        cache_prune::CachePrune::new(
+                            steps,
+                            env.path_var(),
+                            env.home().to_path_buf(),
+                        ),
+                    )));
+                }
+            }
             TaskConfig::BuildOutput {
                 enabled: true,
                 stale_days,
@@ -220,6 +246,41 @@ pub fn from_config(
         }
     }
     out
+}
+
+/// Prune steps for the tools that are turned on and installed. A missing tool
+/// is logged and left out, so one absent tool does not stop the others.
+fn tool_cache_steps(
+    env: &ToolEnv,
+    overrides: &ToolOverrides,
+    uv: bool,
+    homebrew: bool,
+    simulators: bool,
+    bun: bool,
+) -> Vec<cache_prune::PruneStep> {
+    use cache_prune::PruneStep;
+    /// Builds a step from the tool's path and the home folder.
+    type MakeStep = fn(PathBuf, &Path) -> PruneStep;
+    let wanted: [(bool, &str, MakeStep); 4] = [
+        (uv, "uv", |p, _| PruneStep::uv(p)),
+        (homebrew, "brew", |p, _| PruneStep::homebrew(p)),
+        (simulators, "xcrun", PruneStep::simulators),
+        (bun, "bun", |p, _| PruneStep::bun(p)),
+    ];
+    let mut steps = Vec::new();
+    for (on, tool, step) in wanted {
+        if !on {
+            continue;
+        }
+        match env.resolve(tool, overrides) {
+            Some(program) => steps.push(step(program, env.home())),
+            None => log::info!(
+                "tool_caches: {tool} not found on {}; skipping it",
+                env.path_var()
+            ),
+        }
+    }
+    steps
 }
 
 /// Compiles the `exclude` globs. Config validation already checked each one.
@@ -578,5 +639,38 @@ mod tests {
             .map(|t| t.id())
             .collect();
         assert_eq!(ids, vec!["command", "cargo_clean"]);
+    }
+
+    #[test]
+    fn tool_caches_keeps_only_tools_that_are_on_and_installed() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        for tool in ["uv", "brew"] {
+            let p = bin.path().join(tool);
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env = ToolEnv::from_dirs(Path::new("/Users/me"), vec![bin.path().to_path_buf()]);
+        let o = ToolOverrides::default();
+        let labels = |steps: Vec<cache_prune::PruneStep>| -> Vec<String> {
+            steps.into_iter().map(|s| s.label).collect()
+        };
+        // bun and xcrun are not on this PATH.
+        assert_eq!(
+            labels(tool_cache_steps(&env, &o, true, true, true, true)),
+            vec!["uv cache", "Homebrew cache"]
+        );
+        assert_eq!(
+            labels(tool_cache_steps(&env, &o, false, true, true, true)),
+            vec!["Homebrew cache"]
+        );
+        let none = vec![TaskConfig::ToolCaches {
+            enabled: true,
+            uv: false,
+            homebrew: false,
+            simulators: true,
+            bun: true,
+        }];
+        assert!(from_config(&none, &env, &o).is_empty());
     }
 }
