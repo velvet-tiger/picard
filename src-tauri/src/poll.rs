@@ -18,8 +18,8 @@ use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::env::ToolEnv;
 use crate::monitor::{self, States};
-use crate::runner::{self, DataPaths};
-use crate::tasks::SizeCache;
+use crate::runner;
+use crate::state::Shared;
 use crate::tray::{MenuView, Tray};
 use crate::volume::{self, UnavailableRoot, UuidCache, Volume};
 
@@ -131,39 +131,30 @@ fn scan(roots: &[PathBuf], uuids: &UuidCache) -> Scan {
 pub struct Poller<R: Runtime> {
     app: AppHandle<R>,
     tray: Tray<R>,
-    home: PathBuf,
-    config_path: PathBuf,
+    shared: Arc<Shared>,
     config: Option<Config>,
     config_error: bool,
     states: States,
-    sizes: Arc<SizeCache>,
-    uuids: Arc<UuidCache>,
-    /// Resolved once when the loop starts; asking the login shell takes about a second.
-    tools: Option<Arc<ToolEnv>>,
 }
 
 impl<R: Runtime> Poller<R> {
-    pub fn new(app: AppHandle<R>, tray: Tray<R>, home: PathBuf, config_path: PathBuf) -> Self {
+    pub fn new(app: AppHandle<R>, tray: Tray<R>, shared: Arc<Shared>) -> Self {
         Self {
             app,
             tray,
-            home,
-            config_path,
+            shared,
             config: None,
             config_error: false,
             states: States::new(),
-            sizes: Arc::new(SizeCache::default()),
-            uuids: Arc::new(UuidCache::default()),
-            tools: None,
         }
     }
 
     /// Runs until the app exits or every watcher sender is dropped.
     pub async fn run(mut self, mut rx: mpsc::Receiver<Wake>) {
-        let home = self.home.clone();
+        let home = self.shared.home.clone();
         let shell = std::env::var_os("SHELL");
         match tauri::async_runtime::spawn_blocking(move || ToolEnv::detect(&home, shell)).await {
-            Ok(env) => self.tools = Some(Arc::new(env)),
+            Ok(env) => self.shared.set_tools(env),
             Err(e) => log::error!("resolving tool PATH failed; cleanup tasks are off: {e}"),
         }
         self.reload_config();
@@ -196,7 +187,7 @@ impl<R: Runtime> Poller<R> {
 
     /// Re-reads the config file. A bad file keeps the last good config running.
     fn reload_config(&mut self) {
-        let loaded = config::load(&self.config_path, &self.home);
+        let loaded = config::load(&self.shared.config_path, &self.shared.home);
         match loaded {
             Ok(c) => {
                 log::info!(
@@ -267,7 +258,7 @@ impl<R: Runtime> Poller<R> {
 
     async fn scan_volumes(&self, config: &Config) -> Option<Scan> {
         let roots = config.roots.clone();
-        let uuids = Arc::clone(&self.uuids);
+        let uuids = Arc::clone(&self.shared.uuids);
         match tauri::async_runtime::spawn_blocking(move || scan(&roots, &uuids)).await {
             Ok(s) => Some(s),
             Err(e) => {
@@ -280,7 +271,7 @@ impl<R: Runtime> Poller<R> {
     /// Runs the cleanup tasks on one volume and reports the result.
     async fn clean(&self, config: &Config, volume: Volume) {
         log::info!("auto mode: cleaning {}", volume.name);
-        let Some(tools) = self.tools.clone() else {
+        let Some(tools) = self.shared.tools() else {
             self.notify(
                 &format!("{} is low", volume.name),
                 "Cleanup is off because tool paths could not be resolved. See the log.",
@@ -288,11 +279,11 @@ impl<R: Runtime> Poller<R> {
             return;
         };
         let config = config.clone();
-        let sizes = Arc::clone(&self.sizes);
-        let paths = DataPaths::beside(&self.config_path);
+        let sizes = Arc::clone(&self.shared.sizes);
+        let paths = self.shared.paths.clone();
         let name = volume.name.clone();
         let outcome = tauri::async_runtime::spawn_blocking(move || {
-            let run = runner::clean_volume(&config, &volume, &sizes, &paths, &tools);
+            let run = runner::clean_volume(&config, &volume, &sizes, &paths, &tools, None);
             let after = disk::query(&volume.mount).ok();
             (run, after)
         })

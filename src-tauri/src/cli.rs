@@ -5,7 +5,6 @@
 //! Both accept `--config <path>` to use a config other than the default.
 
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 
@@ -13,7 +12,7 @@ use crate::config::{self, Config};
 use crate::disk::{self, DiskSpace};
 use crate::env::ToolEnv;
 use crate::runner::{self, DataPaths, TaskScan, VolumeRun};
-use crate::tasks::{self, Ctx, SizeCache};
+use crate::tasks::SizeCache;
 use crate::volume::{self, Volume};
 
 const USAGE: &str = "usage:
@@ -129,22 +128,18 @@ fn mounted_volumes(config: &Config) -> Vec<(Volume, DiskSpace)> {
 }
 
 fn scan(config: &Config, env: &ToolEnv) -> i32 {
-    let exclude = match tasks::build_exclude(&config.exclude) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("picard: {e:#}");
-            return 1;
-        }
-    };
     let sizes = SizeCache::default();
-    let tasks = tasks::from_config(&config.tasks, env, &config.tools);
+    let mut code = 0;
     for (volume, space) in mounted_volumes(config) {
-        let ctx = Ctx::for_volume(&volume, &exclude, SystemTime::now(), &sizes)
-            .with_search_roots(&config.roots);
-        let scans = runner::preview(&tasks, &ctx);
-        print!("{}", format_scan(&volume.name, space, &scans));
+        match runner::preview_volume(config, &volume, &sizes, env) {
+            Ok(scans) => print!("{}", format_scan(&volume.name, space, &scans)),
+            Err(e) => {
+                eprintln!("picard: {}: {e:#}", volume.name);
+                code = 1;
+            }
+        }
     }
-    0
+    code
 }
 
 fn run(config: &Config, config_path: &std::path::Path, env: &ToolEnv) -> Result<i32> {
@@ -152,7 +147,7 @@ fn run(config: &Config, config_path: &std::path::Path, env: &ToolEnv) -> Result<
     let sizes = SizeCache::default();
     let mut code = 0;
     for (volume, _) in mounted_volumes(config) {
-        match runner::clean_volume(config, &volume, &sizes, &paths, env) {
+        match runner::clean_volume(config, &volume, &sizes, &paths, env, None) {
             Ok(result) => {
                 print!("{}", format_run(&volume.name, &result));
                 if !result.failed.is_empty() {

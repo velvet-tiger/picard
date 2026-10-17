@@ -7,9 +7,12 @@ mod monitor;
 mod poll;
 mod proc;
 mod runner;
+mod state;
 mod tasks;
 mod tray;
 mod volume;
+
+use std::sync::Arc;
 
 use tauri::Manager;
 use tokio::sync::mpsc;
@@ -49,7 +52,9 @@ pub fn run() {
                 Err(e) => log::error!("live reload and drive detection are off: {e:#}"),
             }
 
-            let poller = poll::Poller::new(app.handle().clone(), tray, home, config_path);
+            let shared = Arc::new(state::Shared::new(home, config_path));
+            app.manage(Arc::clone(&shared));
+            let poller = poll::Poller::new(app.handle().clone(), tray, shared);
             tauri::async_runtime::spawn(poller.run(rx));
             Ok(())
         })

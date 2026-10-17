@@ -4,6 +4,7 @@
 //! and stops once the volume is back above `threshold + recover_margin`, so the
 //! cheap, safe tasks listed first are often the only ones that run.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -109,24 +110,26 @@ impl VolumeRun {
 pub fn run_tasks(
     tasks: &[Box<dyn CleanupTask>],
     ctx: &Ctx,
-    target_free: u64,
+    scope: &Scope,
     read_free: &dyn Fn() -> io::Result<u64>,
     record: &mut dyn FnMut(&'static str, &[Removed]),
 ) -> VolumeRun {
     let mut out = VolumeRun::default();
     for task in tasks {
-        match read_free() {
-            Ok(free) if free >= target_free => {
-                out.stopped = Some("enough space is free".to_string());
-                break;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                out.stopped = Some(format!("cannot read free space: {e}"));
-                break;
+        if let Scope::UntilFree(target_free) = scope {
+            match read_free() {
+                Ok(free) if free >= *target_free => {
+                    out.stopped = Some("enough space is free".to_string());
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    out.stopped = Some(format!("cannot read free space: {e}"));
+                    break;
+                }
             }
         }
-        let candidates = match task.scan(ctx) {
+        let scanned = match task.scan(ctx) {
             Ok(c) => c,
             Err(e) => {
                 log::error!("{} scan failed: {e:#}", task.id());
@@ -135,6 +138,10 @@ pub fn run_tasks(
                 continue;
             }
         };
+        let candidates = scope.filter(scanned);
+        if candidates.is_empty() {
+            continue;
+        }
         let report = task.run(ctx, &candidates);
         record(task.id(), &report.removed);
         out.removed
@@ -177,20 +184,72 @@ pub fn outcome_message(
     }
 }
 
+/// How much of a volume a run may clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    /// Every candidate, stopping between tasks once free space reaches this many bytes.
+    UntilFree(u64),
+    /// Only these paths, and only if a fresh scan still proposes them. Used for
+    /// the Preview window: a stale or tampered selection can never remove
+    /// anything Picard would not have proposed itself. No early stop, because
+    /// the user picked exactly what to remove.
+    Selected(HashSet<PathBuf>),
+}
+
+impl Scope {
+    fn filter(&self, candidates: Vec<Candidate>) -> Vec<Candidate> {
+        match self {
+            Scope::UntilFree(_) => candidates,
+            Scope::Selected(chosen) => candidates
+                .into_iter()
+                .filter(|c| chosen.contains(&c.path))
+                .collect(),
+        }
+    }
+}
+
+/// The free-space target for a volume: its threshold plus the recovery margin.
+pub fn target_free(config: &Config, volume: &Volume, total_bytes: u64) -> u64 {
+    config
+        .threshold_for(&volume.mount, volume.uuid.as_deref())
+        .bytes(total_bytes)
+        .saturating_add(config.recover_margin_bytes)
+}
+
+/// Lists what every enabled task would remove on one volume. Changes nothing.
+pub fn preview_volume(
+    config: &Config,
+    volume: &Volume,
+    sizes: &SizeCache,
+    env: &ToolEnv,
+) -> Result<Vec<TaskScan>> {
+    let exclude = tasks::build_exclude(&config.exclude)?;
+    let ctx = Ctx::for_volume(volume, &exclude, SystemTime::now(), sizes)
+        .with_search_roots(&config.roots);
+    let tasks = tasks::from_config(&config.tasks, env, &config.tools);
+    Ok(preview(&tasks, &ctx))
+}
+
 /// Cleans one volume for real: takes the lock, runs the tasks and writes history.
+/// With no `selection`, it cleans until the volume is back above its target.
+/// With one, it removes only those paths (see `Scope::Selected`).
 pub fn clean_volume(
     config: &Config,
     volume: &Volume,
     sizes: &SizeCache,
     paths: &DataPaths,
     env: &ToolEnv,
+    selection: Option<HashSet<PathBuf>>,
 ) -> Result<VolumeRun> {
     let _lock = RunLock::acquire(&paths.lock)?;
-    let space = disk::query(&volume.mount)?;
-    let target_free = config
-        .threshold_for(&volume.mount, volume.uuid.as_deref())
-        .bytes(space.total_bytes)
-        .saturating_add(config.recover_margin_bytes);
+    let scope = match selection {
+        Some(chosen) => Scope::Selected(chosen),
+        None => Scope::UntilFree(target_free(
+            config,
+            volume,
+            disk::query(&volume.mount)?.total_bytes,
+        )),
+    };
     let exclude = tasks::build_exclude(&config.exclude)?;
     let ctx = Ctx::for_volume(volume, &exclude, SystemTime::now(), sizes)
         .with_search_roots(&config.roots);
@@ -211,13 +270,7 @@ pub fn clean_volume(
             log::error!("could not write history: {e:#}");
         }
     };
-    Ok(run_tasks(
-        &tasks,
-        &ctx,
-        target_free,
-        &read_free,
-        &mut record,
-    ))
+    Ok(run_tasks(&tasks, &ctx, &scope, &read_free, &mut record))
 }
 
 #[cfg(test)]
@@ -249,9 +302,13 @@ mod tests {
         let fx = fixture();
         let ctx = fx.ctx();
         let mut recorded = Vec::new();
-        let run = run_tasks(&two_tasks(), &ctx, 100, &|| Ok(0), &mut |t, r| {
-            recorded.push((t, r.len()))
-        });
+        let run = run_tasks(
+            &two_tasks(),
+            &ctx,
+            &Scope::UntilFree(100),
+            &|| Ok(0),
+            &mut |t, r| recorded.push((t, r.len())),
+        );
         assert_eq!(run.removed.len(), 2);
         assert_eq!(recorded, vec![("node_modules", 1), ("cargo_clean", 1)]);
         assert!(run.stopped.is_none());
@@ -268,7 +325,13 @@ mod tests {
             reads.set(reads.get() + 1);
             Ok(if reads.get() == 1 { 0 } else { 100 })
         };
-        let run = run_tasks(&two_tasks(), &ctx, 100, &read_free, &mut |_, _| {});
+        let run = run_tasks(
+            &two_tasks(),
+            &ctx,
+            &Scope::UntilFree(100),
+            &read_free,
+            &mut |_, _| {},
+        );
         assert_eq!(run.removed.len(), 1);
         assert_eq!(run.removed[0].0, "node_modules");
         assert_eq!(run.stopped.as_deref(), Some("enough space is free"));
@@ -284,12 +347,38 @@ mod tests {
         let run = run_tasks(
             &two_tasks(),
             &fx.ctx(),
-            100,
+            &Scope::UntilFree(100),
             &|| Err(io::Error::other("gone")),
             &mut |_, _| {},
         );
         assert!(run.removed.is_empty());
         assert!(run.stopped.unwrap().contains("gone"));
+    }
+
+    #[test]
+    fn selection_removes_only_chosen_paths_that_a_fresh_scan_proposes() {
+        let fx = fixture();
+        let ctx = fx.ctx();
+        let web = fx.root.join("web/node_modules").canonicalize().unwrap();
+        // A real folder the scan would never propose, as a tampered request might send.
+        fx.file("rs/src/main.rs", 1);
+        let outsider = fx.root.join("rs/src").canonicalize().unwrap();
+        let chosen: HashSet<PathBuf> = [web.clone(), outsider.clone()].into_iter().collect();
+        // Free space reads high, which would stop an UntilFree run at once.
+        let run = run_tasks(
+            &two_tasks(),
+            &ctx,
+            &Scope::Selected(chosen),
+            &|| Ok(u64::MAX),
+            &mut |_, _| {},
+        );
+        assert_eq!(run.removed.len(), 1, "{run:?}");
+        assert_eq!(run.removed[0].1.path, web);
+        assert!(
+            fx.root.join("rs/target").exists(),
+            "unselected target must survive"
+        );
+        assert!(outsider.exists(), "unproposed path must survive");
     }
 
     #[test]
