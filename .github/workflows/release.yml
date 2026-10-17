@@ -1,0 +1,143 @@
+# Builds Picard for Apple Silicon and attaches the .dmg to a draft GitHub
+# release. Push a tag such as v0.1.0, or run it by hand from the Actions tab.
+#
+# Signing is optional. With all of these repository secrets set, the app is
+# signed with a Developer ID and notarised by the Tauri CLI:
+#   APPLE_CERTIFICATE           base64 of the Developer ID .p12 (base64 -i cert.p12)
+#   APPLE_CERTIFICATE_PASSWORD  password of that .p12
+#   APPLE_SIGNING_IDENTITY      e.g. "Developer ID Application: Velvet Tiger (TEAMID)"
+#   APPLE_ID                    Apple ID email used to notarise
+#   APPLE_PASSWORD              app-specific password for that Apple ID
+#   APPLE_TEAM_ID               ten-character team ID
+# Without them the build is ad-hoc signed, and the release notes explain how
+# to open it.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Check the tag matches the app version
+        run: |
+          version="${TAG#v}"
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -1)
+          tauri_version=$(node -p 'require("./src-tauri/tauri.conf.json").version')
+          npm_version=$(node -p 'require("./package.json").version')
+          echo "tag=$version Cargo.toml=$cargo_version tauri.conf.json=$tauri_version package.json=$npm_version"
+          if [[ "$cargo_version" != "$version" || "$tauri_version" != "$version" || "$npm_version" != "$version" ]]; then
+            echo "::error::Tag $TAG does not match the version in every file. Update all three before tagging."
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - run: pnpm install --frozen-lockfile
+
+      # Secrets that are not set arrive as empty strings. They are only
+      # exported when present, because the Makefile's `?=` default for
+      # APPLE_SIGNING_IDENTITY does not apply to a variable that is set but empty.
+      - name: Choose signing mode
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          names=(APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID)
+          missing=()
+          for name in "${names[@]}"; do
+            [[ -n "${!name}" ]] || missing+=("$name")
+          done
+          if [[ ${#missing[@]} -eq 0 ]]; then
+            for name in "${names[@]}"; do
+              delimiter="EOF_$(uuidgen)"
+              printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "${!name}" "$delimiter" >> "$GITHUB_ENV"
+            done
+            echo "SIGNED=true" >> "$GITHUB_ENV"
+            echo "Signing with a Developer ID and notarising."
+          elif [[ ${#missing[@]} -eq ${#names[@]} ]]; then
+            echo "SIGNED=false" >> "$GITHUB_ENV"
+            echo "::warning::No Apple signing secrets are set. The build will be ad-hoc signed."
+          else
+            echo "::error::Some Apple signing secrets are set but these are missing: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Check and build
+        run: make dmg
+
+      - name: Verify the build
+        run: make verify
+
+      - name: Write release notes
+        run: |
+          {
+            echo "Picard $VERSION for Apple Silicon Macs."
+            echo
+            echo "Open the .dmg and drag Picard to Applications."
+            if [[ "$SIGNED" != "true" ]]; then
+              echo
+              echo "This build is not signed with a Developer ID, so macOS will refuse to open it at first."
+              echo "After copying it to Applications, run this once in Terminal:"
+              echo
+              echo '```bash'
+              echo "xattr -cr /Applications/Picard.app"
+              echo '```'
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+
+      # Re-running the workflow replaces the .dmg on the existing release
+      # instead of failing, so a failed upload can be retried.
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dmg="src-tauri/target/release/bundle/dmg/Picard_${VERSION}_aarch64.dmg"
+          test -f "$dmg"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$dmg" --clobber
+          else
+            gh release create "$TAG" "$dmg" --draft --verify-tag \
+              --title "Picard $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
