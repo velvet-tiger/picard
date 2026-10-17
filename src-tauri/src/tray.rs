@@ -11,7 +11,7 @@ use tauri::{AppHandle, Runtime};
 
 use crate::disk::{self, DiskSpace};
 use crate::volume::{UnavailableRoot, Volume};
-use crate::windows::{self, Window};
+use crate::windows::{self, Tab};
 
 const TRAY_ID: &str = "picard";
 const MENU_QUIT: &str = "quit";
@@ -106,10 +106,8 @@ impl<R: Runtime> Tray<R> {
             .show_menu_on_left_click(true)
             .on_menu_event(|app, event| {
                 let opened = match event.id().as_ref() {
-                    MENU_CLEAN => windows::open(app, Window::Preview).map_err(|e| e.to_string()),
-                    MENU_SETTINGS => {
-                        windows::open(app, Window::Settings).map_err(|e| e.to_string())
-                    }
+                    MENU_CLEAN => windows::open(app, Tab::Clean).map_err(|e| e.to_string()),
+                    MENU_SETTINGS => windows::open(app, Tab::Settings).map_err(|e| e.to_string()),
                     MENU_LOG => windows::open_log(app),
                     MENU_QUIT => {
                         app.exit(0);

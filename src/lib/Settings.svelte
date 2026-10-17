@@ -83,7 +83,11 @@
     }
   }
 
-  async function close(discard = false) {
+  /**
+   * Closes the window, or shows the unsaved-changes bar first when there are edits.
+   * App.svelte calls this for ⌘W and Escape from either tab.
+   */
+  export async function close(discard = false) {
     if (dirty && !discard) {
       confirmingClose = true
       return
@@ -95,13 +99,16 @@
     }
   }
 
-  // A menu bar app has no Window menu, so ⌘W does nothing unless handled here.
-  function onKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' || (e.metaKey && e.key.toLowerCase() === 'w')) {
-      e.preventDefault()
-      if (confirmingClose) confirmingClose = false
-      else close()
-    }
+  /** True when there are edits that closing the window would lose. */
+  export function hasUnsavedChanges(): boolean {
+    return dirty
+  }
+
+  /** Hides the unsaved-changes bar. Returns false when it was not showing. */
+  export function dismissCloseConfirm(): boolean {
+    if (!confirmingClose) return false
+    confirmingClose = false
+    return true
   }
 
   function move(i: number, by: number) {
@@ -119,8 +126,6 @@
 
   load()
 </script>
-
-<svelte:window onkeydown={onKey} />
 
 <main>
   <h1>Settings</h1>
