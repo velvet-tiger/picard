@@ -19,8 +19,66 @@ const MENU_CLEAN: &str = "clean";
 const MENU_SETTINGS: &str = "settings";
 const MENU_LOG: &str = "open_log";
 
-// TODO(M7): placeholder monochrome icon. Replace with the final ok/low/cleaning set.
-const TRAY_ICON: &[u8] = include_bytes!("../icons/tray-template.png");
+// Template images (black on transparent) that macOS tints for the menu bar.
+// Drawn by icons/make_tray_icons.py.
+const ICON_OK: &[u8] = include_bytes!("../icons/tray-ok.png");
+const ICON_LOW: &[u8] = include_bytes!("../icons/tray-low.png");
+const ICON_CLEANING: &[u8] = include_bytes!("../icons/tray-cleaning.png");
+
+/// What the menu bar icon shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayState {
+    Ok,
+    Low,
+    Cleaning,
+}
+
+impl TrayState {
+    /// Cleaning wins over low, and low over ok: what Picard is doing matters
+    /// more than what it last measured.
+    pub fn from_flags(cleaning: bool, low: bool) -> Self {
+        if cleaning {
+            TrayState::Cleaning
+        } else if low {
+            TrayState::Low
+        } else {
+            TrayState::Ok
+        }
+    }
+
+    fn icon(self) -> &'static [u8] {
+        match self {
+            TrayState::Ok => ICON_OK,
+            TrayState::Low => ICON_LOW,
+            TrayState::Cleaning => ICON_CLEANING,
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            TrayState::Ok => "Picard",
+            TrayState::Low => "Picard: disk space is low",
+            TrayState::Cleaning => "Picard: cleaning",
+        }
+    }
+}
+
+/// Sets the menu bar icon to match `state`. Callable from any thread that has
+/// an `AppHandle`, so window commands can show cleaning too.
+pub fn set_state<R: Runtime>(app: &AppHandle<R>, state: TrayState) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        log::warn!("tray icon not found; cannot show {state:?}");
+        return;
+    };
+    let result = Image::from_bytes(state.icon()).and_then(|img| {
+        tray.set_icon(Some(img))?;
+        tray.set_icon_as_template(true)?;
+        tray.set_tooltip(Some(state.tooltip()))
+    });
+    if let Err(e) = result {
+        log::error!("could not set tray icon to {state:?}: {e}");
+    }
+}
 
 /// What the menu should say, built by the poll loop.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -41,7 +99,7 @@ impl<R: Runtime> Tray<R> {
     pub fn install(app: &AppHandle<R>) -> tauri::Result<Self> {
         let menu = build_menu(app, &["Checking disks…".to_string()])?;
         let icon = TrayIconBuilder::with_id(TRAY_ID)
-            .icon(Image::from_bytes(TRAY_ICON)?)
+            .icon(Image::from_bytes(ICON_OK)?)
             .icon_as_template(true)
             .tooltip("Picard")
             .menu(&menu)
@@ -169,6 +227,13 @@ mod tests {
             status_lines(&view),
             vec!["Startup disk: 19 GB free (2%)", "Projects: not mounted"]
         );
+    }
+
+    #[test]
+    fn cleaning_beats_low_beats_ok() {
+        assert_eq!(TrayState::from_flags(true, true), TrayState::Cleaning);
+        assert_eq!(TrayState::from_flags(false, true), TrayState::Low);
+        assert_eq!(TrayState::from_flags(false, false), TrayState::Ok);
     }
 
     #[test]

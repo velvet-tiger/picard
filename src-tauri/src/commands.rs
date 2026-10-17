@@ -171,12 +171,14 @@ pub async fn preview(state: SharedState<'_>) -> Result<Vec<VolumePreview>, Strin
 }
 
 #[tauri::command]
-pub async fn run_selected(
+pub async fn run_selected<R: Runtime>(
+    app: AppHandle<R>,
     state: SharedState<'_>,
     selections: Vec<Selection>,
 ) -> Result<Vec<RunResult>, String> {
     let shared = Arc::clone(&state);
     blocking(move || {
+        let _cleaning = shared.start_cleaning(&app);
         let config = load_config(&shared)?;
         let tools = shared.tools().ok_or(STILL_STARTING)?;
         let found = poll::scan(&config.roots, &shared.uuids);
@@ -283,10 +285,7 @@ fn status_view(
                 name: v.name.clone(),
                 mount: v.mount.display().to_string(),
                 free_text: disk::format_free(*space),
-                low: space.free_bytes
-                    < config
-                        .threshold_for(&v.mount, v.uuid.as_deref())
-                        .bytes(space.total_bytes),
+                low: crate::monitor::is_low(config, v, *space),
             })
             .collect(),
         unavailable: unavailable

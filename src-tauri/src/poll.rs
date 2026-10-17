@@ -286,6 +286,11 @@ impl<R: Runtime> Poller<R> {
         if cleaned && let Some(after) = self.scan_volumes(&config).await {
             found = after;
         }
+        let low = found
+            .readings
+            .iter()
+            .any(|(v, space)| monitor::is_low(&config, v, *space));
+        self.shared.set_low(&self.app, low);
         self.show(MenuView {
             readings: found.readings,
             unavailable: found.unavailable,
@@ -345,6 +350,7 @@ impl<R: Runtime> Poller<R> {
             );
             return;
         };
+        let _cleaning = self.shared.start_cleaning(&self.app);
         let config = config.clone();
         let sizes = Arc::clone(&self.shared.sizes);
         let paths = self.shared.paths.clone();

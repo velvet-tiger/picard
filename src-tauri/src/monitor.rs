@@ -87,6 +87,14 @@ impl Alert {
     }
 }
 
+/// True if `space` on `volume` is below that volume's threshold.
+pub fn is_low(config: &Config, volume: &Volume, space: DiskSpace) -> bool {
+    space.free_bytes
+        < config
+            .threshold_for(&volume.mount, volume.uuid.as_deref())
+            .bytes(space.total_bytes)
+}
+
 /// Per-volume states, keyed by mount point. Mount point is used rather than
 /// `st_dev` because device numbers can be reused after a drive is remounted.
 pub type States = HashMap<PathBuf, State>;
