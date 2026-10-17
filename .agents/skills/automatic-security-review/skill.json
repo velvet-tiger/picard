@@ -1,0 +1,26 @@
+{
+  "$schema": "https://skills.json.org/schema/1.0.0/skills.schema.json",
+  "name": "automatic-security-review",
+  "version": "2.0.0",
+  "description": "Adversarial security review of a diff and the code paths it reaches, with per-language and per-platform checks",
+  "author": {
+    "name": "Automatic",
+    "url": "https://github.com/velvet-tiger/automatic"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/velvet-tiger/automatic.git",
+    "directory": "src-tauri/assets/skills/automatic-security-review"
+  },
+  "keywords": ["security", "vulnerability", "auth", "review", "adversarial-review"],
+  "skills": [
+    {
+      "name": "automatic-security-review",
+      "path": ".",
+      "description": "Adversarial security review of a ticket's production diff, the code paths it reaches, and its dependency and infrastructure changes. Use after development work, alongside the QA Reviewer skill.",
+      "category": "development",
+      "tags": ["security", "vulnerability", "auth", "review", "adversarial-review", "data-flow", "dependencies", "infrastructure"]
+    }
+  ]
+}
