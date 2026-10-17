@@ -1,3 +1,4 @@
+pub mod cli;
 mod config;
 mod disk;
 mod history;

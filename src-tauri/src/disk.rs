@@ -64,21 +64,25 @@ fn statfs(path: &Path) -> io::Result<libc::statfs> {
     Ok(unsafe { stat.assume_init() })
 }
 
+const MB: f64 = 1_000_000.0;
 const GB: f64 = 1_000_000_000.0;
 const TB: f64 = 1_000_000_000_000.0;
 
 /// Formats a byte count in decimal units, matching how Finder reports capacity.
 ///
 /// Values under 10 GB keep one decimal place, because "3 GB" versus "3.4 GB"
-/// matters when space is tight. Values of 1 TB or more switch to TB.
+/// matters when space is tight. Values under 1 GB switch to whole MB so small
+/// folders do not read as "0.0 GB". Values of 1 TB or more switch to TB.
 pub fn format_bytes(bytes: u64) -> String {
     let b = bytes as f64;
     if b >= TB {
         format!("{:.1} TB", b / TB)
     } else if b >= 10.0 * GB {
         format!("{:.0} GB", b / GB)
-    } else {
+    } else if b >= GB {
         format!("{:.1} GB", b / GB)
+    } else {
+        format!("{:.0} MB", b / MB)
     }
 }
 
@@ -130,6 +134,13 @@ mod tests {
     }
 
     #[test]
+    fn switches_to_megabytes_below_one_gigabyte() {
+        assert_eq!(format_bytes(3_002_368), "3 MB");
+        assert_eq!(format_bytes(203_000_000), "203 MB");
+        assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
+    }
+
+    #[test]
     fn switches_to_terabytes() {
         assert_eq!(format_bytes(1_000_000_000_000), "1.0 TB");
         assert_eq!(format_bytes(2_460_000_000_000), "2.5 TB");
@@ -137,12 +148,12 @@ mod tests {
 
     #[test]
     fn zero_bytes() {
-        assert_eq!(format_free(space(0, 500_000_000_000)), "0.0 GB free (0%)");
+        assert_eq!(format_free(space(0, 500_000_000_000)), "0 MB free (0%)");
     }
 
     #[test]
     fn zero_total_omits_percent() {
-        assert_eq!(format_free(space(0, 0)), "0.0 GB free");
+        assert_eq!(format_free(space(0, 0)), "0 MB free");
     }
 
     #[test]
