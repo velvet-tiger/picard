@@ -5,6 +5,7 @@
 //! `scan`. Every path is re-checked by `check_target` immediately before it is
 //! removed, because the filesystem can change between scan and run.
 
+mod command;
 mod git;
 mod git_worktrees;
 mod in_use;
@@ -120,11 +121,13 @@ pub trait CleanupTask: Send + Sync {
 }
 
 /// Builds the enabled tasks in config order. Tools are found through `env`,
-/// with `overrides` from the `[tools]` table taking precedence.
+/// with `overrides` from the `[tools]` table taking precedence. `commands` is
+/// `Err(reason)` when `command` tasks must not run (see `config_is_private`).
 pub fn from_config(
     tasks: &[TaskConfig],
     env: &ToolEnv,
     overrides: &ToolOverrides,
+    commands: &Result<(), String>,
 ) -> Vec<Box<dyn CleanupTask>> {
     let mut out: Vec<Box<dyn CleanupTask>> = Vec::new();
     for task in tasks {
@@ -165,8 +168,21 @@ pub fn from_config(
             TaskConfig::Command {
                 enabled: true,
                 name,
-                ..
-            } => log::info!("command task {name:?} is not available until M5; skipping"),
+                run,
+                timeout_secs,
+            } => match commands {
+                Ok(()) => out.push(Box::new(command::CommandTask::new(
+                    name.clone(),
+                    run.clone(),
+                    Duration::from_secs(*timeout_secs),
+                    command::Shell::login_zsh(),
+                    env.path_var(),
+                    env.home().to_path_buf(),
+                ))),
+                Err(why) => log::error!(
+                    "command task {name:?} skipped: config.toml must be private to you ({why})"
+                ),
+            },
             _ => {}
         }
     }
@@ -426,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn from_config_skips_disabled_and_unimplemented() {
+    fn from_config_skips_disabled_and_refused_tasks() {
         let tasks = vec![
             TaskConfig::GitWorktrees {
                 enabled: false,
@@ -451,8 +467,13 @@ mod tests {
             },
         ];
         let env = ToolEnv::from_dirs(Path::new("/"), vec![PathBuf::from("/usr/bin")]);
-        let built = from_config(&tasks, &env, &ToolOverrides::default());
-        let ids: Vec<_> = built.iter().map(|t| t.id()).collect();
-        assert_eq!(ids, vec!["cargo_clean"]);
+        let ids = |commands: Result<(), String>| -> Vec<&'static str> {
+            from_config(&tasks, &env, &ToolOverrides::default(), &commands)
+                .iter()
+                .map(|t| t.id())
+                .collect()
+        };
+        assert_eq!(ids(Ok(())), vec!["command", "cargo_clean"]);
+        assert_eq!(ids(Err("writable by group".into())), vec!["cargo_clean"]);
     }
 }

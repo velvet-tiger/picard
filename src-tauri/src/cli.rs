@@ -61,7 +61,7 @@ pub fn main(args: &[String]) -> i32 {
             eprintln!("picard: run removes files; add --yes to confirm\n{USAGE}");
             return 2;
         }
-        Command::Scan => load(parsed.config).map(|(c, _, env)| scan(&c, &env)),
+        Command::Scan => load(parsed.config).map(|(c, path, env)| scan(&c, &path, &env)),
         Command::Run => load(parsed.config).and_then(|(c, path, env)| run(&c, &path, &env)),
     };
     match result {
@@ -129,7 +129,7 @@ fn mounted_volumes(config: &Config) -> Vec<(Volume, DiskSpace)> {
         .collect()
 }
 
-fn scan(config: &Config, env: &ToolEnv) -> i32 {
+fn scan(config: &Config, config_path: &std::path::Path, env: &ToolEnv) -> i32 {
     let exclude = match tasks::build_exclude(&config.exclude) {
         Ok(e) => e,
         Err(e) => {
@@ -138,7 +138,11 @@ fn scan(config: &Config, env: &ToolEnv) -> i32 {
         }
     };
     let sizes = SizeCache::default();
-    let tasks = tasks::from_config(&config.tasks, env, &config.tools);
+    let commands = config::config_is_private(config_path);
+    if let Err(why) = &commands {
+        println!("command tasks are off: config.toml must be private to you ({why})");
+    }
+    let tasks = tasks::from_config(&config.tasks, env, &config.tools, &commands);
     for (volume, space) in mounted_volumes(config) {
         let ctx = Ctx::for_volume(&volume, &exclude, SystemTime::now(), &sizes)
             .with_search_roots(&config.roots);
