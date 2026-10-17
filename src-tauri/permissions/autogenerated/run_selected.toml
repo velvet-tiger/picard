@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-run-selected"
+description = "Enables the run_selected command without any pre-configured scope."
+commands.allow = ["run_selected"]
+
+[[permission]]
+identifier = "deny-run-selected"
+description = "Denies the run_selected command without any pre-configured scope."
+commands.deny = ["run_selected"]

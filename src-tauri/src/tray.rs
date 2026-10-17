@@ -11,9 +11,13 @@ use tauri::{AppHandle, Runtime};
 
 use crate::disk::{self, DiskSpace};
 use crate::volume::{UnavailableRoot, Volume};
+use crate::windows::{self, Window};
 
 const TRAY_ID: &str = "picard";
 const MENU_QUIT: &str = "quit";
+const MENU_CLEAN: &str = "clean";
+const MENU_SETTINGS: &str = "settings";
+const MENU_LOG: &str = "open_log";
 
 // TODO(M7): placeholder monochrome icon. Replace with the final ok/low/cleaning set.
 const TRAY_ICON: &[u8] = include_bytes!("../icons/tray-template.png");
@@ -43,8 +47,20 @@ impl<R: Runtime> Tray<R> {
             .menu(&menu)
             .show_menu_on_left_click(true)
             .on_menu_event(|app, event| {
-                if event.id() == MENU_QUIT {
-                    app.exit(0);
+                let opened = match event.id().as_ref() {
+                    MENU_CLEAN => windows::open(app, Window::Preview).map_err(|e| e.to_string()),
+                    MENU_SETTINGS => {
+                        windows::open(app, Window::Settings).map_err(|e| e.to_string())
+                    }
+                    MENU_LOG => windows::open_log(app),
+                    MENU_QUIT => {
+                        app.exit(0);
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                };
+                if let Err(e) = opened {
+                    log::error!("menu item {:?} failed: {e}", event.id().as_ref());
                 }
             })
             .build(app)?;
@@ -65,6 +81,14 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, lines: &[String]) -> tauri::Result
     let menu = Menu::new(app)?;
     for line in lines {
         menu.append(&MenuItem::new(app, line, false, None::<&str>)?)?;
+    }
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    for (id, label) in [
+        (MENU_CLEAN, "Clean…"),
+        (MENU_SETTINGS, "Settings…"),
+        (MENU_LOG, "Open Log"),
+    ] {
+        menu.append(&MenuItem::with_id(app, id, label, true, None::<&str>)?)?;
     }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(

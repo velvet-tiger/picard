@@ -13,6 +13,7 @@ mod state;
 mod tasks;
 mod tray;
 mod volume;
+mod windows;
 
 use std::sync::Arc;
 
@@ -29,6 +30,11 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
+        // Off until the user turns it on in Settings.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
             commands::get_settings,
@@ -36,6 +42,8 @@ pub fn run() {
             commands::preview,
             commands::run_selected,
             commands::get_history,
+            commands::get_launch_at_login,
+            commands::set_launch_at_login,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Runtime, State};
+use tauri_plugin_autostart::ManagerExt;
 
 use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
@@ -207,6 +208,25 @@ pub async fn run_selected(
 pub async fn get_history(state: SharedState<'_>, limit: usize) -> Result<Vec<Entry>, String> {
     let shared = Arc::clone(&state);
     blocking(move || history::read_recent(&shared.paths.history, limit.min(500)).map_err(err)).await
+}
+
+/// Whether Picard opens at login (a LaunchAgent written by the autostart plugin).
+#[tauri::command]
+pub fn get_launch_at_login<R: Runtime>(app: AppHandle<R>) -> Result<bool, String> {
+    app.autolaunch().is_enabled().map_err(err)
+}
+
+#[tauri::command]
+pub fn set_launch_at_login<R: Runtime>(app: AppHandle<R>, enabled: bool) -> Result<(), String> {
+    let launcher = app.autolaunch();
+    let result = if enabled {
+        launcher.enable()
+    } else {
+        launcher.disable()
+    };
+    result.map_err(err)?;
+    log::info!("launch at login {}", if enabled { "on" } else { "off" });
+    Ok(())
 }
 
 /// Reads the config file through the same privacy check `config::load` uses.
