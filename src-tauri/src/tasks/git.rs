@@ -135,10 +135,16 @@ impl GitCmd {
     /// Why git must not run `status` or `worktree remove` in `dir`, if anything.
     ///
     /// Both commands can run a clean filter. Filters defined in the repo's own
-    /// config are refused. Submodules are refused too, because `status` recurses
-    /// into them and each has its own config that this check does not read.
-    /// `git worktree remove` refuses worktrees with submodules anyway, so
-    /// skipping them loses nothing. Every check here only reads, and runs nothing.
+    /// config are refused. Checked-out submodules are refused too, because
+    /// `status` recurses into them and each has its own config that this check
+    /// does not read. `git worktree remove` refuses those anyway.
+    ///
+    /// A submodule that was never checked out is only an empty folder, with no
+    /// config of its own, and git removes such a worktree. Claude Code's agent
+    /// worktrees look like this, so they are not refused. A gitlink folder that
+    /// holds anything at all is refused, because git would delete those files
+    /// without listing them in `status`. Every check here only reads, and runs
+    /// nothing.
     pub fn unsafe_to_inspect(&self, dir: &Path) -> Result<Option<String>> {
         let filters = self.untrusted_filters(dir)?;
         if !filters.is_empty() {
@@ -147,19 +153,50 @@ impl GitCmd {
                 filters.join(", ")
             )));
         }
-        let has_gitmodules = std::fs::symlink_metadata(dir.join(".gitmodules")).is_ok();
+        let git_dir = self.output(dir, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+        let modules = Path::new(git_dir.trim()).join("modules");
+        if std::fs::symlink_metadata(&modules).is_ok() {
+            return Ok(Some(format!(
+                "contains checked-out submodules ({} exists)",
+                modules.display()
+            )));
+        }
         let index = self.output(dir, &["ls-files", "--stage", "-z"])?;
-        if has_gitmodules || index_has_gitlinks(&index) {
-            return Ok(Some("contains submodules".to_string()));
+        for gitlink in index_gitlinks(&index) {
+            if let Some(why) = submodule_folder_problem(&dir.join(gitlink)) {
+                return Ok(Some(format!("submodule {gitlink} {why}")));
+            }
         }
         Ok(None)
     }
 }
 
-/// True if `git ls-files --stage -z` output lists a gitlink (mode 160000), which
-/// is how a submodule appears in the index.
-pub fn index_has_gitlinks(raw: &str) -> bool {
-    raw.split('\0').any(|entry| entry.starts_with("160000 "))
+/// Paths of the gitlinks (mode 160000) in `git ls-files --stage -z` output.
+/// A gitlink is how a submodule appears in the index. Each record is
+/// `mode SP sha SP stage TAB path NUL`.
+pub fn index_gitlinks(raw: &str) -> Vec<&str> {
+    raw.split('\0')
+        .filter(|entry| entry.starts_with("160000 "))
+        .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path))
+        .collect()
+}
+
+/// Why a submodule's folder makes its worktree unsafe, if it does.
+/// Missing or empty is safe: nothing is checked out and nothing would be lost.
+fn submodule_folder_problem(folder: &Path) -> Option<String> {
+    let meta = match std::fs::symlink_metadata(folder) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("cannot be read: {e}")),
+    };
+    if !meta.is_dir() {
+        return Some("is not a folder".to_string());
+    }
+    match std::fs::read_dir(folder).map(|mut entries| entries.next().is_none()) {
+        Ok(true) => None,
+        Ok(false) => Some("is checked out or not empty".to_string()),
+        Err(e) => Some(format!("cannot be read: {e}")),
+    }
 }
 
 /// Parses `git config --list --show-scope -z` and returns `filter.*` keys set in
@@ -274,11 +311,28 @@ mod tests {
     }
 
     #[test]
-    fn detects_gitlinks_in_the_index() {
+    fn lists_gitlinks_in_the_index() {
         let plain = "100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0\tREADME\0";
-        let with_sub = "100644 aaa 0\tREADME\x00160000 bbb 0\tvendor/lib\0";
-        assert!(!index_has_gitlinks(plain));
-        assert!(index_has_gitlinks(with_sub));
+        let with_sub =
+            "100644 aaa 0\tREADME\x00160000 bbb 0\tvendor/lib\x00160000 ccc 0\twith space\0";
+        assert!(index_gitlinks(plain).is_empty());
+        assert_eq!(index_gitlinks(with_sub), vec!["vendor/lib", "with space"]);
+    }
+
+    #[test]
+    fn submodule_folder_is_safe_only_when_missing_or_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(submodule_folder_problem(&dir.path().join("missing")), None);
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(submodule_folder_problem(&empty), None);
+        let stray = dir.path().join("stray");
+        std::fs::create_dir(&stray).unwrap();
+        std::fs::write(stray.join("notes.txt"), "mine").unwrap();
+        assert!(submodule_folder_problem(&stray).is_some());
+        let file = dir.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(submodule_folder_problem(&file).is_some());
     }
 
     #[test]
