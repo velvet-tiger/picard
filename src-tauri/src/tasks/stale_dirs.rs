@@ -1,0 +1,347 @@
+//! Removes regenerable build folders from projects nobody has touched lately.
+//!
+//! `node_modules` and Cargo `target/` work the same way: find a folder named
+//! `dir_name` next to a `marker` file, decide whether the project is stale,
+//! and delete the folder. Both can be rebuilt with `npm install` or
+//! `cargo build`, so they are deleted outright. Moving them to the Trash would
+//! free nothing.
+
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use anyhow::Result;
+use walkdir::WalkDir;
+
+use super::{Candidate, CleanupTask, Ctx, Report, check_target, remove_dirs};
+
+/// Folders never descended into while searching for projects or reading mtimes.
+/// They are either the build output itself or too large to walk usefully.
+const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git"];
+
+/// How deep to search under each root unless a task says otherwise.
+const DEFAULT_SEARCH_DEPTH: usize = 8;
+
+/// How deep to look inside a project for its newest file.
+const MTIME_DEPTH: usize = 6;
+
+const SECS_PER_DAY: u64 = 86_400;
+
+pub struct StaleDirs {
+    id: &'static str,
+    marker: &'static str,
+    dir_name: &'static str,
+    /// `None` means every match is a candidate (cargo_clean `mode = "all"`).
+    stale_days: Option<u32>,
+    search_depth: usize,
+}
+
+/// Stale `node_modules` next to a `package.json`.
+pub fn node_modules(stale_days: u32) -> StaleDirs {
+    StaleDirs {
+        id: "node_modules",
+        marker: "package.json",
+        dir_name: "node_modules",
+        stale_days: Some(stale_days),
+        search_depth: DEFAULT_SEARCH_DEPTH,
+    }
+}
+
+/// Cargo `target/` next to a `Cargo.toml`. `stale_days = None` cleans them all.
+pub fn cargo_clean(stale_days: Option<u32>, depth: Option<u32>) -> StaleDirs {
+    StaleDirs {
+        id: "cargo_clean",
+        marker: "Cargo.toml",
+        dir_name: "target",
+        stale_days,
+        search_depth: depth.map_or(DEFAULT_SEARCH_DEPTH, |d| d as usize),
+    }
+}
+
+impl CleanupTask for StaleDirs {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn scan(&self, ctx: &Ctx) -> Result<Vec<Candidate>> {
+        let mut found = Vec::new();
+        for (project, target) in find_pairs(ctx, self.marker, self.dir_name, self.search_depth) {
+            if let Err(why) = check_target(&target, ctx) {
+                log::info!("{}: skipping {}: {why}", self.id, target.display());
+                continue;
+            }
+            let reason = match self.stale_days {
+                None => "cleans all (mode = \"all\")".to_string(),
+                Some(days) => match idle_days(&project, ctx.now) {
+                    Some(idle) if idle >= u64::from(days) => format!("untouched for {idle} days"),
+                    _ => continue,
+                },
+            };
+            found.push((target, reason));
+        }
+        let paths: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
+        let sizes = ctx.sizes.measure_all(&paths);
+        Ok(found
+            .into_iter()
+            .zip(sizes)
+            .map(|((path, reason), bytes)| Candidate {
+                path,
+                bytes,
+                reason,
+            })
+            .collect())
+    }
+
+    fn run(&self, ctx: &Ctx, candidates: &[Candidate]) -> Report {
+        remove_dirs(ctx, candidates)
+    }
+}
+
+/// Finds `(project, project/dir_name)` pairs under every root.
+///
+/// Never follows symlinks, never descends into `SKIP_DIRS`, and prunes
+/// excluded folders, so a `node_modules` nested inside another is not found.
+fn find_pairs(ctx: &Ctx, marker: &str, dir_name: &str, depth: usize) -> Vec<(PathBuf, PathBuf)> {
+    let mut pairs = Vec::new();
+    for root in &ctx.roots {
+        let walker = WalkDir::new(root)
+            .follow_links(false)
+            .max_depth(depth)
+            .into_iter()
+            .filter_entry(|e| {
+                e.depth() == 0
+                    || (e.file_type().is_dir()
+                        && !is_skipped(e.path())
+                        && !ctx.exclude.is_match(e.path()))
+            });
+        for entry in walker {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    log::debug!("walk error under {}: {e}", root.display());
+                    continue;
+                }
+            };
+            let project = entry.path();
+            let target = project.join(dir_name);
+            if is_file(&project.join(marker)) && is_real_dir(&target) {
+                pairs.push((project.to_path_buf(), target));
+            }
+        }
+    }
+    pairs
+}
+
+fn is_skipped(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| SKIP_DIRS.contains(&n))
+}
+
+fn is_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// Whole days since anything in the project last changed, ignoring build
+/// output and `.git`. `None` if nothing could be read or the newest mtime is
+/// in the future (a clock or exFAT oddity), which counts as "not stale".
+fn idle_days(project: &Path, now: SystemTime) -> Option<u64> {
+    let newest = newest_mtime(project)?;
+    let idle = now.duration_since(newest).ok()?;
+    Some(idle.as_secs() / SECS_PER_DAY)
+}
+
+fn newest_mtime(project: &Path) -> Option<SystemTime> {
+    WalkDir::new(project)
+        .follow_links(false)
+        .max_depth(MTIME_DEPTH)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !is_skipped(e.path()))
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok()?.modified().ok())
+        .max()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::Fixture;
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn names(c: &[Candidate], root: &Path) -> Vec<String> {
+        let root = root.canonicalize().unwrap();
+        let mut v: Vec<String> = c
+            .iter()
+            .map(|c| {
+                c.path
+                    .canonicalize()
+                    .unwrap()
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A node project with a `node_modules` holding `bytes` bytes.
+    fn node_project(fx: &Fixture, rel: &str, bytes: usize, age_days: u64) {
+        fx.file(&format!("{rel}/package.json"), 10);
+        fx.file(&format!("{rel}/src/index.js"), 10);
+        fx.file(&format!("{rel}/node_modules/dep/index.js"), bytes);
+        fx.age(rel, age_days);
+    }
+
+    #[test]
+    fn finds_stale_node_modules_with_size_and_reason() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "old", 50_000, 40);
+        node_project(&fx, "fresh", 50_000, 2);
+        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["old/node_modules"]);
+        assert!(found[0].bytes >= 50_000, "{}", found[0].bytes);
+        assert_eq!(found[0].reason, "untouched for 40 days");
+    }
+
+    #[test]
+    fn a_recent_source_edit_keeps_the_project_fresh() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 10, 90);
+        fx.file("p/src/new.js", 1);
+        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recent_activity_inside_node_modules_does_not_count() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 10, 90);
+        // Touching a file deep inside node_modules leaves the project idle.
+        fx.file("p/node_modules/dep/extra.js", 1);
+        fx.age("p/node_modules/dep", 0);
+        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
+    }
+
+    #[test]
+    fn nested_node_modules_are_not_scanned() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 10, 90);
+        fx.file("p/node_modules/dep/package.json", 1);
+        fx.file("p/node_modules/dep/node_modules/x/i.js", 1);
+        fx.age("p", 90);
+        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
+    }
+
+    #[test]
+    fn monorepo_packages_are_each_candidates() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "mono", 10, 60);
+        node_project(&fx, "mono/packages/a", 10, 60);
+        fx.age("mono", 60);
+        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(
+            names(&found, &fx.root),
+            vec!["mono/node_modules", "mono/packages/a/node_modules"]
+        );
+    }
+
+    #[test]
+    fn symlinked_node_modules_is_not_a_candidate() {
+        let fx = Fixture::new(&[]);
+        fx.file("shared/dep/i.js", 1);
+        fx.file("p/package.json", 1);
+        symlink(fx.root.join("shared"), fx.root.join("p/node_modules")).unwrap();
+        fx.age("p", 90);
+        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn excluded_projects_are_skipped() {
+        let fx = Fixture::new(&["**/keep-*/**", "**/keep-*"]);
+        node_project(&fx, "keep-me", 10, 90);
+        node_project(&fx, "other", 10, 90);
+        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["other/node_modules"]);
+    }
+
+    #[test]
+    fn no_package_json_means_no_candidate() {
+        let fx = Fixture::new(&[]);
+        fx.file("loose/node_modules/x.js", 1);
+        fx.age("loose", 90);
+        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    fn cargo_project(fx: &Fixture, rel: &str, age_days: u64) {
+        fx.file(&format!("{rel}/Cargo.toml"), 10);
+        fx.file(&format!("{rel}/src/main.rs"), 10);
+        fx.file(&format!("{rel}/target/debug/app"), 20_000);
+        fx.age(rel, age_days);
+    }
+
+    #[test]
+    fn cargo_stale_mode_only_takes_idle_projects() {
+        let fx = Fixture::new(&[]);
+        cargo_project(&fx, "old", 20);
+        cargo_project(&fx, "today", 0);
+        let found = cargo_clean(Some(14), None).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["old/target"]);
+    }
+
+    #[test]
+    fn cargo_all_mode_takes_everything() {
+        let fx = Fixture::new(&[]);
+        cargo_project(&fx, "old", 20);
+        cargo_project(&fx, "today", 0);
+        let found = cargo_clean(None, None).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["old/target", "today/target"]);
+    }
+
+    #[test]
+    fn cargo_workspace_member_edit_keeps_workspace_target() {
+        let fx = Fixture::new(&[]);
+        cargo_project(&fx, "ws", 30);
+        fx.file("ws/crates/a/Cargo.toml", 1);
+        fx.age("ws", 30);
+        fx.file("ws/crates/a/src/lib.rs", 1);
+        assert!(
+            cargo_clean(Some(14), None)
+                .scan(&fx.ctx())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cargo_depth_limits_the_search() {
+        let fx = Fixture::new(&[]);
+        cargo_project(&fx, "a/b/c/deep", 30);
+        assert!(
+            cargo_clean(None, Some(2))
+                .scan(&fx.ctx())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(cargo_clean(None, Some(5)).scan(&fx.ctx()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn run_removes_only_the_scanned_folders() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "old", 10, 40);
+        let ctx = fx.ctx();
+        let task = node_modules(30);
+        let found = task.scan(&ctx).unwrap();
+        let report = task.run(&ctx, &found);
+        assert_eq!(report.removed.len(), 1);
+        assert!(!fx.root.join("old/node_modules").exists());
+        assert!(fx.root.join("old/package.json").exists());
+        assert!(fx.root.join("old/src/index.js").exists());
+    }
+}

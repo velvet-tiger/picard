@@ -2,6 +2,7 @@ mod config;
 mod disk;
 mod monitor;
 mod poll;
+mod tasks;
 mod tray;
 mod volume;
 
