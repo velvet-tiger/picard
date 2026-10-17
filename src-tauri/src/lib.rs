@@ -1,6 +1,7 @@
 mod config;
 mod disk;
 mod tray;
+mod volume;
 
 use tauri::Manager;
 

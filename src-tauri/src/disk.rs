@@ -5,11 +5,11 @@
 //! available to unprivileged users) is the conservative "free" figure. It does not
 //! include APFS purgeable space, so it can read lower than Finder.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString, OsStr};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Free and total capacity of the volume that holds a path, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +23,25 @@ pub struct DiskSpace {
 /// Fails with the OS error if the path does not exist or the volume cannot be
 /// queried (for example, an external drive that was just unplugged).
 pub fn query(path: &Path) -> io::Result<DiskSpace> {
+    let stat = statfs(path)?;
+    let block_size = u64::from(stat.f_bsize);
+    Ok(DiskSpace {
+        free_bytes: stat.f_bavail.saturating_mul(block_size),
+        total_bytes: stat.f_blocks.saturating_mul(block_size),
+    })
+}
+
+/// Returns the mount point of the volume containing `path`, for example `/` or
+/// `/Volumes/Projects`.
+pub fn mount_point(path: &Path) -> io::Result<PathBuf> {
+    let stat = statfs(path)?;
+    // SAFETY: the kernel writes a NUL-terminated string into f_mntonname, which
+    // is MAXPATHLEN bytes long.
+    let name = unsafe { CStr::from_ptr(stat.f_mntonname.as_ptr()) };
+    Ok(PathBuf::from(OsStr::from_bytes(name.to_bytes())))
+}
+
+fn statfs(path: &Path) -> io::Result<libc::statfs> {
     let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -42,13 +61,7 @@ pub fn query(path: &Path) -> io::Result<DiskSpace> {
         ));
     }
     // SAFETY: rc == 0, so statfs initialised the struct.
-    let stat = unsafe { stat.assume_init() };
-
-    let block_size = u64::from(stat.f_bsize);
-    Ok(DiskSpace {
-        free_bytes: stat.f_bavail.saturating_mul(block_size),
-        total_bytes: stat.f_blocks.saturating_mul(block_size),
-    })
+    Ok(unsafe { stat.assume_init() })
 }
 
 const GB: f64 = 1_000_000_000.0;
@@ -137,6 +150,11 @@ mod tests {
         let s = query(Path::new("/")).expect("statfs on / should succeed");
         assert!(s.total_bytes > 0, "total should be non-zero: {s:?}");
         assert!(s.free_bytes <= s.total_bytes, "free exceeds total: {s:?}");
+    }
+
+    #[test]
+    fn mount_point_of_root_is_root() {
+        assert_eq!(mount_point(Path::new("/")).unwrap(), PathBuf::from("/"));
     }
 
     #[test]
