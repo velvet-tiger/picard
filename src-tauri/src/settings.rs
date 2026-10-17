@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(s.threshold, ThresholdSetting::Gb(30.0));
         assert_eq!(s.roots, vec!["~/working"]);
         assert_eq!(s.mode, Mode::Ask);
-        assert_eq!(s.tasks.len(), 3);
+        assert_eq!(s.tasks.len(), 4);
     }
 
     #[test]

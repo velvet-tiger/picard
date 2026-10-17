@@ -38,6 +38,10 @@ stale_days = 30
 type = "cargo_clean"
 mode = "stale"
 stale_days = 14
+
+[[task]]
+type = "python_venv"
+stale_days = 30
 "#;
 
 const BYTES_PER_GB: f64 = 1_000_000_000.0;
@@ -283,6 +287,13 @@ pub enum TaskConfig {
         stale_days: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         depth: Option<u32>,
+    },
+    /// Python virtualenvs (`.venv`, `venv`) in idle projects.
+    PythonVenv {
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default = "default_node_modules_stale_days")]
+        stale_days: u32,
     },
     Command {
         #[serde(default = "default_true")]
@@ -536,7 +547,7 @@ mod tests {
         assert_eq!(c.cooldown_minutes, 60);
         assert_eq!(c.mode, Mode::Ask);
         assert_eq!(c.roots, vec![PathBuf::from("/Users/test/working")]);
-        assert_eq!(c.tasks.len(), 3);
+        assert_eq!(c.tasks.len(), 4);
         assert_eq!(
             c.tasks[2],
             TaskConfig::CargoClean {
@@ -544,6 +555,13 @@ mod tests {
                 mode: CargoMode::Stale,
                 stale_days: 14,
                 depth: None
+            }
+        );
+        assert_eq!(
+            c.tasks[3],
+            TaskConfig::PythonVenv {
+                enabled: true,
+                stale_days: 30
             }
         );
     }

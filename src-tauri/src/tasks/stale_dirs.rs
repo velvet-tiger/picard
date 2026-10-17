@@ -1,10 +1,10 @@
 //! Removes regenerable build folders from projects nobody has touched lately.
 //!
-//! `node_modules` and Cargo `target/` work the same way: find a folder named
-//! `dir_name` next to a `marker` file, decide whether the project is stale,
-//! and delete the folder. Both can be rebuilt with `npm install` or
-//! `cargo build`, so they are deleted outright. Moving them to the Trash would
-//! free nothing.
+//! `node_modules`, Cargo `target/` and Python virtualenvs work the same way:
+//! find a folder named one of `dir_names` next to one of the `markers` files,
+//! decide whether the project is stale, and delete the folder. Each can be
+//! rebuilt with `npm install`, `cargo build` or `pip install`, so they are
+//! deleted outright. Moving them to the Trash would free nothing.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -35,8 +35,11 @@ const FINDER_METADATA: &str = ".DS_Store";
 
 pub struct StaleDirs {
     id: &'static str,
-    marker: &'static str,
-    dir_name: &'static str,
+    /// The project must hold at least one of these files.
+    markers: &'static [&'static str],
+    dir_names: &'static [&'static str],
+    /// A file the folder itself must hold, proving it is what its name says.
+    inner_marker: Option<&'static str>,
     /// `None` means every match is a candidate (cargo_clean `mode = "all"`).
     stale_days: Option<u32>,
     search_depth: usize,
@@ -55,8 +58,9 @@ impl StaleDirs {
 pub fn node_modules(stale_days: u32) -> StaleDirs {
     StaleDirs {
         id: "node_modules",
-        marker: "package.json",
-        dir_name: "node_modules",
+        markers: &["package.json"],
+        dir_names: &["node_modules"],
+        inner_marker: None,
         stale_days: Some(stale_days),
         search_depth: DEFAULT_SEARCH_DEPTH,
         cache_prune: None,
@@ -67,10 +71,34 @@ pub fn node_modules(stale_days: u32) -> StaleDirs {
 pub fn cargo_clean(stale_days: Option<u32>, depth: Option<u32>) -> StaleDirs {
     StaleDirs {
         id: "cargo_clean",
-        marker: "Cargo.toml",
-        dir_name: "target",
+        markers: &["Cargo.toml"],
+        dir_names: &["target"],
+        inner_marker: None,
         stale_days,
         search_depth: depth.map_or(DEFAULT_SEARCH_DEPTH, |d| d as usize),
+        cache_prune: None,
+    }
+}
+
+/// Python virtualenvs (`.venv`, `venv`) in a project with a Python manifest.
+///
+/// The folder must hold `pyvenv.cfg`, which `python -m venv`, virtualenv, uv
+/// and Poetry all write, so a source folder that happens to be called `venv`
+/// is never a candidate.
+pub fn python_venv(stale_days: u32) -> StaleDirs {
+    StaleDirs {
+        id: "python_venv",
+        markers: &[
+            "pyproject.toml",
+            "requirements.txt",
+            "setup.py",
+            "setup.cfg",
+            "Pipfile",
+        ],
+        dir_names: &[".venv", "venv"],
+        inner_marker: Some("pyvenv.cfg"),
+        stale_days: Some(stale_days),
+        search_depth: DEFAULT_SEARCH_DEPTH,
         cache_prune: None,
     }
 }
@@ -82,14 +110,20 @@ impl CleanupTask for StaleDirs {
 
     fn scan(&self, ctx: &Ctx) -> Result<Vec<Candidate>> {
         let mut found = Vec::new();
-        for (project, target) in find_pairs(ctx, self.marker, self.dir_name, self.search_depth) {
+        for (project, target) in find_pairs(ctx, self.markers, self.dir_names, self.search_depth) {
             if let Err(why) = check_target(&target, ctx) {
                 log::info!("{}: skipping {}: {why}", self.id, target.display());
                 continue;
             }
+            if let Some(inner) = self.inner_marker
+                && !is_file(&target.join(inner))
+            {
+                log::debug!("{}: skipping {}: no {inner}", self.id, target.display());
+                continue;
+            }
             let reason = match self.stale_days {
                 None => "cleans all (mode = \"all\")".to_string(),
-                Some(days) => match idle_days(&project, ctx.now) {
+                Some(days) => match idle_days(&project, ctx.now, self.dir_names) {
                     Some(idle) if idle >= u64::from(days) => format!("untouched for {idle} days"),
                     _ => continue,
                 },
@@ -120,11 +154,18 @@ impl CleanupTask for StaleDirs {
     }
 }
 
-/// Finds `(project, project/dir_name)` pairs under every root.
+/// Finds `(project, project/<one of dir_names>)` pairs under every root.
 ///
-/// Never follows symlinks, never descends into `SKIP_DIRS`, and prunes
-/// excluded folders, so a `node_modules` nested inside another is not found.
-fn find_pairs(ctx: &Ctx, marker: &str, dir_name: &str, depth: usize) -> Vec<(PathBuf, PathBuf)> {
+/// A folder is a project when it holds one of `markers`. An empty `markers`
+/// makes every folder a project. Never follows symlinks, never descends into
+/// `SKIP_DIRS` or `dir_names`, and prunes excluded folders, so a
+/// `node_modules` nested inside another is not found.
+pub(super) fn find_pairs(
+    ctx: &Ctx,
+    markers: &[&str],
+    dir_names: &[&str],
+    depth: usize,
+) -> Vec<(PathBuf, PathBuf)> {
     let mut pairs = Vec::new();
     for root in &ctx.roots {
         let walker = WalkDir::new(root)
@@ -134,7 +175,7 @@ fn find_pairs(ctx: &Ctx, marker: &str, dir_name: &str, depth: usize) -> Vec<(Pat
             .filter_entry(|e| {
                 e.depth() == 0
                     || (e.file_type().is_dir()
-                        && !is_skipped(e.path())
+                        && !is_skipped(e.path(), dir_names)
                         && !ctx.exclude.is_match(e.path()))
             });
         for entry in walker {
@@ -146,22 +187,30 @@ fn find_pairs(ctx: &Ctx, marker: &str, dir_name: &str, depth: usize) -> Vec<(Pat
                 }
             };
             let project = entry.path();
-            let target = project.join(dir_name);
-            if is_file(&project.join(marker)) && is_real_dir(&target) {
-                pairs.push((project.to_path_buf(), target));
+            let is_project =
+                markers.is_empty() || markers.iter().any(|m| is_file(&project.join(m)));
+            if !is_project {
+                continue;
+            }
+            for name in dir_names {
+                let target = project.join(name);
+                if is_real_dir(&target) {
+                    pairs.push((project.to_path_buf(), target));
+                }
             }
         }
     }
     pairs
 }
 
-fn is_skipped(path: &Path) -> bool {
+/// True for `SKIP_DIRS` and for any folder named in `extra`.
+fn is_skipped(path: &Path, extra: &[&str]) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| SKIP_DIRS.contains(&n))
+        .is_some_and(|n| SKIP_DIRS.contains(&n) || extra.contains(&n))
 }
 
-fn is_file(path: &Path) -> bool {
+pub(super) fn is_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
 }
 
@@ -170,10 +219,12 @@ fn is_real_dir(path: &Path) -> bool {
 }
 
 /// Whole days since anything in the project last changed, ignoring build
-/// output and `.git`. `None` if nothing could be read or the newest mtime is
-/// in the future (a clock or exFAT oddity), which counts as "not stale".
-fn idle_days(project: &Path, now: SystemTime) -> Option<u64> {
-    let newest = newest_mtime(project)?;
+/// output, `.git` and the folders named in `also_skip` (the task's own
+/// targets, so rebuilding them is not activity). `None` if nothing could be
+/// read or the newest mtime is in the future (a clock or exFAT oddity), which
+/// counts as "not stale".
+pub(super) fn idle_days(project: &Path, now: SystemTime, also_skip: &[&str]) -> Option<u64> {
+    let newest = newest_mtime_skipping(project, also_skip)?;
     let idle = now.duration_since(newest).ok()?;
     Some(idle.as_secs() / SECS_PER_DAY)
 }
@@ -186,11 +237,16 @@ fn idle_days(project: &Path, now: SystemTime) -> Option<u64> {
 /// are skipped for the same reason. A deleted file therefore no longer counts
 /// as activity; editing or adding one still does.
 pub(super) fn newest_mtime(project: &Path) -> Option<SystemTime> {
+    newest_mtime_skipping(project, &[])
+}
+
+/// `newest_mtime`, also skipping folders named in `also_skip`.
+fn newest_mtime_skipping(project: &Path, also_skip: &[&str]) -> Option<SystemTime> {
     WalkDir::new(project)
         .follow_links(false)
         .max_depth(MTIME_DEPTH)
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !is_skipped(e.path()))
+        .filter_entry(|e| e.depth() == 0 || !is_skipped(e.path(), also_skip))
         .filter_map(|e| e.ok())
         .filter(|e| !e.file_type().is_dir() && e.file_name() != FINDER_METADATA)
         .filter_map(|e| e.metadata().ok()?.modified().ok())
@@ -387,6 +443,59 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(cargo_clean(None, Some(5)).scan(&fx.ctx()).unwrap().len(), 1);
+    }
+
+    /// A Python project with a virtualenv in `rel/venv_name`.
+    fn python_project(fx: &Fixture, rel: &str, venv_name: &str, age_days: u64) {
+        fx.file(&format!("{rel}/pyproject.toml"), 10);
+        fx.file(&format!("{rel}/app/main.py"), 10);
+        fx.file(&format!("{rel}/{venv_name}/pyvenv.cfg"), 10);
+        fx.file(&format!("{rel}/{venv_name}/lib/site.py"), 30_000);
+        fx.age(rel, age_days);
+    }
+
+    #[test]
+    fn finds_stale_venvs_under_either_name() {
+        let fx = Fixture::new(&[]);
+        python_project(&fx, "old", ".venv", 40);
+        python_project(&fx, "older", "venv", 90);
+        python_project(&fx, "fresh", ".venv", 2);
+        let found = python_venv(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["old/.venv", "older/venv"]);
+        assert!(found.iter().all(|c| c.bytes >= 30_000));
+    }
+
+    #[test]
+    fn any_python_manifest_marks_a_project() {
+        let fx = Fixture::new(&[]);
+        fx.file("reqs/requirements.txt", 1);
+        fx.file("reqs/.venv/pyvenv.cfg", 1);
+        fx.file("pipenv/Pipfile", 1);
+        fx.file("pipenv/.venv/pyvenv.cfg", 1);
+        fx.file("none/.venv/pyvenv.cfg", 1);
+        fx.age("", 90);
+        let found = python_venv(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["pipenv/.venv", "reqs/.venv"]);
+    }
+
+    #[test]
+    fn a_venv_folder_without_pyvenv_cfg_is_kept() {
+        let fx = Fixture::new(&[]);
+        fx.file("p/pyproject.toml", 1);
+        // Source code that happens to live in a folder called venv.
+        fx.file("p/venv/notes.py", 1);
+        fx.age("p", 90);
+        assert!(python_venv(30).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn installing_into_the_venv_does_not_make_the_project_fresh() {
+        let fx = Fixture::new(&[]);
+        python_project(&fx, "p", ".venv", 60);
+        fx.file("p/.venv/lib/new_dep.py", 1);
+        let found = python_venv(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/.venv"]);
+        assert_eq!(found[0].reason, "untouched for 60 days");
     }
 
     #[test]

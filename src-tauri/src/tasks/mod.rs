@@ -167,6 +167,10 @@ pub fn from_config(
                 };
                 out.push(Box::new(stale_dirs::cargo_clean(stale_days, *depth)));
             }
+            TaskConfig::PythonVenv {
+                enabled: true,
+                stale_days,
+            } => out.push(Box::new(stale_dirs::python_venv(*stale_days))),
             TaskConfig::GitWorktrees {
                 enabled: true,
                 stale_days,
@@ -183,7 +187,6 @@ pub fn from_config(
                     env.path_var()
                 ),
             },
-            // TODO(M5): command. Listed in config but not run yet.
             TaskConfig::Command {
                 enabled: true,
                 name,

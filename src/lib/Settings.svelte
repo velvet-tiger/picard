@@ -268,6 +268,14 @@
                   </span>
                 </div>
               {/if}
+            {:else if task.type === 'python_venv'}
+              <div class="field">
+                <span>Projects untouched for</span>
+                <span class="control">
+                  <input type="number" min="0" bind:value={task.stale_days} />
+                  <span class="unit">days</span>
+                </span>
+              </div>
             {:else if task.type === 'command'}
               <div class="field">
                 <span>Name</span>
