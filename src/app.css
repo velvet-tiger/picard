@@ -5,9 +5,16 @@
   --text: #1d1d1f;
   --muted: #6e6e73;
   --line: #d2d2d7;
-  --accent: #0a66d8;
   --danger: #c62828;
   --ok: #2e7d32;
+  /* Mid-tones in the spirit of a TNG ship's console. They are only ever fills
+     behind black text, so one set serves both themes. */
+  --lc-peach: #ffcc99;
+  --lc-lilac: #cc99cc;
+  --lc-sky: #9999ff;
+  --lc-tan: #cc9966;
+  --lc-rose: #cc6666;
+  --on-pastel: #000;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
   font-size: 13px;
   line-height: 1.4;
@@ -20,7 +27,6 @@
     --text: #f5f5f7;
     --muted: #98989d;
     --line: #3a3a3c;
-    --accent: #4c9bff;
     --danger: #ff6b6b;
     --ok: #66bb6a;
   }
@@ -41,13 +47,41 @@ main {
 }
 
 h1 {
-  font-size: 18px;
+  font-size: 17px;
   margin: 0 0 4px;
 }
 
 h2 {
   font-size: 14px;
   margin: 0;
+}
+
+/* Headings are capitals with a short rounded cap in front, like a console label. */
+h1,
+.panel h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.panel h2 {
+  font-size: 13px;
+}
+
+h1::before,
+.panel h2::before {
+  content: '';
+  flex: none;
+  width: 14px;
+  height: 0.8em;
+  border-radius: 99px 0 0 99px;
+  background: var(--lc-peach);
+}
+
+.panel h2::before {
+  background: var(--lc-sky);
 }
 
 .muted {
@@ -57,6 +91,7 @@ h2 {
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
+  border-left: 4px solid var(--lc-sky);
   border-radius: 8px;
   padding: 12px 14px;
   margin-top: 12px;
@@ -72,18 +107,31 @@ h2 {
 
 button {
   font: inherit;
-  padding: 5px 12px;
-  border-radius: 6px;
-  border: 1px solid var(--line);
-  background: var(--panel);
-  color: var(--text);
+  padding: 4px 14px;
+  border-radius: 99px;
+  border: 1px solid transparent;
+  background: var(--lc-lilac);
+  color: var(--on-pastel);
   cursor: pointer;
 }
 
+button:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+/* The one main action in a view: capitals on pale blue. */
 button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+  background: var(--lc-sky);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 5px 18px;
+}
+
+input[type='checkbox'],
+input[type='radio'] {
+  accent-color: var(--lc-sky);
 }
 
 button:disabled {

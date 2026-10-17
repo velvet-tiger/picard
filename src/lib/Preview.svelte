@@ -14,6 +14,9 @@
     type HistoryEntry,
   } from './api'
 
+  // Each task group in a drive gets the next pastel cap, so groups are easy to tell apart.
+  const GROUP_CAPS = ['var(--lc-peach)', 'var(--lc-lilac)', 'var(--lc-rose)'] as const
+
   let volumes = $state<VolumePreview[]>([])
   // Keyed by "mount\u0000path" so the same path on two volumes cannot collide.
   let checked = $state<Record<string, boolean>>({})
@@ -107,7 +110,7 @@
   <div class="row">
     <h1>Clean up</h1>
     <span class="spacer"></span>
-    <button onclick={scan} disabled={scanning || cleaning}>Rescan</button>
+    <button class="rescan" onclick={scan} disabled={scanning || cleaning}>Rescan</button>
   </div>
   <p class="muted">
     Nothing is removed until you press Clean. Picard re-checks every item just before removing it.
@@ -164,8 +167,8 @@
           <span class="spacer"></span>
           <span class="muted">up to {v.total_text}</span>
         </div>
-        {#each v.tasks as t}
-          <h3>{TASK_LABELS[t.task] ?? t.task}</h3>
+        {#each v.tasks as t, ti}
+          <h3 style:--cap={GROUP_CAPS[ti % GROUP_CAPS.length]}>{TASK_LABELS[t.task] ?? t.task}</h3>
           {#if t.error}
             <p class="error">Could not scan: {t.error}</p>
           {:else if t.items.length === 0}
@@ -205,7 +208,7 @@
   {/if}
 
   {#if history.length > 0}
-    <div class="panel">
+    <div class="panel history-panel">
       <h2>Recently removed</h2>
       <ul class="history">
         {#each history as h}
@@ -222,11 +225,30 @@
 
 <style>
   h3 {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--muted);
     margin: 12px 0 4px;
+  }
+  h3::before {
+    content: '';
+    width: 10px;
+    height: 10px;
+    border-radius: 99px 0 0 99px;
+    background: var(--cap);
+  }
+  .rescan {
+    background: var(--lc-peach);
+  }
+  .history-panel {
+    border-left-color: var(--lc-tan);
+  }
+  .history-panel h2::before {
+    background: var(--lc-tan);
   }
   ul {
     list-style: none;
@@ -292,7 +314,7 @@
     height: 16px;
     border-radius: 50%;
     border: 2px solid var(--line);
-    border-top-color: var(--accent);
+    border-top-color: var(--lc-sky);
     animation: spin 0.8s linear infinite;
   }
   /* Indeterminate bar: a short stripe that sweeps across. */
@@ -309,7 +331,7 @@
     inset: 0 auto 0 0;
     width: 35%;
     border-radius: 2px;
-    background: var(--accent);
+    background: var(--lc-sky);
     animation: sweep 1.4s ease-in-out infinite;
   }
   /* Placeholder rows in the shape of results: checkbox | two lines | size. */
