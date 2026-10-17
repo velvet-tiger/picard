@@ -13,6 +13,7 @@ mod in_use;
 mod size;
 pub mod stale_dirs;
 
+use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -144,6 +145,7 @@ pub fn from_config(
                         env.resolve("npm", overrides),
                         env.resolve("pnpm", overrides),
                         env.path_var(),
+                        env.home().to_path_buf(),
                     );
                     if prune.is_empty() {
                         log::warn!("prune_package_caches is on but neither npm nor pnpm was found");
@@ -242,6 +244,38 @@ pub fn check_target(path: &Path, ctx: &Ctx) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
+/// How many times `remove_dirs` tries a folder that comes back "not empty".
+const REMOVE_ATTEMPTS: u32 = 3;
+const REMOVE_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Removes `dir` with `remove`, trying again when it fails with ENOTEMPTY.
+///
+/// On macOS another process can write into a folder while it is deleted. Finder
+/// and Finder extensions drop `.DS_Store` files into folders whose contents
+/// change, so the final `rmdir` sees a new file. A later pass removes it.
+/// Other errors return at once.
+fn remove_tree(
+    dir: &Path,
+    attempts: u32,
+    delay: Duration,
+    remove: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match remove(dir) {
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty && attempt < attempts => {
+                log::warn!(
+                    "removing {} (attempt {attempt} of {attempts}): {e}; retrying",
+                    dir.display()
+                );
+                attempt += 1;
+                std::thread::sleep(delay);
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Removes candidate directories one at a time, stopping if the volume goes away.
 pub fn remove_dirs(ctx: &Ctx, candidates: &[Candidate]) -> Report {
     let mut report = Report::default();
@@ -259,7 +293,9 @@ pub fn remove_dirs(ctx: &Ctx, candidates: &[Candidate]) -> Report {
             }
         };
         // std's remove_dir_all does not follow symlinks inside the tree.
-        match std::fs::remove_dir_all(&canon) {
+        match remove_tree(&canon, REMOVE_ATTEMPTS, REMOVE_RETRY_DELAY, |p| {
+            std::fs::remove_dir_all(p)
+        }) {
             Ok(()) => {
                 log::info!("removed {} ({} bytes)", canon.display(), c.bytes);
                 report.removed.push(Removed {
@@ -452,6 +488,43 @@ mod tests {
         );
         assert!(report.halted.is_some());
         assert!(fx.root.join("p/node_modules").exists());
+    }
+
+    #[test]
+    fn remove_tree_retries_directory_not_empty() {
+        let calls = std::cell::Cell::new(0);
+        let result = remove_tree(Path::new("/x"), 3, Duration::ZERO, |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err(io::Error::from(io::ErrorKind::DirectoryNotEmpty))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn remove_tree_gives_up_after_the_last_attempt() {
+        let calls = std::cell::Cell::new(0);
+        let result = remove_tree(Path::new("/x"), 3, Duration::ZERO, |_| {
+            calls.set(calls.get() + 1);
+            Err(io::Error::from(io::ErrorKind::DirectoryNotEmpty))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::DirectoryNotEmpty);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn remove_tree_does_not_retry_other_errors() {
+        let calls = std::cell::Cell::new(0);
+        let result = remove_tree(Path::new("/x"), 3, Duration::ZERO, |_| {
+            calls.set(calls.get() + 1);
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
