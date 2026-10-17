@@ -82,6 +82,19 @@ impl Alert {
 /// `st_dev` because device numbers can be reused after a drive is remounted.
 pub type States = HashMap<PathBuf, State>;
 
+/// States to keep after a config reload.
+///
+/// A mode change re-arms every volume, so switching from ask to auto acts on a
+/// disk that is already low instead of waiting out the cooldown. Any other
+/// change keeps the states, so editing a threshold does not repeat an alert.
+pub fn states_after_reload(states: States, old_mode: Option<Mode>, new_mode: Mode) -> States {
+    if old_mode == Some(new_mode) {
+        states
+    } else {
+        States::new()
+    }
+}
+
 /// Evaluates every reading against the config.
 ///
 /// Returns the new states and the alerts to send. Volumes missing from
@@ -240,6 +253,15 @@ mod tests {
         // Second pass: still low, but already fired, so nothing new.
         let (_, alerts) = evaluate(&states, &readings, &config, now + Duration::from_secs(300));
         assert!(alerts.is_empty());
+    }
+
+    #[test]
+    fn mode_change_rearms_but_other_edits_do_not() {
+        let mut states = States::new();
+        states.insert(PathBuf::from("/"), State::Fired { at: Instant::now() });
+        let kept = states_after_reload(states.clone(), Some(Mode::Ask), Mode::Ask);
+        assert_eq!(kept.len(), 1);
+        assert!(states_after_reload(states, Some(Mode::Ask), Mode::Auto).is_empty());
     }
 
     #[test]

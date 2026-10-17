@@ -152,6 +152,30 @@ pub fn run_tasks(
     out
 }
 
+/// Notification title and body for a cleanup on volume `name`.
+///
+/// `after` is the free space once the run finished, if it could be read.
+pub fn outcome_message(
+    name: &str,
+    run: &Result<VolumeRun, String>,
+    after: Option<disk::DiskSpace>,
+) -> (String, String) {
+    let now = after.map_or_else(String::new, |s| format!(" {}.", disk::format_free(s)));
+    match run {
+        Err(e) => (
+            format!("{name} is low"),
+            format!("Cleanup failed: {e}. See the log."),
+        ),
+        Ok(r) if r.removed.is_empty() => {
+            (format!("{name} is low"), format!("Nothing to clean.{now}"))
+        }
+        Ok(r) => (
+            format!("Picard cleaned {name}"),
+            format!("Freed {}.{now}", disk::format_bytes(r.freed_bytes())),
+        ),
+    }
+}
+
 /// Cleans one volume for real: takes the lock, runs the tasks and writes history.
 pub fn clean_volume(
     config: &Config,
@@ -286,6 +310,39 @@ mod tests {
         assert!(err.to_string().contains("already running"), "{err}");
         drop(first);
         assert!(RunLock::acquire(&path).is_ok());
+    }
+
+    #[test]
+    fn outcome_messages() {
+        let after = Some(disk::DiskSpace {
+            free_bytes: 15_000_000_000,
+            total_bytes: 994_000_000_000,
+        });
+        let run = VolumeRun {
+            removed: vec![(
+                "node_modules",
+                Removed {
+                    path: PathBuf::from("/x"),
+                    bytes: 3_200_000_000,
+                },
+            )],
+            ..VolumeRun::default()
+        };
+        assert_eq!(
+            outcome_message("Startup disk", &Ok(run), after),
+            (
+                "Picard cleaned Startup disk".to_string(),
+                "Freed 3.2 GB. 15 GB free (2%).".to_string()
+            )
+        );
+        assert_eq!(
+            outcome_message("D", &Ok(VolumeRun::default()), None).1,
+            "Nothing to clean."
+        );
+        assert_eq!(
+            outcome_message("D", &Err("another cleanup is already running".into()), None).1,
+            "Cleanup failed: another cleanup is already running. See the log."
+        );
     }
 
     #[test]

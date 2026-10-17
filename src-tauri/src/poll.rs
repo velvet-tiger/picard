@@ -5,6 +5,7 @@
 //! on their own thread and send `Wake` messages into the loop.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -13,9 +14,11 @@ use tauri::{AppHandle, Runtime};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::mpsc;
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
-use crate::monitor::{self, Alert, States};
+use crate::monitor::{self, States};
+use crate::runner::{self, DataPaths};
+use crate::tasks::SizeCache;
 use crate::tray::{MenuView, Tray};
 use crate::volume::{self, UnavailableRoot, Volume};
 
@@ -131,6 +134,7 @@ pub struct Poller<R: Runtime> {
     config: Option<Config>,
     config_error: bool,
     states: States,
+    sizes: Arc<SizeCache>,
 }
 
 impl<R: Runtime> Poller<R> {
@@ -143,6 +147,7 @@ impl<R: Runtime> Poller<R> {
             config: None,
             config_error: false,
             states: States::new(),
+            sizes: Arc::new(SizeCache::default()),
         }
     }
 
@@ -188,6 +193,12 @@ impl<R: Runtime> Poller<R> {
                     c.mode,
                     c.roots.len()
                 );
+                let old_mode = self.config.as_ref().map(|old| old.mode);
+                self.states = monitor::states_after_reload(
+                    std::mem::take(&mut self.states),
+                    old_mode,
+                    c.mode,
+                );
                 self.config = Some(c);
                 self.config_error = false;
             }
@@ -203,7 +214,7 @@ impl<R: Runtime> Poller<R> {
         }
     }
 
-    /// One check: scan, decide, alert, redraw.
+    /// One check: scan, decide, alert (or clean, in auto mode), redraw.
     async fn check(&mut self) {
         let Some(config) = self.config.clone() else {
             self.show(MenuView {
@@ -212,38 +223,90 @@ impl<R: Runtime> Poller<R> {
             });
             return;
         };
-        let roots = config.roots.clone();
-        let scan = match tauri::async_runtime::spawn_blocking(move || scan(&roots)).await {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("disk scan task failed: {e}");
-                return;
-            }
+        let Some(mut found) = self.scan_volumes(&config).await else {
+            return;
         };
         let (states, alerts) =
-            monitor::evaluate(&self.states, &scan.readings, &config, Instant::now());
+            monitor::evaluate(&self.states, &found.readings, &config, Instant::now());
         self.states = states;
+        let mut cleaned = false;
         for alert in &alerts {
-            self.send(alert);
+            if config.mode == Mode::Auto {
+                let volume = found.readings.iter().find(|(v, _)| v.mount == alert.mount);
+                if let Some((volume, _)) = volume {
+                    self.clean(&config, volume.clone()).await;
+                    cleaned = true;
+                    continue;
+                }
+            }
+            // TODO(M6): in ask mode, add the cleanable estimate and a Clean button.
+            let (title, body) = alert.message();
+            self.notify(&title, &body);
+        }
+        // Show the space after cleaning, not the reading that triggered it.
+        if cleaned && let Some(after) = self.scan_volumes(&config).await {
+            found = after;
         }
         self.show(MenuView {
-            readings: scan.readings,
-            unavailable: scan.unavailable,
+            readings: found.readings,
+            unavailable: found.unavailable,
             config_error: self.config_error,
         });
     }
 
-    // TODO(M3): in auto mode, run the cleanup tasks before notifying.
-    // TODO(M6): in ask mode, add the cleanable estimate and a Clean button.
-    fn send(&self, alert: &Alert) {
-        let (title, body) = alert.message();
+    async fn scan_volumes(&self, config: &Config) -> Option<Scan> {
+        let roots = config.roots.clone();
+        match tauri::async_runtime::spawn_blocking(move || scan(&roots)).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::error!("disk scan task failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Runs the cleanup tasks on one volume and reports the result.
+    async fn clean(&self, config: &Config, volume: Volume) {
+        log::info!("auto mode: cleaning {}", volume.name);
+        let config = config.clone();
+        let sizes = Arc::clone(&self.sizes);
+        let paths = DataPaths::beside(&self.config_path);
+        let name = volume.name.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            let run = runner::clean_volume(&config, &volume, &sizes, &paths);
+            let after = disk::query(&volume.mount).ok();
+            (run, after)
+        })
+        .await;
+        let (title, body) = match outcome {
+            Ok((run, after)) => {
+                let run = run.map_err(|e| format!("{e:#}"));
+                if let Ok(r) = &run {
+                    log::info!(
+                        "auto mode: {name}: removed {}, failed {}, stopped {:?}",
+                        r.removed.len(),
+                        r.failed.len(),
+                        r.stopped
+                    );
+                }
+                runner::outcome_message(&name, &run, after)
+            }
+            Err(e) => {
+                log::error!("cleanup task for {name} panicked or was cancelled: {e}");
+                runner::outcome_message(&name, &Err(e.to_string()), None)
+            }
+        };
+        self.notify(&title, &body);
+    }
+
+    fn notify(&self, title: &str, body: &str) {
         log::info!("alert: {title}: {body}");
         if let Err(e) = self
             .app
             .notification()
             .builder()
-            .title(&title)
-            .body(&body)
+            .title(title)
+            .body(body)
             .show()
         {
             log::error!("could not show notification {title:?}: {e}");
