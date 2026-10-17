@@ -25,6 +25,17 @@ impl Default for GitCmd {
 impl GitCmd {
     fn command(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(&self.program);
+        // Picard runs git unattended in every repo under the roots, including
+        // repos it did not create (an unpacked archive can carry a .git folder).
+        // Repo config can name programs for git to run. Command-line config wins
+        // over repo config, so these two cannot be set by a repo. Filters are
+        // handled by `untrusted_filters`, because their names are not known ahead.
+        cmd.args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ]);
         cmd.arg("-C").arg(dir).args(args);
         // Picard only reads, apart from `worktree remove`. Skipping optional
         // locks stops `git status` from contending with a live session's git.
@@ -67,6 +78,31 @@ impl GitCmd {
             ),
         }
     }
+}
+
+impl GitCmd {
+    /// Filter drivers defined in the repo's own config (or the worktree's) rather
+    /// than the user's global or system config. Commands like `git status` and
+    /// `git worktree remove` can run a filter's program, so a worktree that has
+    /// any is skipped. Reading config runs nothing.
+    pub fn untrusted_filters(&self, dir: &Path) -> Result<Vec<String>> {
+        let raw = self.output(dir, &["config", "--list", "--show-scope", "-z"])?;
+        Ok(repo_scoped_filters(&raw))
+    }
+}
+
+/// Parses `git config --list --show-scope -z` and returns `filter.*` keys set in
+/// local or worktree scope. Each record is `scope NUL key NEWLINE value NUL`.
+pub fn repo_scoped_filters(raw: &str) -> Vec<String> {
+    let mut parts = raw.split('\0');
+    let mut keys = Vec::new();
+    while let (Some(scope), Some(entry)) = (parts.next(), parts.next()) {
+        let key = entry.split_once('\n').map_or(entry, |(k, _)| k);
+        if matches!(scope, "local" | "worktree") && key.starts_with("filter.") {
+            keys.push(key.to_string());
+        }
+    }
+    keys
 }
 
 /// One entry from `git worktree list --porcelain -z`.
@@ -152,6 +188,18 @@ mod tests {
         assert!(e[2].locked);
         assert_eq!(e[2].branch.as_deref(), Some("feature/x"));
         assert!(e[3].prunable);
+    }
+
+    #[test]
+    fn finds_only_repo_scoped_filters() {
+        let raw = "global\0filter.lfs.clean\ngit-lfs clean -- %f\0\
+                   local\0core.bare\nfalse\0\
+                   local\0filter.evil.clean\ntouch /tmp/pwned\0\
+                   worktree\0filter.wt.smudge\nx\0";
+        assert_eq!(
+            repo_scoped_filters(raw),
+            vec!["filter.evil.clean", "filter.wt.smudge"]
+        );
     }
 
     #[test]

@@ -73,6 +73,15 @@ impl GitWorktrees {
             );
             return Ok(None);
         }
+        let filters = self.git.untrusted_filters(&wt.path)?;
+        if !filters.is_empty() {
+            log::warn!(
+                "worktree {}: skipped because its repo config defines filters that git could run: {}",
+                wt.path.display(),
+                filters.join(", ")
+            );
+            return Ok(None);
+        }
         if !self
             .git
             .output(&wt.path, &["status", "--porcelain"])?
@@ -215,6 +224,16 @@ impl GitWorktrees {
         check_target(&c.path, ctx)?;
         if in_use.contains(&c.path) {
             return Err("now in use by a running process".to_string());
+        }
+        let filters = self
+            .git
+            .untrusted_filters(&c.path)
+            .map_err(|e| format!("{e:#}"))?;
+        if !filters.is_empty() {
+            return Err(format!(
+                "repo config defines filters: {}",
+                filters.join(", ")
+            ));
         }
         let dirty = self
             .git
@@ -614,6 +633,56 @@ mod tests {
             Arc::new(|| anyhow::bail!("lsof broke")),
         );
         assert!(t.scan(&fx.ctx()).is_err());
+    }
+
+    /// Writes an executable script that creates `marker` when run.
+    fn tripwire(dir: &Path, marker: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("tripwire.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    fn repo_fsmonitor_is_never_run() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "fsmon");
+        let marker = fx.dir.path().join("fsmonitor-ran");
+        let script = tripwire(fx.dir.path(), &marker);
+        git(&r, &["config", "core.fsmonitor", script.to_str().unwrap()]);
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        t.run(&ctx, &found);
+        assert!(!marker.exists(), "repo-configured fsmonitor was executed");
+    }
+
+    #[test]
+    fn worktree_with_repo_filter_is_skipped_and_filter_never_runs() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let marker = fx.dir.path().join("filter-ran");
+        let script = tripwire(fx.dir.path(), &marker);
+        std::fs::write(r.join(".gitattributes"), "* filter=evil\n").unwrap();
+        git(&r, &["add", ".gitattributes"]);
+        git(&r, &["commit", "-qm", "attrs"]);
+        let wt = worktree(&r, "filtered");
+        git(
+            &r,
+            &["config", "filter.evil.clean", script.to_str().unwrap()],
+        );
+        // Stale timestamps make status re-read file contents, which runs clean filters.
+        age(&fx, &wt, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        assert!(!marker.exists(), "repo-configured filter was executed");
     }
 
     #[test]
