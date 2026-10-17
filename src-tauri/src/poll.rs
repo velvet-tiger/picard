@@ -251,6 +251,7 @@ impl<R: Runtime> Poller<R> {
     }
 
     fn show(&self, view: MenuView) {
+        log::info!("status: {}", crate::tray::status_lines(&view).join("; "));
         if let Err(e) = self.tray.show(&view) {
             log::error!("could not update tray menu: {e}");
         }

@@ -190,6 +190,60 @@ mod tests {
         assert_eq!(locate(Path::new("/definitely/not/here")), Location::Missing);
     }
 
+    /// Mounts a real 200 MB disk image to stand in for an external drive, then
+    /// unmounts it. Ignored by default because it attaches a disk; run with
+    /// `cargo test -- --ignored disk_image`.
+    #[test]
+    #[ignore]
+    fn disk_image_is_its_own_volume_until_detached() {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("picard-dmg-{}", std::process::id()));
+        let image = dir.join("drive.dmg");
+        let mount = dir.join("PicardTestDrive");
+        std::fs::create_dir_all(&mount).unwrap();
+        let ok = |cmd: &mut Command| {
+            let out = cmd.output().expect("running hdiutil");
+            assert!(
+                out.status.success(),
+                "{cmd:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        ok(Command::new("hdiutil")
+            .args([
+                "create",
+                "-size",
+                "200m",
+                "-fs",
+                "APFS",
+                "-volname",
+                "PicardTestDrive",
+            ])
+            .arg(&image));
+        ok(Command::new("hdiutil")
+            .args(["attach", "-nobrowse", "-mountpoint"])
+            .arg(&mount)
+            .arg(&image));
+
+        let root = mount.join("code");
+        std::fs::create_dir_all(&root).unwrap();
+        let home_root = std::env::temp_dir();
+        let map = map_roots(&[home_root.clone(), root.clone()], locate);
+
+        ok(Command::new("hdiutil").args(["detach"]).arg(&mount));
+        let after = map_roots(&[home_root, root.clone()], locate);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(map.volumes.len(), 2, "{map:?}");
+        let drive = &map.volumes[1];
+        assert_eq!(drive.name, "PicardTestDrive");
+        assert_eq!(drive.roots, vec![root]);
+        assert_eq!(after.volumes.len(), 1, "{after:?}");
+        assert_eq!(after.unavailable.len(), 1, "{after:?}");
+        assert_eq!(after.unavailable[0].reason, "not mounted");
+    }
+
     #[test]
     fn two_real_folders_on_one_volume_share_a_device() {
         let tmp = std::env::temp_dir();
