@@ -104,7 +104,7 @@ pub fn map_roots(roots: &[PathBuf], locate: impl Fn(&Path) -> Location) -> Volum
 /// A short name for the menu. The startup disk is mounted at `/` or, for the
 /// APFS Data volume that holds home folders, `/System/Volumes/Data`.
 fn display_name(mount: &Path) -> String {
-    if mount == Path::new("/") || mount == Path::new("/System/Volumes/Data") {
+    if mount == Path::new("/") || mount == Path::new(crate::config::STARTUP_DATA_MOUNT) {
         return "Startup disk".to_string();
     }
     mount.file_name().map_or_else(

@@ -38,6 +38,9 @@ stale_days = 14
 
 const BYTES_PER_GB: f64 = 1_000_000_000.0;
 
+/// Where macOS mounts the APFS Data volume that holds home folders.
+pub const STARTUP_DATA_MOUNT: &str = "/System/Volumes/Data";
+
 /// Where the config file lives, relative to the user's home folder.
 pub fn config_path(home: &Path) -> PathBuf {
     home.join("Library/Application Support/Picard/config.toml")
@@ -180,10 +183,16 @@ pub struct Config {
 
 impl Config {
     /// The threshold for the volume mounted at `mount`, falling back to the default.
+    ///
+    /// Home folders live on the APFS Data volume, mounted at
+    /// `/System/Volumes/Data`, but users think of the startup disk as `/`. Both
+    /// share one container and report the same free space, so an override for
+    /// `/` also applies to the Data volume.
     pub fn threshold_for(&self, mount: &Path) -> Threshold {
+        let is_startup = |p: &Path| p == Path::new("/") || p == Path::new(STARTUP_DATA_MOUNT);
         self.volumes
             .iter()
-            .find(|v| v.mount == mount)
+            .find(|v| v.mount == mount || (is_startup(&v.mount) && is_startup(mount)))
             .map_or(self.threshold, |v| v.threshold)
     }
 }
@@ -427,6 +436,21 @@ mod tests {
             Threshold::Pct(5.0)
         );
         assert_eq!(c.threshold_for(Path::new("/")), Threshold::Gb(30.0));
+    }
+
+    #[test]
+    fn root_override_applies_to_the_data_volume() {
+        let c = parse_ok(
+            "min_free_gb = 30\nroots = [\"/a\"]\n[[volume]]\nmount = \"/\"\nmin_free_gb = 5\n",
+        );
+        assert_eq!(
+            c.threshold_for(Path::new("/System/Volumes/Data")),
+            Threshold::Gb(5.0)
+        );
+        assert_eq!(
+            c.threshold_for(Path::new("/Volumes/X")),
+            Threshold::Gb(30.0)
+        );
     }
 
     #[test]
