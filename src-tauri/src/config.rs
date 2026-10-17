@@ -481,8 +481,17 @@ fn validate_task(task: &TaskConfig) -> Result<()> {
             bail!("build_output dirs is empty; list folder names such as \"dist\"");
         }
         for d in dirs {
-            if d.is_empty() || d == "." || d == ".." || d == ".git" || d.contains('/') {
-                bail!("build_output dirs entry {d:?} must be a plain folder name, not a path");
+            if d.is_empty()
+                || d == "."
+                || d == ".."
+                || d == ".git"
+                || d.contains('/')
+                || d.starts_with(':')
+                || d.chars().any(|c| c.is_control() || "*?[]\\".contains(c))
+            {
+                bail!(
+                    "build_output dirs entry {d:?} must be a plain folder name, not a path or pattern"
+                );
             }
         }
     }
@@ -888,7 +897,17 @@ mod tests {
             &parse_ok(base).tasks[0],
             TaskConfig::BuildOutput { dirs, .. } if dirs.len() == 4
         ));
-        for bad in ["[]", "[\"\"]", "[\"..\"]", "[\".git\"]", "[\"a/dist\"]"] {
+        for bad in [
+            "[]",
+            "[\"\"]",
+            "[\"..\"]",
+            "[\".git\"]",
+            "[\"a/dist\"]",
+            "[\"dist\\n\"]",
+            "[\":dist\"]",
+            "[\"dist*\"]",
+            "[\"[ab]\"]",
+        ] {
             let err = parse_err(&format!("{base}dirs = {bad}\n"));
             assert!(err.contains("build_output dirs"), "{bad}: {err}");
         }

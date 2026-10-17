@@ -41,13 +41,26 @@ impl BuildOutput {
     ///
     /// `check-ignore` and `ls-files` read the index and ignore files. Neither
     /// runs filters or hooks, and `GitCmd` turns off fsmonitor.
+    ///
+    /// Both must read `name` as that one folder. Git reads its arguments as
+    /// pathspecs, where `*` and a leading `:` have meaning. Config validation
+    /// refuses names with those characters. As a second guard, `ls-files` gets
+    /// `--literal-pathspecs`, and the `./` prefix stops a leading `:` acting as
+    /// magic for `check-ignore`, which refuses that flag.
     fn keep_reason(&self, project: &Path, name: &str) -> Option<String> {
-        match self.git.check(project, &["check-ignore", "-q", "--", name]) {
+        let path = format!("./{name}");
+        match self
+            .git
+            .check(project, &["check-ignore", "-q", "--", &path])
+        {
             Ok(true) => {}
             Ok(false) => return Some("git does not ignore it".to_string()),
             Err(e) => return Some(format!("cannot ask git about it: {e:#}")),
         }
-        match self.git.output(project, &["ls-files", "-z", "--", name]) {
+        match self.git.output(
+            project,
+            &["--literal-pathspecs", "ls-files", "-z", "--", name],
+        ) {
             Ok(tracked) if tracked.is_empty() => {}
             Ok(_) => return Some("git tracks files inside it".to_string()),
             Err(e) => return Some(format!("cannot list its tracked files: {e:#}")),
