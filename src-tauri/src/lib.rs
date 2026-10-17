@@ -1,6 +1,7 @@
 pub mod cli;
 mod config;
 mod disk;
+mod env;
 mod history;
 mod monitor;
 mod poll;

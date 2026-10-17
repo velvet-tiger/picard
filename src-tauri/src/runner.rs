@@ -15,6 +15,7 @@ use chrono::Utc;
 
 use crate::config::Config;
 use crate::disk;
+use crate::env::ToolEnv;
 use crate::history::{self, Entry};
 use crate::tasks::{self, Candidate, CleanupTask, Ctx, Removed, SizeCache};
 use crate::volume::Volume;
@@ -182,6 +183,7 @@ pub fn clean_volume(
     volume: &Volume,
     sizes: &SizeCache,
     paths: &DataPaths,
+    env: &ToolEnv,
 ) -> Result<VolumeRun> {
     let _lock = RunLock::acquire(&paths.lock)?;
     let space = disk::query(&volume.mount)?;
@@ -192,7 +194,7 @@ pub fn clean_volume(
     let exclude = tasks::build_exclude(&config.exclude)?;
     let ctx = Ctx::for_volume(volume, &exclude, SystemTime::now(), sizes)
         .with_search_roots(&config.roots);
-    let tasks = tasks::from_config(&config.tasks);
+    let tasks = tasks::from_config(&config.tasks, env, &config.tools);
     let read_free = || disk::query(&volume.mount).map(|s| s.free_bytes);
     let mut record = |task: &'static str, removed: &[Removed]| {
         let entries: Vec<Entry> = removed

@@ -98,6 +98,25 @@ impl Threshold {
     }
 }
 
+/// Absolute paths for tools, overriding the PATH search. Empty by default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolOverrides {
+    pub git: Option<PathBuf>,
+    pub npm: Option<PathBuf>,
+    pub pnpm: Option<PathBuf>,
+}
+
+impl ToolOverrides {
+    pub fn get(&self, tool: &str) -> Option<&Path> {
+        match tool {
+            "git" => self.git.as_deref(),
+            "npm" => self.npm.as_deref(),
+            "pnpm" => self.pnpm.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 /// A per-volume threshold override, matched by mount point.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VolumeOverride {
@@ -187,6 +206,7 @@ pub struct Config {
     pub exclude: Vec<String>,
     pub volumes: Vec<VolumeOverride>,
     pub tasks: Vec<TaskConfig>,
+    pub tools: ToolOverrides,
 }
 
 impl Config {
@@ -223,6 +243,16 @@ struct RawConfig {
     volume: Vec<RawVolume>,
     #[serde(default)]
     task: Vec<TaskConfig>,
+    #[serde(default)]
+    tools: RawTools,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawTools {
+    git: Option<String>,
+    npm: Option<String>,
+    pnpm: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -284,6 +314,21 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
         exclude: raw.exclude,
         volumes,
         tasks: raw.task,
+        tools: parse_tools(&raw.tools, home)?,
+    })
+}
+
+fn parse_tools(raw: &RawTools, home: &Path) -> Result<ToolOverrides> {
+    let one = |name: &str, value: &Option<String>| -> Result<Option<PathBuf>> {
+        value
+            .as_deref()
+            .map(|v| expand_path(v, home).with_context(|| format!("[tools] {name}")))
+            .transpose()
+    };
+    Ok(ToolOverrides {
+        git: one("git", &raw.git)?,
+        npm: one("npm", &raw.npm)?,
+        pnpm: one("pnpm", &raw.pnpm)?,
     })
 }
 
@@ -474,6 +519,24 @@ mod tests {
             "min_free_gb = 1\nroots = [\"/a\"]\n[[task]]\ntype = \"command\"\nname = \"x\"",
         );
         assert!(e.contains("run"), "{e}");
+    }
+
+    #[test]
+    fn parses_tool_overrides_and_rejects_unknown_tools() {
+        let c = parse_ok(
+            "min_free_gb = 1\nroots = [\"/a\"]\n[tools]\ngit = \"/opt/homebrew/bin/git\"\nnpm = \"~/bin/npm\"\n",
+        );
+        assert_eq!(c.tools.get("git"), Some(Path::new("/opt/homebrew/bin/git")));
+        assert_eq!(c.tools.get("npm"), Some(Path::new("/Users/test/bin/npm")));
+        assert_eq!(c.tools.get("pnpm"), None);
+        assert!(
+            parse_err("min_free_gb = 1\nroots = [\"/a\"]\n[tools]\ncargo = \"/x\"")
+                .contains("cargo")
+        );
+        assert!(
+            parse_err("min_free_gb = 1\nroots = [\"/a\"]\n[tools]\ngit = \"git\"")
+                .contains("absolute")
+        );
     }
 
     #[test]

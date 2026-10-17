@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
+use crate::env::ToolEnv;
 use crate::monitor::{self, States};
 use crate::runner::{self, DataPaths};
 use crate::tasks::SizeCache;
@@ -135,6 +136,8 @@ pub struct Poller<R: Runtime> {
     config_error: bool,
     states: States,
     sizes: Arc<SizeCache>,
+    /// Resolved once when the loop starts; asking the login shell takes about a second.
+    tools: Option<Arc<ToolEnv>>,
 }
 
 impl<R: Runtime> Poller<R> {
@@ -148,11 +151,18 @@ impl<R: Runtime> Poller<R> {
             config_error: false,
             states: States::new(),
             sizes: Arc::new(SizeCache::default()),
+            tools: None,
         }
     }
 
     /// Runs until the app exits or every watcher sender is dropped.
     pub async fn run(mut self, mut rx: mpsc::Receiver<Wake>) {
+        let home = self.home.clone();
+        let shell = std::env::var_os("SHELL");
+        match tauri::async_runtime::spawn_blocking(move || ToolEnv::detect(&home, shell)).await {
+            Ok(env) => self.tools = Some(Arc::new(env)),
+            Err(e) => log::error!("resolving tool PATH failed; cleanup tasks are off: {e}"),
+        }
         self.reload_config();
         loop {
             self.check().await;
@@ -268,12 +278,19 @@ impl<R: Runtime> Poller<R> {
     /// Runs the cleanup tasks on one volume and reports the result.
     async fn clean(&self, config: &Config, volume: Volume) {
         log::info!("auto mode: cleaning {}", volume.name);
+        let Some(tools) = self.tools.clone() else {
+            self.notify(
+                &format!("{} is low", volume.name),
+                "Cleanup is off because tool paths could not be resolved. See the log.",
+            );
+            return;
+        };
         let config = config.clone();
         let sizes = Arc::clone(&self.sizes);
         let paths = DataPaths::beside(&self.config_path);
         let name = volume.name.clone();
         let outcome = tauri::async_runtime::spawn_blocking(move || {
-            let run = runner::clean_volume(&config, &volume, &sizes, &paths);
+            let run = runner::clean_volume(&config, &volume, &sizes, &paths, &tools);
             let after = disk::query(&volume.mount).ok();
             (run, after)
         })

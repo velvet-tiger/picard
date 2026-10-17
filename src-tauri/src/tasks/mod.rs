@@ -21,7 +21,8 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 
 pub use size::SizeCache;
 
-use crate::config::{CargoMode, TaskConfig};
+use crate::config::{CargoMode, TaskConfig, ToolOverrides};
+use crate::env::ToolEnv;
 use crate::volume::Volume;
 
 /// Something a task proposes to remove.
@@ -118,8 +119,13 @@ pub trait CleanupTask: Send + Sync {
     fn run(&self, ctx: &Ctx, candidates: &[Candidate]) -> Report;
 }
 
-/// Builds the enabled tasks in config order.
-pub fn from_config(tasks: &[TaskConfig]) -> Vec<Box<dyn CleanupTask>> {
+/// Builds the enabled tasks in config order. Tools are found through `env`,
+/// with `overrides` from the `[tools]` table taking precedence.
+pub fn from_config(
+    tasks: &[TaskConfig],
+    env: &ToolEnv,
+    overrides: &ToolOverrides,
+) -> Vec<Box<dyn CleanupTask>> {
     let mut out: Vec<Box<dyn CleanupTask>> = Vec::new();
     for task in tasks {
         match task {
@@ -143,12 +149,18 @@ pub fn from_config(tasks: &[TaskConfig]) -> Vec<Box<dyn CleanupTask>> {
                 enabled: true,
                 stale_days,
                 min_idle_minutes,
-            } => out.push(Box::new(git_worktrees::GitWorktrees::new(
-                git::GitCmd::default(),
-                *stale_days,
-                Duration::from_secs(min_idle_minutes.saturating_mul(60)),
-                Arc::new(in_use::InUse::load),
-            ))),
+            } => match env.resolve("git", overrides) {
+                Some(git) => out.push(Box::new(git_worktrees::GitWorktrees::new(
+                    git::GitCmd::new(git, env.path_var()),
+                    *stale_days,
+                    Duration::from_secs(min_idle_minutes.saturating_mul(60)),
+                    Arc::new(in_use::InUse::load),
+                ))),
+                None => log::error!(
+                    "git_worktrees skipped: git not found on {} (set [tools] git)",
+                    env.path_var()
+                ),
+            },
             // TODO(M5): command. Listed in config but not run yet.
             TaskConfig::Command {
                 enabled: true,
@@ -438,7 +450,8 @@ mod tests {
                 depth: None,
             },
         ];
-        let built = from_config(&tasks);
+        let env = ToolEnv::from_dirs(Path::new("/"), vec![PathBuf::from("/usr/bin")]);
+        let built = from_config(&tasks, &env, &ToolOverrides::default());
         let ids: Vec<_> = built.iter().map(|t| t.id()).collect();
         assert_eq!(ids, vec!["cargo_clean"]);
     }

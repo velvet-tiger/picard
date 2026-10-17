@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config};
 use crate::disk::{self, DiskSpace};
+use crate::env::ToolEnv;
 use crate::runner::{self, DataPaths, TaskScan, VolumeRun};
 use crate::tasks::{self, Ctx, SizeCache};
 use crate::volume::{self, Volume};
@@ -60,8 +61,8 @@ pub fn main(args: &[String]) -> i32 {
             eprintln!("picard: run removes files; add --yes to confirm\n{USAGE}");
             return 2;
         }
-        Command::Scan => load(parsed.config).map(|(c, _)| scan(&c)),
-        Command::Run => load(parsed.config).and_then(|(c, path)| run(&c, &path)),
+        Command::Scan => load(parsed.config).map(|(c, _, env)| scan(&c, &env)),
+        Command::Run => load(parsed.config).and_then(|(c, path, env)| run(&c, &path, &env)),
     };
     match result {
         Ok(code) => code,
@@ -98,13 +99,16 @@ fn parse_args(args: &[String]) -> Result<Args> {
     Ok(parsed)
 }
 
-fn load(config_path: Option<PathBuf>) -> Result<(Config, PathBuf)> {
+/// Reads the config and resolves tools the way the app does, so a CLI run from a
+/// bare environment (cron, launchd, `env -i`) finds the same git and npm.
+fn load(config_path: Option<PathBuf>) -> Result<(Config, PathBuf, ToolEnv)> {
     let home = std::env::home_dir().context("cannot find the home folder")?;
     let path = config_path.unwrap_or_else(|| config::config_path(&home));
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let config = config::parse(&text, &home).with_context(|| format!("in {}", path.display()))?;
-    Ok((config, path))
+    let env = ToolEnv::detect(&home, std::env::var_os("SHELL"));
+    Ok((config, path, env))
 }
 
 /// Volumes holding roots, with their current free space. Prints the ones it skips.
@@ -125,7 +129,7 @@ fn mounted_volumes(config: &Config) -> Vec<(Volume, DiskSpace)> {
         .collect()
 }
 
-fn scan(config: &Config) -> i32 {
+fn scan(config: &Config, env: &ToolEnv) -> i32 {
     let exclude = match tasks::build_exclude(&config.exclude) {
         Ok(e) => e,
         Err(e) => {
@@ -134,7 +138,7 @@ fn scan(config: &Config) -> i32 {
         }
     };
     let sizes = SizeCache::default();
-    let tasks = tasks::from_config(&config.tasks);
+    let tasks = tasks::from_config(&config.tasks, env, &config.tools);
     for (volume, space) in mounted_volumes(config) {
         let ctx = Ctx::for_volume(&volume, &exclude, SystemTime::now(), &sizes)
             .with_search_roots(&config.roots);
@@ -144,12 +148,12 @@ fn scan(config: &Config) -> i32 {
     0
 }
 
-fn run(config: &Config, config_path: &std::path::Path) -> Result<i32> {
+fn run(config: &Config, config_path: &std::path::Path, env: &ToolEnv) -> Result<i32> {
     let paths = DataPaths::beside(config_path);
     let sizes = SizeCache::default();
     let mut code = 0;
     for (volume, _) in mounted_volumes(config) {
-        match runner::clean_volume(config, &volume, &sizes, &paths) {
+        match runner::clean_volume(config, &volume, &sizes, &paths, env) {
             Ok(result) => {
                 print!("{}", format_run(&volume.name, &result));
                 if !result.failed.is_empty() {
