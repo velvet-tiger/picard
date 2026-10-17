@@ -131,6 +131,16 @@ pub fn write_private(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Writes a folder the way roots are usually written: `~/…` when it is inside
+/// the home folder, otherwise the absolute path.
+pub fn display_root(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 /// Sets a top-level key. An existing value is replaced in place, so the key
 /// keeps its position and its comments (including any comment block above it).
 fn set(doc: &mut DocumentMut, key: &str, mut new: Value) {
@@ -268,6 +278,25 @@ mod tests {
         s.roots = vec!["~/working".into()];
         s.threshold = ThresholdSetting::Pct(150.0);
         assert!(apply(DEFAULT_TOML, &s, home()).is_err());
+    }
+
+    #[test]
+    fn display_root_uses_tilde_inside_home_only() {
+        let home = Path::new("/Users/test");
+        assert_eq!(
+            display_root(Path::new("/Users/test/working"), home),
+            "~/working"
+        );
+        assert_eq!(display_root(Path::new("/Users/test"), home), "~");
+        assert_eq!(
+            display_root(Path::new("/Users/tester/x"), home),
+            "/Users/tester/x",
+            "a sibling whose name starts the same is not inside home"
+        );
+        assert_eq!(
+            display_root(Path::new("/Volumes/P/code"), home),
+            "/Volumes/P/code"
+        );
     }
 
     #[test]

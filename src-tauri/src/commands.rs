@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Runtime, State};
+use tauri::{AppHandle, Runtime, State, WebviewWindow};
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_dialog::DialogExt;
 
 use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
@@ -227,6 +228,36 @@ pub fn set_launch_at_login<R: Runtime>(app: AppHandle<R>, enabled: bool) -> Resu
     result.map_err(err)?;
     log::info!("launch at login {}", if enabled { "on" } else { "off" });
     Ok(())
+}
+
+/// Shows the macOS folder picker as a sheet on the calling window. Returns the
+/// chosen folder as it should appear in `roots` (`~/…` inside the home
+/// folder), or `None` if the user cancelled.
+#[tauri::command]
+pub async fn pick_folder<R: Runtime>(
+    window: WebviewWindow<R>,
+    state: SharedState<'_>,
+) -> Result<Option<String>, String> {
+    let home = state.home.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Choose a folder for Picard to clean")
+        .set_directory(&home)
+        .pick_folder(move |picked| {
+            // The receiver only goes away if the window closed meanwhile.
+            let _ = tx.send(picked);
+        });
+    let Some(picked) = rx
+        .await
+        .map_err(|_| "the folder picker closed unexpectedly")?
+    else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(err)?;
+    Ok(Some(settings::display_root(&path, &home)))
 }
 
 /// Reads the config file through the same privacy check `config::load` uses.

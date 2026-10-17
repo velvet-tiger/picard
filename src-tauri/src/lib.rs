@@ -30,6 +30,8 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
+        // Used only from Rust (commands::pick_folder); its JS commands are not granted.
+        .plugin(tauri_plugin_dialog::init())
         // Off until the user turns it on in Settings.
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -44,6 +46,7 @@ pub fn run() {
             commands::get_history,
             commands::get_launch_at_login,
             commands::set_launch_at_login,
+            commands::pick_folder,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

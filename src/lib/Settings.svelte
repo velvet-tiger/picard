@@ -4,6 +4,7 @@
     saveSettings,
     getLaunchAtLogin,
     setLaunchAtLogin,
+    pickFolder,
     errorText,
     newTask,
     TASK_LABELS,
@@ -34,13 +35,29 @@
     }
   }
 
+  async function addFolder() {
+    if (!settings) return
+    try {
+      const folder = await pickFolder()
+      if (folder && !settings.roots.includes(folder)) settings.roots.push(folder)
+    } catch (e) {
+      saveError = errorText(e)
+    }
+  }
+
   async function save() {
     if (!settings) return
     saving = true
     saveError = null
     saved = false
+    // A row left blank is not a folder or pattern; drop it rather than fail validation.
+    const clean = $state.snapshot(settings)
+    clean.roots = clean.roots.map((r) => r.trim()).filter(Boolean)
+    clean.exclude = clean.exclude.map((p) => p.trim()).filter(Boolean)
     try {
-      await saveSettings($state.snapshot(settings))
+      await saveSettings(clean)
+      settings.roots = clean.roots
+      settings.exclude = clean.exclude
       saved = true
     } catch (e) {
       saveError = errorText(e)
@@ -141,7 +158,7 @@
           <button onclick={() => settings!.roots.splice(i, 1)}>Remove</button>
         </div>
       {/each}
-      <button onclick={() => settings!.roots.push('')}>Add folder</button>
+      <button onclick={addFolder}>Add folder…</button>
 
       <h2 class="sub">Never touch (glob patterns)</h2>
       {#each settings.exclude as _, i}

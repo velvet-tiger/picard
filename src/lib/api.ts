@@ -76,6 +76,8 @@ export const preview = () => invoke<VolumePreview[]>('preview')
 export const runSelected = (selections: Selection[]) =>
   invoke<RunResult[]>('run_selected', { selections })
 export const getHistory = (limit: number) => invoke<HistoryEntry[]>('get_history', { limit })
+/** Opens the folder picker; resolves to `~/…` or an absolute path, or null if cancelled. */
+export const pickFolder = () => invoke<string | null>('pick_folder')
 export const getLaunchAtLogin = () => invoke<boolean>('get_launch_at_login')
 export const setLaunchAtLogin = (enabled: boolean) =>
   invoke<void>('set_launch_at_login', { enabled })

@@ -10,6 +10,7 @@ const COMMANDS: &[&str] = &[
     "get_history",
     "get_launch_at_login",
     "set_launch_at_login",
+    "pick_folder",
 ];
 
 fn main() {
