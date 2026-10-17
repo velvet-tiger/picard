@@ -37,12 +37,20 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, tab: Tab) -> tauri::Result<()> {
         return existing.set_focus();
     }
     let url = WebviewUrl::App(format!("index.html#/{}", tab.id()).into());
-    let window = WebviewWindowBuilder::new(app, WINDOW_LABEL, url)
+    let builder = WebviewWindowBuilder::new(app, WINDOW_LABEL, url)
         .title("Picard")
         .inner_size(760.0, 720.0)
         .min_inner_size(480.0, 400.0)
-        .center()
-        .build()?;
+        .center();
+    // The page draws its own title strip holding the tabs, so the title bar is
+    // hidden and only the traffic lights float over it. The strip in
+    // App.svelte is 40px tall; the lights are placed to sit centred in it.
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(16.0, 20.0));
+    let window = builder.build()?;
     // A menu bar app is never the active app, so the new window would open
     // behind whatever the user is working in without an explicit focus.
     window.set_focus()
