@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Picard's app icon. Source for `pnpm tauri icon`; edit here, then regenerate. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b4cca"/>
+      <stop offset="1" stop-color="#1c2470"/>
+    </linearGradient>
+    <linearGradient id="gauge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff6b5b"/>
+      <stop offset="0.5" stop-color="#ffc94a"/>
+      <stop offset="1" stop-color="#4fd18b"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- macOS icon grid: 824 px tile centred on a 1024 canvas. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)" filter="url(#shadow)"/>
+
+  <!-- Free-space gauge: red (full) to green (plenty free), needle in the green. -->
+  <path d="M 292 520 A 220 220 0 0 1 732 520" fill="none" stroke="url(#gauge)"
+        stroke-width="44" stroke-linecap="round"/>
+  <line x1="512" y1="520" x2="652" y2="388" stroke="#ffffff" stroke-width="22" stroke-linecap="round"/>
+  <circle cx="512" cy="520" r="30" fill="#ffffff"/>
+
+  <!-- The drive. -->
+  <rect x="232" y="586" width="560" height="214" rx="56" fill="#ffffff"/>
+  <rect x="298" y="678" width="250" height="30" rx="15" fill="#1c2470"/>
+  <circle cx="702" cy="693" r="24" fill="#4fd18b"/>
+</svg>
