@@ -30,6 +30,9 @@ const MTIME_DEPTH: usize = 6;
 
 const SECS_PER_DAY: u64 = 86_400;
 
+/// Written by Finder when a folder is opened. Not a sign of work.
+const FINDER_METADATA: &str = ".DS_Store";
+
 pub struct StaleDirs {
     id: &'static str,
     marker: &'static str,
@@ -175,6 +178,13 @@ fn idle_days(project: &Path, now: SystemTime) -> Option<u64> {
     Some(idle.as_secs() / SECS_PER_DAY)
 }
 
+/// Newest mtime of any file in the project, ignoring build output and `.git`.
+///
+/// Folder mtimes are not counted. Finder writes a `.DS_Store` into every
+/// folder you open, which bumps that folder's mtime, so merely looking at an
+/// old project would make it look active. The `.DS_Store` files themselves
+/// are skipped for the same reason. A deleted file therefore no longer counts
+/// as activity; editing or adding one still does.
 pub(super) fn newest_mtime(project: &Path) -> Option<SystemTime> {
     WalkDir::new(project)
         .follow_links(false)
@@ -182,6 +192,7 @@ pub(super) fn newest_mtime(project: &Path) -> Option<SystemTime> {
         .into_iter()
         .filter_entry(|e| e.depth() == 0 || !is_skipped(e.path()))
         .filter_map(|e| e.ok())
+        .filter(|e| !e.file_type().is_dir() && e.file_name() != FINDER_METADATA)
         .filter_map(|e| e.metadata().ok()?.modified().ok())
         .max()
 }
@@ -246,6 +257,19 @@ mod tests {
         fx.age("p/node_modules/dep", 0);
         let found = node_modules(30).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
+    }
+
+    #[test]
+    fn browsing_in_finder_does_not_make_a_project_fresh() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 10, 40);
+        // Opening folders in Finder writes .DS_Store files, which also bumps
+        // the mtime of each folder they land in.
+        fx.file("p/.DS_Store", 1);
+        fx.file("p/src/.DS_Store", 1);
+        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
+        assert_eq!(found[0].reason, "untouched for 40 days");
     }
 
     #[test]
