@@ -154,7 +154,7 @@ fn idle_days(project: &Path, now: SystemTime) -> Option<u64> {
     Some(idle.as_secs() / SECS_PER_DAY)
 }
 
-fn newest_mtime(project: &Path) -> Option<SystemTime> {
+pub(super) fn newest_mtime(project: &Path) -> Option<SystemTime> {
     WalkDir::new(project)
         .follow_links(false)
         .max_depth(MTIME_DEPTH)

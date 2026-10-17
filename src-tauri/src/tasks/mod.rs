@@ -5,12 +5,16 @@
 //! `scan`. Every path is re-checked by `check_target` immediately before it is
 //! removed, because the filesystem can change between scan and run.
 
+mod git;
+mod git_worktrees;
+mod in_use;
 mod size;
 pub mod stale_dirs;
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -48,7 +52,11 @@ pub struct Report {
 /// What a task may touch on one volume.
 pub struct Ctx<'a> {
     /// Canonical roots on this volume. Roots that cannot be resolved are left out.
+    /// Everything removed must sit inside one of these.
     pub roots: Vec<PathBuf>,
+    /// Where to look for things that own removable folders, such as git repos
+    /// whose worktrees live on this volume. Defaults to `roots`.
+    pub search_roots: Vec<PathBuf>,
     /// `st_dev` of the volume. Targets on any other device are refused.
     pub dev: u64,
     pub exclude: &'a GlobSet,
@@ -63,7 +71,7 @@ impl<'a> Ctx<'a> {
         now: SystemTime,
         sizes: &'a SizeCache,
     ) -> Self {
-        let roots = volume
+        let roots: Vec<PathBuf> = volume
             .roots
             .iter()
             .filter_map(|r| match r.canonicalize() {
@@ -75,12 +83,20 @@ impl<'a> Ctx<'a> {
             })
             .collect();
         Self {
+            search_roots: roots.clone(),
             roots,
             dev: volume.dev,
             exclude,
             now,
             sizes,
         }
+    }
+
+    /// Searches all of `roots` (every configured root, on any volume) for owners
+    /// of removable folders, while removal stays limited to this volume's roots.
+    pub fn with_search_roots(mut self, roots: &[PathBuf]) -> Self {
+        self.search_roots = roots.iter().filter_map(|r| r.canonicalize().ok()).collect();
+        self
     }
 
     /// True while at least one root is still on the expected device.
@@ -123,10 +139,17 @@ pub fn from_config(tasks: &[TaskConfig]) -> Vec<Box<dyn CleanupTask>> {
                 };
                 out.push(Box::new(stale_dirs::cargo_clean(stale_days, *depth)));
             }
-            // TODO(M4): git_worktrees. TODO(M5): command. Listed in config but not run yet.
-            TaskConfig::GitWorktrees { enabled: true, .. } => {
-                log::info!("git_worktrees task is not available until M4; skipping")
-            }
+            TaskConfig::GitWorktrees {
+                enabled: true,
+                stale_days,
+                min_idle_minutes,
+            } => out.push(Box::new(git_worktrees::GitWorktrees::new(
+                git::GitCmd::default(),
+                *stale_days,
+                Duration::from_secs(min_idle_minutes.saturating_mul(60)),
+                Arc::new(in_use::InUse::load),
+            ))),
+            // TODO(M5): command. Listed in config but not run yet.
             TaskConfig::Command {
                 enabled: true,
                 name,
@@ -394,8 +417,15 @@ mod tests {
     fn from_config_skips_disabled_and_unimplemented() {
         let tasks = vec![
             TaskConfig::GitWorktrees {
-                enabled: true,
+                enabled: false,
                 stale_days: 14,
+                min_idle_minutes: 30,
+            },
+            TaskConfig::Command {
+                enabled: true,
+                name: "x".into(),
+                run: "true".into(),
+                timeout_secs: 1,
             },
             TaskConfig::NodeModules {
                 enabled: false,

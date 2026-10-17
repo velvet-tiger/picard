@@ -25,6 +25,7 @@ exclude = []
 [[task]]
 type = "git_worktrees"
 stale_days = 14
+min_idle_minutes = 30
 
 [[task]]
 type = "node_modules"
@@ -123,6 +124,10 @@ pub enum TaskConfig {
         enabled: bool,
         #[serde(default = "default_worktree_stale_days")]
         stale_days: u32,
+        /// How long a merged worktree must sit untouched before removal. Short,
+        /// because disks fill fast; the in-use check guards live sessions.
+        #[serde(default = "default_min_idle_minutes")]
+        min_idle_minutes: u64,
     },
     NodeModules {
         #[serde(default = "default_true")]
@@ -154,6 +159,9 @@ fn default_true() -> bool {
 }
 fn default_worktree_stale_days() -> u32 {
     14
+}
+fn default_min_idle_minutes() -> u64 {
+    30
 }
 fn default_node_modules_stale_days() -> u32 {
     30

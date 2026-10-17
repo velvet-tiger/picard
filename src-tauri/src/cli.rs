@@ -136,7 +136,8 @@ fn scan(config: &Config) -> i32 {
     let sizes = SizeCache::default();
     let tasks = tasks::from_config(&config.tasks);
     for (volume, space) in mounted_volumes(config) {
-        let ctx = Ctx::for_volume(&volume, &exclude, SystemTime::now(), &sizes);
+        let ctx = Ctx::for_volume(&volume, &exclude, SystemTime::now(), &sizes)
+            .with_search_roots(&config.roots);
         let scans = runner::preview(&tasks, &ctx);
         print!("{}", format_scan(&volume.name, space, &scans));
     }
