@@ -19,6 +19,17 @@
   let checked = $state<Record<string, boolean>>({})
   let history = $state<HistoryEntry[]>([])
   let scanning = $state(true)
+  let elapsed = $state(0)
+
+  // Counts seconds while a scan runs. The scan reports no progress of its own,
+  // so elapsed time is the honest thing to show.
+  $effect(() => {
+    if (!scanning) return
+    elapsed = 0
+    const started = Date.now()
+    const timer = setInterval(() => (elapsed = Math.floor((Date.now() - started) / 1000)), 250)
+    return () => clearInterval(timer)
+  })
   let cleaning = $state(false)
   let error = $state<string | null>(null)
   let results = $state<RunResult[] | null>(null)
@@ -122,7 +133,26 @@
   {/if}
 
   {#if scanning}
-    <p class="muted">Scanning… this can take half a minute on large folders.</p>
+    <div class="panel scanning" role="status" aria-live="polite">
+      <div class="row">
+        <span class="spinner" aria-hidden="true"></span>
+        <strong>Scanning your folders…</strong>
+        <span class="muted elapsed">{elapsed} s</span>
+      </div>
+      <div class="bar" aria-hidden="true"><span></span></div>
+      <p class="muted hint">
+        Measuring build folders and checking worktrees. Large folders can take half a minute.
+      </p>
+      {#each [72, 58, 66] as width}
+        <div class="skeleton" aria-hidden="true">
+          <span class="box"></span>
+          <span class="lines"
+            ><span style="width: {width}%"></span><span style="width: {width - 20}%"></span></span
+          >
+          <span class="box"></span>
+        </div>
+      {/each}
+    </div>
   {:else if volumes.length === 0}
     <p class="muted">No mounted volumes hold a configured root.</p>
   {:else}
@@ -247,6 +277,92 @@
     text-align: right;
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
+  }
+  .scanning .row {
+    gap: 10px;
+  }
+  .elapsed {
+    font-variant-numeric: tabular-nums;
+  }
+  .hint {
+    margin: 8px 0 12px;
+  }
+  .spinner {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 2px solid var(--line);
+    border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
+  }
+  /* Indeterminate bar: a short stripe that sweeps across. */
+  .bar {
+    position: relative;
+    height: 4px;
+    margin-top: 12px;
+    border-radius: 2px;
+    background: var(--line);
+    overflow: hidden;
+  }
+  .bar span {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 35%;
+    border-radius: 2px;
+    background: var(--accent);
+    animation: sweep 1.4s ease-in-out infinite;
+  }
+  /* Placeholder rows in the shape of results: checkbox | two lines | size. */
+  .skeleton {
+    display: grid;
+    grid-template-columns: 14px minmax(0, 1fr) 48px;
+    column-gap: 10px;
+    align-items: start;
+    padding: 8px 0;
+    border-top: 1px solid var(--line);
+  }
+  .skeleton .box,
+  .skeleton .lines span {
+    display: block;
+    height: 12px;
+    border-radius: 4px;
+    background: linear-gradient(90deg, var(--line) 25%, var(--bg) 50%, var(--line) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.6s linear infinite;
+  }
+  .skeleton .box {
+    height: 14px;
+  }
+  .skeleton .lines {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @keyframes sweep {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(290%);
+    }
+  }
+  @keyframes shimmer {
+    to {
+      background-position: -200% 0;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .spinner,
+    .bar span,
+    .skeleton .box,
+    .skeleton .lines span {
+      animation: none;
+    }
   }
   .history-row {
     display: grid;
