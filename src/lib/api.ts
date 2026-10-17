@@ -124,6 +124,32 @@ export function newTask(type: TaskType): Task {
   }
 }
 
+/**
+ * Task types that Settings always lists, once each. `command` is the
+ * exception: you can have none or several, so it is added by hand.
+ */
+export const BUILT_IN_TASKS = [
+  'git_worktrees',
+  'node_modules',
+  'cargo_clean',
+  'python_venv',
+  'build_output',
+  'tool_caches',
+] as const satisfies readonly TaskType[]
+
+/**
+ * Appends each built-in task missing from `tasks`, switched off and with its
+ * defaults, so Settings shows every task with a checkbox. Existing tasks keep
+ * their order and options.
+ */
+export function withEveryBuiltIn(tasks: Task[]): Task[] {
+  const present = new Set(tasks.map((t) => t.type))
+  const missing = BUILT_IN_TASKS.filter((type) => !present.has(type)).map(
+    (type): Task => ({ ...newTask(type), enabled: false }),
+  )
+  return [...tasks, ...missing]
+}
+
 /** Closes the window this page is in. */
 export const closeWindow = () => getCurrentWindow().close()
 

@@ -8,9 +8,9 @@
     closeWindow,
     errorText,
     newTask,
+    withEveryBuiltIn,
     TASK_LABELS,
     type Settings,
-    type TaskType,
   } from './api'
 
   let settings = $state<Settings | null>(null)
@@ -19,7 +19,6 @@
   let saveError = $state<string | null>(null)
   let saved = $state(false)
   let saving = $state(false)
-  let addType = $state<TaskType>('git_worktrees')
   // The settings as last loaded or saved, to tell whether closing loses edits.
   let savedJson = $state('')
   let confirmingClose = $state(false)
@@ -33,7 +32,11 @@
 
   async function load() {
     try {
-      settings = await getSettings()
+      const loaded = await getSettings()
+      // Filled in before `savedJson` is taken, so tasks that are only listed,
+      // not changed, do not count as unsaved edits.
+      loaded.tasks = withEveryBuiltIn(loaded.tasks)
+      settings = loaded
       savedJson = JSON.stringify(settings)
       launchAtLogin = await getLaunchAtLogin()
     } catch (e) {
@@ -222,7 +225,9 @@
               disabled={i === settings!.tasks.length - 1}
               aria-label="Move down">↓</button
             >
-            <button onclick={() => settings!.tasks.splice(i, 1)}>Remove</button>
+            {#if task.type === 'command'}
+              <button onclick={() => settings!.tasks.splice(i, 1)}>Remove</button>
+            {/if}
           </div>
           <div class="opts">
             {#if task.type === 'git_worktrees'}
@@ -344,12 +349,7 @@
         </div>
       {/each}
       <div class="row">
-        <select bind:value={addType}>
-          {#each Object.entries(TASK_LABELS) as [value, label]}
-            <option {value}>{label}</option>
-          {/each}
-        </select>
-        <button onclick={() => settings!.tasks.push(newTask(addType))}>Add task</button>
+        <button onclick={() => settings!.tasks.push(newTask('command'))}>Add custom command</button>
       </div>
     </section>
 
