@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "windows",
-  "description": "What the Settings and Preview windows may do. No shell, file system or opener access.",
-  "windows": ["settings", "preview"],
+  "description": "What the Picard window may do. No shell, file system or opener access.",
+  "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-close",

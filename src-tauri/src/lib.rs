@@ -83,6 +83,17 @@ pub fn run() {
             tauri::async_runtime::spawn(poller.run(rx));
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Picard");
+        .build(tauri::generate_context!())
+        .expect("error while building Picard")
+        .run(|_app, event| {
+            // Tauri quits when the last window closes, which for a menu bar app
+            // means closing the Picard window would quit it. Such exits carry no
+            // code; Quit in the tray menu calls `app.exit(0)` and still works.
+            if let tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } = event
+            {
+                api.prevent_exit();
+            }
+        });
 }

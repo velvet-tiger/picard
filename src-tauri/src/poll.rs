@@ -13,7 +13,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_notification::{Action, ActionType, NotificationExt};
 
-use crate::windows::{self, Window};
+use crate::windows::{self, Tab};
 use tokio::sync::mpsc;
 
 use crate::config::{self, Config, Mode};
@@ -48,7 +48,7 @@ pub fn register_clean_action<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
     notifications
         .on_action(move |performed| {
             if matches!(performed.action_id(), CLEAN_ACTION | TAP_ACTION)
-                && let Err(e) = windows::open(&handle, Window::Preview)
+                && let Err(e) = windows::open(&handle, Tab::Clean)
             {
                 log::error!("could not open the Clean window from a notification: {e}");
             }
