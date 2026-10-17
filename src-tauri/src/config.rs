@@ -184,6 +184,9 @@ pub enum TaskConfig {
         enabled: bool,
         #[serde(default = "default_node_modules_stale_days")]
         stale_days: u32,
+        /// Also run `npm cache clean --force` and `pnpm store prune`.
+        #[serde(default)]
+        prune_package_caches: bool,
     },
     CargoClean {
         #[serde(default = "default_true")]
@@ -614,6 +617,25 @@ mod tests {
             "a world-writable folder lets others replace the file"
         );
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn package_cache_pruning_is_off_by_default() {
+        let base = "min_free_gb = 1\nroots = [\"/a\"]\n[[task]]\ntype = \"node_modules\"\n";
+        assert!(matches!(
+            parse_ok(base).tasks[0],
+            TaskConfig::NodeModules {
+                prune_package_caches: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_ok(&format!("{base}prune_package_caches = true\n")).tasks[0],
+            TaskConfig::NodeModules {
+                prune_package_caches: true,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! `scan`. Every path is re-checked by `check_target` immediately before it is
 //! removed, because the filesystem can change between scan and run.
 
+mod cache_prune;
 mod command;
 mod git;
 mod git_worktrees;
@@ -135,7 +136,23 @@ pub fn from_config(
             TaskConfig::NodeModules {
                 enabled: true,
                 stale_days,
-            } => out.push(Box::new(stale_dirs::node_modules(*stale_days))),
+                prune_package_caches,
+            } => {
+                let mut task = stale_dirs::node_modules(*stale_days);
+                if *prune_package_caches {
+                    let prune = cache_prune::CachePrune::new(
+                        env.resolve("npm", overrides),
+                        env.resolve("pnpm", overrides),
+                        env.path_var(),
+                    );
+                    if prune.is_empty() {
+                        log::warn!("prune_package_caches is on but neither npm nor pnpm was found");
+                    } else {
+                        task = task.with_cache_prune(prune);
+                    }
+                }
+                out.push(Box::new(task));
+            }
             TaskConfig::CargoClean {
                 enabled: true,
                 mode,
@@ -458,6 +475,7 @@ mod tests {
             TaskConfig::NodeModules {
                 enabled: false,
                 stale_days: 30,
+                prune_package_caches: false,
             },
             TaskConfig::CargoClean {
                 enabled: true,

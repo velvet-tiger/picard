@@ -12,6 +12,7 @@ use std::time::SystemTime;
 use anyhow::Result;
 use walkdir::WalkDir;
 
+use super::cache_prune::CachePrune;
 use super::{Candidate, CleanupTask, Ctx, Report, check_target, remove_dirs};
 
 /// Folders never descended into while searching for projects or reading mtimes.
@@ -33,6 +34,15 @@ pub struct StaleDirs {
     /// `None` means every match is a candidate (cargo_clean `mode = "all"`).
     stale_days: Option<u32>,
     search_depth: usize,
+    /// Runs after the folders are removed (node_modules only).
+    cache_prune: Option<CachePrune>,
+}
+
+impl StaleDirs {
+    pub fn with_cache_prune(mut self, prune: CachePrune) -> Self {
+        self.cache_prune = Some(prune);
+        self
+    }
 }
 
 /// Stale `node_modules` next to a `package.json`.
@@ -43,6 +53,7 @@ pub fn node_modules(stale_days: u32) -> StaleDirs {
         dir_name: "node_modules",
         stale_days: Some(stale_days),
         search_depth: DEFAULT_SEARCH_DEPTH,
+        cache_prune: None,
     }
 }
 
@@ -54,6 +65,7 @@ pub fn cargo_clean(stale_days: Option<u32>, depth: Option<u32>) -> StaleDirs {
         dir_name: "target",
         stale_days,
         search_depth: depth.map_or(DEFAULT_SEARCH_DEPTH, |d| d as usize),
+        cache_prune: None,
     }
 }
 
@@ -92,7 +104,13 @@ impl CleanupTask for StaleDirs {
     }
 
     fn run(&self, ctx: &Ctx, candidates: &[Candidate]) -> Report {
-        remove_dirs(ctx, candidates)
+        let mut report = remove_dirs(ctx, candidates);
+        if let Some(prune) = &self.cache_prune
+            && report.halted.is_none()
+        {
+            prune.run(ctx, &mut report);
+        }
+        report
     }
 }
 
