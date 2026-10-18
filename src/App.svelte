@@ -58,28 +58,21 @@
 
 <svelte:window onkeydown={onKey} />
 
-<!-- The macOS title bar is hidden (src-tauri/src/windows.rs), so this strip is
-     what the window is dragged by. Its height leaves room for the traffic lights. -->
-<header class="titlebar" data-tauri-drag-region>
-  {#if active !== null}
-    <div class="tabs" role="tablist" aria-label="Picard">
-      {#each TABS as t}
-        <button
-          role="tab"
-          id="tab-{t.id}"
-          aria-selected={active === t.id}
-          aria-controls="panel-{t.id}"
-          class:selected={active === t.id}
-          onclick={() => show(t.id)}>{t.label}</button
-        >
-      {/each}
-    </div>
-  {/if}
-</header>
-
 {#if active === null}
   <main><p>Unknown view “{initial}”.</p></main>
 {:else}
+  <div class="tabs" role="tablist" aria-label="Picard">
+    {#each TABS as t}
+      <button
+        role="tab"
+        id="tab-{t.id}"
+        aria-selected={active === t.id}
+        aria-controls="panel-{t.id}"
+        class:selected={active === t.id}
+        onclick={() => show(t.id)}>{t.label}</button
+      >
+    {/each}
+  </div>
   {#if opened.clean}
     <div role="tabpanel" id="panel-clean" aria-labelledby="tab-clean" hidden={active !== 'clean'}>
       <Preview />
@@ -98,38 +91,26 @@
 {/if}
 
 <style>
-  .titlebar {
-    position: sticky;
-    top: 0;
-    z-index: 10;
-    height: 40px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: var(--bg);
-  }
-  /* Two segments that join into one pill. */
   .tabs {
     display: flex;
-    gap: 3px;
+    justify-content: center;
+    gap: 2px;
+    width: fit-content;
+    margin: 12px auto 0;
+    padding: 2px;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background: var(--panel);
   }
   .tabs button {
-    height: 24px;
-    padding: 0 20px;
-    border-radius: 0;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    background: var(--lc-lilac);
-  }
-  .tabs button:first-child {
-    border-radius: 12px 0 0 12px;
-  }
-  .tabs button:last-child {
-    border-radius: 0 12px 12px 0;
+    border: none;
+    border-radius: 5px;
+    padding: 3px 18px;
+    background: transparent;
+    color: var(--text);
   }
   .tabs button.selected {
-    background: var(--lc-sky);
+    background: var(--accent);
+    color: #fff;
   }
 </style>
