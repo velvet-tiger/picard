@@ -222,6 +222,13 @@ fn format_run(name: &str, run: &VolumeRun) -> String {
             path.display()
         ));
     }
+    for (task, path, why) in &run.skipped {
+        out.push_str(&format!(
+            "  skipped  {:<13} {}: {why}\n",
+            task,
+            path.display()
+        ));
+    }
     if let Some(why) = &run.stopped {
         out.push_str(&format!("  stopped: {why}\n"));
     }
@@ -333,10 +340,19 @@ mod tests {
                 },
             )],
             failed: vec![],
+            skipped: vec![(
+                "node_modules",
+                PathBuf::from("/w/k/node_modules"),
+                "is ignored",
+            )],
             stopped: Some("enough space is free".into()),
         };
         let text = format_run("X", &run);
         assert!(text.contains("removed  cargo_clean"));
+        assert!(
+            text.contains("skipped  node_modules  /w/k/node_modules: is ignored"),
+            "{text}"
+        );
         assert!(text.contains("stopped: enough space is free"));
         assert!(text.ends_with("freed: 5.0 GB\n"));
     }

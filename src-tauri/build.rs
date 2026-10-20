@@ -13,6 +13,7 @@ const COMMANDS: &[&str] = &[
     "pick_folder",
     "get_ignored",
     "set_ignored",
+    "get_protection",
 ];
 
 fn main() {

@@ -4,6 +4,7 @@
     runSelected,
     getHistory,
     setIgnored,
+    getProtection,
     notifyIgnoreChanged,
     onIgnoreChanged,
     errorText,
@@ -151,6 +152,9 @@
       await setIgnored(item.path, ignore)
       item.ignored = ignore
       notifyIgnoreChanged({ path: item.path, ignored: ignore, source: 'clean' })
+      // One change can protect or free other rows too, such as the worktree
+      // that holds this folder.
+      await refreshProtection()
     } catch (e) {
       error = errorText(e)
     } finally {
@@ -158,19 +162,36 @@
     }
   }
 
-  // Settings sends entries as written (`~/…` or absolute). A folder written
-  // through a symlink will not match here; the row then stays marked until
-  // Rescan, which is safe because the backend decides what is removed.
+  /**
+   * Asks the backend how the ignore list protects every listed row, and
+   * updates them. Cheap: it reads the config and checks paths, with no scan.
+   * A row that becomes protected is unticked; one that is freed stays
+   * unticked until you tick it.
+   */
+  async function refreshProtection() {
+    const rows = volumes.flatMap((v) =>
+      v.tasks.flatMap((t) => t.items.map((item) => ({ mount: v.mount, item }))),
+    )
+    if (rows.length === 0) return
+    const found = await getProtection(rows.map((r) => r.item.path))
+    if (found.length !== rows.length) {
+      throw new Error(`get_protection returned ${found.length} answers for ${rows.length} rows`)
+    }
+    rows.forEach(({ mount, item }, n) => {
+      const ignored = found[n] === 'ignored'
+      const holds = found[n] === 'holds_ignored'
+      if (ignored !== item.ignored || holds !== item.holds_ignored) {
+        checked[key(mount, item.path)] = false
+      }
+      item.ignored = ignored
+      item.holds_ignored = holds
+    })
+  }
+
   $effect(() =>
     onIgnoreChanged((change) => {
       if (change.source === 'clean') return
-      for (const v of volumes)
-        for (const t of v.tasks)
-          for (const i of t.items)
-            if (i.path === change.path || tildePath(i.path) === change.path) {
-              i.ignored = change.ignored
-              checked[key(v.mount, i.path)] = false
-            }
+      refreshProtection().catch((e) => (error = errorText(e)))
     }),
   )
 
@@ -197,6 +218,11 @@
         <h2>{r.name}: freed {r.freed_text}</h2>
         {#if r.error}<p class="error">{r.error}</p>{/if}
         {#if r.stopped}<p class="muted">Stopped: {r.stopped}</p>{/if}
+        {#each r.skipped as s}
+          <p class="muted" title={tildePath(s.path)}>
+            Skipped {itemTitle(s.task, s.path)}: {s.reason}
+          </p>
+        {/each}
         {#each r.failed as f}
           <p class="error" title={tildePath(f.path)}>
             {itemTitle(f.task, f.path)}: {f.reason}

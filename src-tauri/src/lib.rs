@@ -49,6 +49,7 @@ pub fn run() {
             commands::pick_folder,
             commands::get_ignored,
             commands::set_ignored,
+            commands::get_protection,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

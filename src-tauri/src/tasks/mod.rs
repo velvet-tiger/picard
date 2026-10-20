@@ -94,7 +94,12 @@ pub struct Report {
 /// through a symlinked parent such as `/var`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IgnoreList {
+    /// Every entry, as given and resolved. A candidate equal to one is ignored.
     paths: HashSet<PathBuf>,
+    /// The entries that exist now, as given and resolved. Only these make a
+    /// candidate hold an ignored folder: removing a folder cannot remove an
+    /// ignored folder that is not inside it any more.
+    present: HashSet<PathBuf>,
 }
 
 /// Why `IgnoreList` protects a path.
@@ -116,17 +121,22 @@ impl Protected {
 }
 
 impl IgnoreList {
-    /// Builds the list from config entries. An entry that cannot be resolved,
-    /// for example because the folder is gone, still matches by its own path.
+    /// Builds the list from config entries, checking which exist now. An
+    /// entry that cannot be resolved, for example because the folder is gone,
+    /// still matches by its own path, so the folder stays ignored if it comes
+    /// back.
     pub fn new(entries: &[PathBuf]) -> Self {
         let mut paths = HashSet::new();
+        let mut present = HashSet::new();
         for entry in entries {
             paths.insert(entry.clone());
             if let Ok(canon) = entry.canonicalize() {
-                paths.insert(canon);
+                paths.insert(canon.clone());
+                present.insert(entry.clone());
+                present.insert(canon);
             }
         }
-        Self { paths }
+        Self { paths, present }
     }
 
     /// Whether removing `path` would remove an ignored folder, and why.
@@ -138,13 +148,11 @@ impl IgnoreList {
         let forms = std::iter::once(path).chain(canon.as_deref());
         let mut found = None;
         for form in forms {
-            for entry in &self.paths {
-                if entry == form {
-                    return Some(Protected::Ignored);
-                }
-                if entry.starts_with(form) {
-                    found = Some(Protected::HoldsIgnored);
-                }
+            if self.paths.contains(form) {
+                return Some(Protected::Ignored);
+            }
+            if self.present.iter().any(|entry| entry.starts_with(form)) {
+                found = Some(Protected::HoldsIgnored);
             }
         }
         found
@@ -647,6 +655,11 @@ mod tests {
         assert_eq!(
             gone.protects(Path::new("/nowhere/at/all")),
             Some(Protected::Ignored)
+        );
+        assert_eq!(
+            gone.protects(Path::new("/nowhere/at")),
+            None,
+            "a missing entry does not protect the folder above it"
         );
         assert_eq!(IgnoreList::default().protects(&real), None);
     }

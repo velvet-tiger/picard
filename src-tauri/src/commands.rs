@@ -20,6 +20,7 @@ use crate::poll;
 use crate::runner::{self, CleanRequest, TaskScan, VolumeRun};
 use crate::settings::{self, Settings};
 use crate::state::Shared;
+use crate::tasks::{IgnoreList, Protected};
 use crate::volume::Volume;
 
 type SharedState<'a> = State<'a, Arc<Shared>>;
@@ -98,6 +99,8 @@ pub struct RunResult {
     pub freed_text: String,
     pub removed: Vec<RunItem>,
     pub failed: Vec<RunFailure>,
+    /// Left alone because the ignore list protects them; `reason` says why.
+    pub skipped: Vec<RunFailure>,
     pub stopped: Option<String>,
     /// Set when the whole volume could not be cleaned, for example because
     /// another cleanup was already running.
@@ -197,6 +200,33 @@ pub async fn set_ignored(
         Ok(())
     })
     .await
+}
+
+/// How the current `ignore` list protects each of `paths`, in order:
+/// "ignored", "holds_ignored", or null. Reads the config only, with no scan,
+/// so the Clean tab can refresh every row after an Ignore or Unignore.
+#[tauri::command]
+pub async fn get_protection(
+    state: SharedState<'_>,
+    paths: Vec<String>,
+) -> Result<Vec<Option<&'static str>>, String> {
+    let shared = Arc::clone(&state);
+    blocking(move || {
+        let config = load_config(&shared)?;
+        Ok(protection_view(&IgnoreList::new(&config.ignore), &paths))
+    })
+    .await
+}
+
+fn protection_view(ignore: &IgnoreList, paths: &[String]) -> Vec<Option<&'static str>> {
+    paths
+        .iter()
+        .map(|p| match ignore.protects(std::path::Path::new(p)) {
+            Some(Protected::Ignored) => Some("ignored"),
+            Some(Protected::HoldsIgnored) => Some("holds_ignored"),
+            None => None,
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -405,6 +435,15 @@ fn run_view(name: &str, result: Result<VolumeRun, String>) -> RunResult {
                     reason: why.clone(),
                 })
                 .collect(),
+            skipped: run
+                .skipped
+                .iter()
+                .map(|(task, path, why)| RunFailure {
+                    task: task.to_string(),
+                    path: path.display().to_string(),
+                    reason: why.to_string(),
+                })
+                .collect(),
             stopped: run.stopped,
             error: None,
         },
@@ -413,6 +452,7 @@ fn run_view(name: &str, result: Result<VolumeRun, String>) -> RunResult {
             freed_text: disk::format_bytes(0),
             removed: Vec::new(),
             failed: Vec::new(),
+            skipped: Vec::new(),
             stopped: None,
             error: Some(e),
         },
@@ -497,6 +537,24 @@ mod tests {
     }
 
     #[test]
+    fn protection_view_reports_each_path_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("wt/node_modules");
+        std::fs::create_dir_all(&kept).unwrap();
+        let ignore = IgnoreList::new(std::slice::from_ref(&kept));
+        let paths = [
+            dir.path().join("wt"),
+            kept.clone(),
+            dir.path().join("other"),
+        ]
+        .map(|p| p.display().to_string());
+        assert_eq!(
+            protection_view(&ignore, &paths),
+            vec![Some("holds_ignored"), Some("ignored"), None]
+        );
+    }
+
+    #[test]
     fn run_view_reports_success_and_whole_volume_errors() {
         let run = VolumeRun {
             removed: vec![(
@@ -511,11 +569,17 @@ mod tests {
                 PathBuf::from("/w/r/wt"),
                 "now in use".into(),
             )],
+            skipped: vec![(
+                "node_modules",
+                PathBuf::from("/w/k/node_modules"),
+                "is ignored",
+            )],
             stopped: None,
         };
         let ok = run_view("Startup disk", Ok(run));
         assert_eq!(ok.freed_text, "2.0 GB");
         assert_eq!(ok.failed[0].reason, "now in use");
+        assert_eq!(ok.skipped[0].reason, "is ignored");
         let failed = run_view(
             "Startup disk",
             Err("another cleanup is already running".into()),

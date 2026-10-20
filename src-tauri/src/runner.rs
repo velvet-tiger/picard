@@ -148,6 +148,8 @@ pub fn preview(tasks: &[Box<dyn CleanupTask>], ctx: &Ctx, ignore: &IgnoreList) -
 pub struct VolumeRun {
     pub removed: Vec<(&'static str, Removed)>,
     pub failed: Vec<(&'static str, PathBuf, String)>,
+    /// Candidates left alone because the ignore list protects them, with why.
+    pub skipped: Vec<(&'static str, PathBuf, &'static str)>,
     /// Why the run ended before the last task, if it did.
     pub stopped: Option<String>,
 }
@@ -209,6 +211,7 @@ pub fn run_tasks(
                     c.path.display(),
                     why.reason()
                 );
+                out.skipped.push((task.id(), c.path.clone(), why.reason()));
                 false
             }
             None => true,
@@ -598,6 +601,8 @@ mod tests {
             assert_eq!(run.removed.len(), 1, "{scope:?}: {run:?}");
             assert_eq!(run.removed[0].0, "cargo_clean");
             assert!(run.failed.is_empty(), "{scope:?}: {run:?}");
+            assert_eq!(run.skipped.len(), 1, "{scope:?}: {run:?}");
+            assert_eq!(run.skipped[0].2, "is ignored");
         }
     }
 
@@ -632,6 +637,7 @@ mod tests {
             &mut |_, _| {},
         );
         assert!(fx.root.join("rs/target/debug/keep/a").exists(), "{run:?}");
+        assert_eq!(run.skipped[0].2, "holds an ignored folder");
         assert_eq!(run.removed.len(), 1, "{run:?}");
         assert_eq!(run.removed[0].0, "node_modules");
     }

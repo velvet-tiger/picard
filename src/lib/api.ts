@@ -76,6 +76,8 @@ export interface RunResult {
   freed_text: string
   removed: { task: TaskType; path: string; size_text: string }[]
   failed: { task: TaskType; path: string; reason: string }[]
+  /** Left alone because the ignore list protects them. */
+  skipped: { task: TaskType; path: string; reason: string }[]
   stopped: string | null
   error: string | null
 }
@@ -99,6 +101,12 @@ export const getIgnored = () => invoke<string[]>('get_ignored')
 /** Adds a folder to the `ignore` list, or takes it off. Safe to repeat. */
 export const setIgnored = (path: string, ignored: boolean) =>
   invoke<void>('set_ignored', { path, ignored })
+
+export type Protection = 'ignored' | 'holds_ignored' | null
+
+/** How the current ignore list protects each path, in order. Reads the config only; no scan. */
+export const getProtection = (paths: string[]) =>
+  invoke<Protection[]>('get_protection', { paths })
 
 // The Clean and Settings tabs share one window and both edit the ignore list,
 // so each tells the other when it changes. A DOM event is enough: they run in

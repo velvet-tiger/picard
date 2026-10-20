@@ -16,6 +16,7 @@
     "allow-set-launch-at-login",
     "allow-pick-folder",
     "allow-get-ignored",
-    "allow-set-ignored"
+    "allow-set-ignored",
+    "allow-get-protection"
   ]
 }

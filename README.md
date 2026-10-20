@@ -42,7 +42,7 @@ Picard never switches modes by itself.
 
 Each folder in the **Clean…** list has an **Ignore** button. An ignored folder stays in the list, greyed out and unticked, so you can find it again. No cleanup removes it, in any mode, and it is left out of the totals. Press **Unignore** to undo it.
 
-A folder that holds an ignored folder is skipped too, because removing it would remove the ignored one. For example, ignoring `node_modules` inside a merged worktree keeps the whole worktree. Its row is greyed out with the note "holds an ignored folder".
+A folder that holds an ignored folder is skipped too, because removing it would remove the ignored one. For example, ignoring `node_modules` inside a merged worktree keeps the whole worktree. Its row is greyed out with the note "holds an ignored folder". If you delete an ignored folder yourself, its entry stays until you remove it in **Settings…**. The folder stays ignored if it comes back, but it no longer protects the folder above it. After a cleanup, the results list each protected folder as "Skipped", with the reason.
 
 A cleanup that is already running reads the list again before each task, so a folder you ignore mid-run is safe from the next task on. A folder you stop ignoring mid-run stays protected until the next run.
 

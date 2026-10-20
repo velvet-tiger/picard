@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-protection"
+description = "Enables the get_protection command without any pre-configured scope."
+commands.allow = ["get_protection"]
+
+[[permission]]
+identifier = "deny-get-protection"
+description = "Denies the get_protection command without any pre-configured scope."
+commands.deny = ["get_protection"]
