@@ -24,7 +24,7 @@ These rules always hold:
 - Git branches are never deleted. Worktrees are removed with `git worktree remove`, never with `--force`.
 - A worktree with uncommitted or untracked changes is never removed.
 - Every item is checked again just before it is removed.
-- A folder you ignore is never removed, in any mode.
+- A folder you ignore is never removed, in any mode. Neither is a folder that holds one, such as a worktree with an ignored `node_modules` inside it.
 - Every removal is logged to `history.jsonl`.
 - Only one cleanup runs at a time.
 
@@ -41,6 +41,10 @@ Picard never switches modes by itself.
 ### Ignoring a folder
 
 Each folder in the **Clean…** list has an **Ignore** button. An ignored folder stays in the list, greyed out and unticked, so you can find it again. No cleanup removes it, in any mode, and it is left out of the totals. Press **Unignore** to undo it.
+
+A folder that holds an ignored folder is skipped too, because removing it would remove the ignored one. For example, ignoring `node_modules` inside a merged worktree keeps the whole worktree. Its row is greyed out with the note "holds an ignored folder".
+
+A cleanup that is already running reads the list again before each task, so a folder you ignore mid-run is safe from the next task on. A folder you stop ignoring mid-run stays protected until the next run.
 
 Ignored folders are saved to `ignore` in the config. **Settings…** lists them, with a **Remove** button on each. Use that list when a folder has dropped out of the **Clean…** list, for example because you worked on that project again. Ignoring matches one exact folder. Ignoring a project folder does not protect the `node_modules` inside it. To protect everything below a folder, use `exclude`, which hides matching folders from the list completely.
 

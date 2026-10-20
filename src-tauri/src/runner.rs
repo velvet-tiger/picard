@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::disk;
 use crate::env::ToolEnv;
 use crate::history::{self, Entry};
-use crate::tasks::{self, Candidate, CleanupTask, Ctx, Removed, SizeCache};
+use crate::tasks::{self, Candidate, CleanupTask, Ctx, IgnoreList, Protected, Removed, SizeCache};
 use crate::volume::Volume;
 
 /// Files Picard keeps next to its config.
@@ -86,42 +86,6 @@ impl RunLock {
     }
 }
 
-/// Folders the user asked Picard to leave alone (`ignore` in the config).
-///
-/// Matching is exact, never by prefix: ignoring a folder does not protect
-/// another folder inside it. A path matches when it, or the path it resolves
-/// to, equals an entry or the path that entry resolves to. So `~/w/x` still
-/// matches after macOS reports it through a symlinked parent such as `/var`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct IgnoreList {
-    paths: HashSet<PathBuf>,
-}
-
-impl IgnoreList {
-    /// Builds the list from config entries. An entry that cannot be resolved,
-    /// for example because the folder is gone, still matches by its own path.
-    pub fn new(entries: &[PathBuf]) -> Self {
-        let mut paths = HashSet::new();
-        for entry in entries {
-            paths.insert(entry.clone());
-            if let Ok(canon) = entry.canonicalize() {
-                paths.insert(canon);
-            }
-        }
-        Self { paths }
-    }
-
-    pub fn contains(&self, path: &Path) -> bool {
-        if self.paths.is_empty() {
-            return false;
-        }
-        self.paths.contains(path)
-            || path
-                .canonicalize()
-                .is_ok_and(|canon| self.paths.contains(&canon))
-    }
-}
-
 /// One task's scan result, for preview.
 #[derive(Debug)]
 pub struct TaskScan {
@@ -130,42 +94,50 @@ pub struct TaskScan {
     pub result: Result<Vec<Candidate>, String>,
     /// The candidate paths in `result` that the user ignored. No run removes them.
     pub ignored: HashSet<PathBuf>,
+    /// The candidate paths in `result` that hold an ignored folder, such as a
+    /// worktree with an ignored `node_modules`. No run removes them either.
+    pub holds_ignored: HashSet<PathBuf>,
 }
 
 impl TaskScan {
-    /// Bytes a run could free: every candidate that is not ignored.
+    /// Whether no run will remove this candidate.
+    pub fn is_protected(&self, path: &Path) -> bool {
+        self.ignored.contains(path) || self.holds_ignored.contains(path)
+    }
+
+    /// Bytes a run could free: every candidate that is not protected.
     pub fn cleanable_bytes(&self) -> u64 {
         self.result.as_ref().map_or(0, |cands| {
             cands
                 .iter()
-                .filter(|c| !self.ignored.contains(&c.path))
+                .filter(|c| !self.is_protected(&c.path))
                 .map(|c| c.bytes)
                 .sum()
         })
     }
 }
 
-/// Lists what every task would remove, marking the candidates in `ignore`.
-/// Changes nothing.
+/// Lists what every task would remove, marking the candidates `ignore`
+/// protects. Changes nothing.
 pub fn preview(tasks: &[Box<dyn CleanupTask>], ctx: &Ctx, ignore: &IgnoreList) -> Vec<TaskScan> {
     tasks
         .iter()
         .map(|t| {
             let result = t.scan(ctx).map_err(|e| format!("{e:#}"));
-            let ignored = result.as_ref().map_or_else(
-                |_| HashSet::new(),
-                |cands| {
-                    cands
-                        .iter()
-                        .filter(|c| ignore.contains(&c.path))
-                        .map(|c| c.path.clone())
-                        .collect()
-                },
-            );
+            let mut ignored = HashSet::new();
+            let mut holds_ignored = HashSet::new();
+            for c in result.iter().flatten() {
+                match ignore.protects(&c.path) {
+                    Some(Protected::Ignored) => ignored.insert(c.path.clone()),
+                    Some(Protected::HoldsIgnored) => holds_ignored.insert(c.path.clone()),
+                    None => false,
+                };
+            }
             TaskScan {
                 task: t.id(),
                 result,
                 ignored,
+                holds_ignored,
             }
         })
         .collect()
@@ -188,15 +160,18 @@ impl VolumeRun {
 
 /// Runs tasks in order until free space reaches `target_free`.
 ///
-/// Candidates in `ignore` are never removed, whatever the scope. `read_free`
-/// and `record` are passed in so the ordering and early-stop rules can be
-/// tested without a real disk or history file. `record` is called after each
-/// task with what it removed.
+/// Candidates the ignore list protects are never removed, whatever the scope.
+/// `ignore` is called before each task, so a folder ignored while a run is
+/// under way is honoured from the next task on. It is also set on `ctx`, so
+/// each removal checks it again on the resolved path. `read_free` and
+/// `record` are passed in so the ordering and early-stop rules can be tested
+/// without a real disk or history file. `record` is called after each task
+/// with what it removed.
 pub fn run_tasks(
     tasks: &[Box<dyn CleanupTask>],
     ctx: &Ctx,
     scope: &Scope,
-    ignore: &IgnoreList,
+    ignore: &dyn Fn() -> IgnoreList,
     read_free: &dyn Fn() -> io::Result<u64>,
     record: &mut dyn FnMut(&'static str, &[Removed]),
 ) -> VolumeRun {
@@ -224,14 +199,21 @@ pub fn run_tasks(
                 continue;
             }
         };
+        let ignore = ignore();
         let mut candidates = scope.filter(scanned);
-        candidates.retain(|c| {
-            let ignored = ignore.contains(&c.path);
-            if ignored {
-                log::info!("{}: skipping ignored {}", task.id(), c.path.display());
+        candidates.retain(|c| match ignore.protects(&c.path) {
+            Some(why) => {
+                log::info!(
+                    "{}: skipping {}: {}",
+                    task.id(),
+                    c.path.display(),
+                    why.reason()
+                );
+                false
             }
-            !ignored
+            None => true,
         });
+        ctx.set_keep(ignore);
         if candidates.is_empty() {
             continue;
         }
@@ -365,8 +347,35 @@ pub fn preview_volume(
     Ok(preview(&tasks, &ctx, &IgnoreList::new(&config.ignore)))
 }
 
+/// Re-reads the `ignore` list from the config file during a run.
+pub type ReloadIgnore<'a> = &'a (dyn Fn() -> Result<Vec<PathBuf>> + 'a);
+
+/// A `ReloadIgnore` that reads the config file at `config_path`.
+pub fn ignore_from_file<'a>(
+    config_path: &'a Path,
+    home: &'a Path,
+) -> impl Fn() -> Result<Vec<PathBuf>> + 'a {
+    move || crate::config::load(config_path, home).map(|c| c.ignore)
+}
+
+/// The ignore list for the next task: `base`, from the config the run
+/// started with, plus whatever `reload` finds now. Taking the union means a
+/// folder ignored mid-run is honoured, and a failed or half-written re-read
+/// can never drop an entry. An entry removed mid-run applies from the next run.
+fn current_ignore(base: &[PathBuf], reload: ReloadIgnore) -> IgnoreList {
+    let mut entries = base.to_vec();
+    match reload() {
+        Ok(more) => entries.extend(more),
+        Err(e) => log::warn!(
+            "could not re-read the ignore list; using the one from the start of the run: {e:#}"
+        ),
+    }
+    IgnoreList::new(&entries)
+}
+
 /// Cleans one volume for real: takes the lock, runs the tasks and writes history.
-/// `request` says how much to remove; see `CleanRequest`.
+/// `request` says how much to remove; see `CleanRequest`. `reload_ignore`
+/// re-reads the ignore list before each task; see `current_ignore`.
 pub fn clean_volume(
     config: &Config,
     volume: &Volume,
@@ -374,6 +383,7 @@ pub fn clean_volume(
     paths: &DataPaths,
     env: &ToolEnv,
     request: CleanRequest,
+    reload_ignore: ReloadIgnore,
 ) -> Result<VolumeRun> {
     let _lock = RunLock::acquire(&paths.lock)?;
     let scope = match request {
@@ -405,7 +415,7 @@ pub fn clean_volume(
             log::error!("could not write history: {e:#}");
         }
     };
-    let ignore = IgnoreList::new(&config.ignore);
+    let ignore = || current_ignore(&config.ignore, reload_ignore);
     Ok(run_tasks(
         &tasks,
         &ctx,
@@ -449,7 +459,7 @@ mod tests {
             &two_tasks(),
             &ctx,
             &Scope::UntilFree(100),
-            &IgnoreList::default(),
+            &IgnoreList::default,
             &|| Ok(0),
             &mut |t, r| recorded.push((t, r.len())),
         );
@@ -473,7 +483,7 @@ mod tests {
             &two_tasks(),
             &ctx,
             &Scope::UntilFree(100),
-            &IgnoreList::default(),
+            &IgnoreList::default,
             &read_free,
             &mut |_, _| {},
         );
@@ -493,7 +503,7 @@ mod tests {
             &two_tasks(),
             &fx.ctx(),
             &Scope::All,
-            &IgnoreList::default(),
+            &IgnoreList::default,
             &|| Ok(u64::MAX),
             &mut |_, _| {},
         );
@@ -509,7 +519,7 @@ mod tests {
             &two_tasks(),
             &fx.ctx(),
             &Scope::UntilFree(100),
-            &IgnoreList::default(),
+            &IgnoreList::default,
             &|| Err(io::Error::other("gone")),
             &mut |_, _| {},
         );
@@ -531,7 +541,7 @@ mod tests {
             &two_tasks(),
             &ctx,
             &Scope::Selected(chosen),
-            &IgnoreList::default(),
+            &IgnoreList::default,
             &|| Ok(u64::MAX),
             &mut |_, _| {},
         );
@@ -577,7 +587,7 @@ mod tests {
                 &two_tasks(),
                 &fx.ctx(),
                 &scope,
-                &ignore,
+                &|| ignore.clone(),
                 &|| Ok(0),
                 &mut |_, _| {},
             );
@@ -599,7 +609,7 @@ mod tests {
             &two_tasks(),
             &fx.ctx(),
             &Scope::All,
-            &ignore,
+            &|| ignore.clone(),
             &|| Ok(0),
             &mut |_, _| {},
         );
@@ -607,31 +617,80 @@ mod tests {
     }
 
     #[test]
-    fn ignore_list_matches_through_symlinked_parents_and_missing_entries() {
+    fn a_folder_holding_an_ignored_folder_is_not_removed() {
+        // A target folder whose inner build folder is ignored stands in for a
+        // worktree holding an ignored node_modules.
         let fx = fixture();
-        let real = fx.root.join("web/node_modules");
-        let link = fx.dir.path().join("link");
-        std::os::unix::fs::symlink(&fx.root, &link).unwrap();
-        let ignore = IgnoreList::new(&[link.join("web/node_modules")]);
-        assert!(ignore.contains(&real));
-        assert!(ignore.contains(&real.canonicalize().unwrap()));
-        assert!(!ignore.contains(&fx.root.join("rs/target")));
-        let gone = IgnoreList::new(&[PathBuf::from("/nowhere/at/all")]);
-        assert!(gone.contains(Path::new("/nowhere/at/all")));
-        assert!(!IgnoreList::default().contains(&real));
+        fx.file("rs/target/debug/keep/a", 10);
+        let ignore = IgnoreList::new(&[fx.root.join("rs/target/debug/keep")]);
+        let run = run_tasks(
+            &two_tasks(),
+            &fx.ctx(),
+            &Scope::All,
+            &|| ignore.clone(),
+            &|| Ok(0),
+            &mut |_, _| {},
+        );
+        assert!(fx.root.join("rs/target/debug/keep/a").exists(), "{run:?}");
+        assert_eq!(run.removed.len(), 1, "{run:?}");
+        assert_eq!(run.removed[0].0, "node_modules");
     }
 
     #[test]
-    fn preview_marks_ignored_candidates_and_leaves_them_out_of_cleanable_bytes() {
+    fn ignore_list_is_read_again_before_each_task() {
         let fx = fixture();
-        let ignore = IgnoreList::new(&[fx.root.join("web/node_modules")]);
+        let calls = Cell::new(0);
+        // Empty for the first task; the cargo target is ignored by the second.
+        let target = fx.root.join("rs/target");
+        let ignore = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                IgnoreList::default()
+            } else {
+                IgnoreList::new(std::slice::from_ref(&target))
+            }
+        };
+        let run = run_tasks(
+            &two_tasks(),
+            &fx.ctx(),
+            &Scope::All,
+            &ignore,
+            &|| Ok(0),
+            &mut |_, _| {},
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(run.removed.len(), 1, "{run:?}");
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn current_ignore_keeps_the_starting_list_when_a_reload_fails_or_drops_entries() {
+        let a = PathBuf::from("/x/a");
+        let b = PathBuf::from("/x/b");
+        let failed = current_ignore(std::slice::from_ref(&a), &|| Err(anyhow::anyhow!("bad")));
+        assert_eq!(failed.protects(&a), Some(Protected::Ignored));
+        let grown = current_ignore(std::slice::from_ref(&a), &|| Ok(vec![b.clone()]));
+        assert_eq!(grown.protects(&a), Some(Protected::Ignored));
+        assert_eq!(grown.protects(&b), Some(Protected::Ignored));
+    }
+
+    #[test]
+    fn preview_marks_protected_candidates_and_leaves_them_out_of_cleanable_bytes() {
+        let fx = fixture();
+        fx.file("rs/target/debug/keep/a", 10);
+        let ignore = IgnoreList::new(&[
+            fx.root.join("web/node_modules"),
+            fx.root.join("rs/target/debug/keep"),
+        ]);
         let scans = preview(&two_tasks(), &fx.ctx(), &ignore);
-        let node = &scans[0];
+        let (node, cargo) = (&scans[0], &scans[1]);
         assert_eq!(node.result.as_ref().unwrap().len(), 1, "still listed");
         assert_eq!(node.ignored.len(), 1);
+        assert!(node.holds_ignored.is_empty());
         assert_eq!(node.cleanable_bytes(), 0);
-        assert!(scans[1].ignored.is_empty());
-        assert!(scans[1].cleanable_bytes() >= 1000);
+        assert!(cargo.ignored.is_empty());
+        assert_eq!(cargo.holds_ignored.len(), 1);
+        assert_eq!(cargo.cleanable_bytes(), 0);
     }
 
     const LOCK_TEST: &str = "runner::tests::lock_blocks_a_second_holder_until_released";

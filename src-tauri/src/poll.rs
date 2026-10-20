@@ -649,10 +649,18 @@ impl<R: Runtime> Poller<R> {
         let config = config.clone();
         let sizes = Arc::clone(&self.shared.sizes);
         let paths = self.shared.paths.clone();
+        let (config_path, home) = (self.shared.config_path.clone(), self.shared.home.clone());
         let name = volume.name.clone();
         let outcome = tauri::async_runtime::spawn_blocking(move || {
-            let run =
-                runner::clean_volume(&config, &volume, &sizes, &paths, &tools, trigger.request());
+            let run = runner::clean_volume(
+                &config,
+                &volume,
+                &sizes,
+                &paths,
+                &tools,
+                trigger.request(),
+                &runner::ignore_from_file(&config_path, &home),
+            );
             let after = disk::query(&volume.mount).ok();
             (run, after)
         })

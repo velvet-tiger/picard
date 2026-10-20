@@ -50,6 +50,8 @@ pub struct PreviewItem {
     pub reason: String,
     /// In the config's `ignore` list: shown, but never removed.
     pub ignored: bool,
+    /// Holds a folder in the `ignore` list, so it is never removed either.
+    pub holds_ignored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -144,6 +146,7 @@ pub async fn get_settings(state: SharedState<'_>) -> Result<Settings, String> {
 pub async fn save_settings(state: SharedState<'_>, settings: Settings) -> Result<(), String> {
     let shared = Arc::clone(&state);
     blocking(move || {
+        let _writing = shared.lock_config();
         let text = read_config_text(&shared)?;
         let updated =
             settings::apply(&text, &settings, &shared.home).map_err(|e| format!("{e:#}"))?;
@@ -175,6 +178,7 @@ pub async fn set_ignored(
 ) -> Result<(), String> {
     let shared = Arc::clone(&state);
     blocking(move || {
+        let _writing = shared.lock_config();
         let text = read_config_text(&shared)?;
         let updated = settings::set_ignored(&text, &path, ignored, &shared.home)
             .map_err(|e| format!("{e:#}"))?;
@@ -242,6 +246,7 @@ pub async fn run_selected<R: Runtime>(
                 &shared.paths,
                 &tools,
                 CleanRequest::Selected(chosen),
+                &runner::ignore_from_file(&shared.config_path, &shared.home),
             );
             out.push(run_view(&volume.name, result.map_err(|e| format!("{e:#}"))));
         }
@@ -354,6 +359,7 @@ fn preview_view(volume: &Volume, space: DiskSpace, scans: &[TaskScan]) -> Volume
                         size_text: c.size_text(),
                         reason: c.reason.clone(),
                         ignored: s.ignored.contains(&c.path),
+                        holds_ignored: s.holds_ignored.contains(&c.path),
                     })
                     .collect(),
                 error: None,
@@ -459,6 +465,7 @@ mod tests {
                     },
                 ]),
                 ignored: [PathBuf::from("/w/c/node_modules")].into_iter().collect(),
+                holds_ignored: Default::default(),
             },
             TaskScan {
                 task: "tool_caches",
@@ -469,11 +476,13 @@ mod tests {
                     estimate: Estimate::UpTo(2_600_000_000),
                 }]),
                 ignored: Default::default(),
+                holds_ignored: Default::default(),
             },
             TaskScan {
                 task: "git_worktrees",
                 result: Err("lsof broke".into()),
                 ignored: Default::default(),
+                holds_ignored: Default::default(),
             },
         ];
         let view = preview_view(&volume(), SPACE, &scans);

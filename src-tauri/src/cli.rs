@@ -154,6 +154,7 @@ fn run(config: &Config, config_path: &std::path::Path, env: &ToolEnv) -> Result<
             &paths,
             env,
             CleanRequest::UntilTarget,
+            &runner::ignore_from_file(config_path, env.home()),
         ) {
             Ok(result) => {
                 print!("{}", format_run(&volume.name, &result));
@@ -180,17 +181,21 @@ fn format_scan(name: &str, space: DiskSpace, scans: &[TaskScan]) -> String {
             Ok(c) if c.is_empty() => out.push_str(&format!("  {}: nothing to remove\n", s.task)),
             Ok(c) => {
                 for cand in c {
-                    let ignored = s.ignored.contains(&cand.path);
-                    if !ignored {
+                    let mark = if s.ignored.contains(&cand.path) {
+                        "  [ignored]"
+                    } else if s.holds_ignored.contains(&cand.path) {
+                        "  [holds an ignored folder]"
+                    } else {
                         total += cand.bytes;
-                    }
+                        ""
+                    };
                     out.push_str(&format!(
                         "  {:<13} {:>9}  {}  ({}){}\n",
                         s.task,
                         cand.size_text(),
                         cand.path.display(),
                         cand.reason,
-                        if ignored { "  [ignored]" } else { "" }
+                        mark
                     ));
                 }
             }
@@ -283,6 +288,7 @@ mod tests {
                     },
                 ]),
                 ignored: [PathBuf::from("/w/b/node_modules")].into_iter().collect(),
+                holds_ignored: Default::default(),
             },
             TaskScan {
                 task: "command",
@@ -293,11 +299,13 @@ mod tests {
                     estimate: Estimate::Unknown,
                 }]),
                 ignored: Default::default(),
+                holds_ignored: Default::default(),
             },
             TaskScan {
                 task: "cargo_clean",
                 result: Ok(vec![]),
                 ignored: Default::default(),
+                holds_ignored: Default::default(),
             },
         ];
         let text = format_scan(

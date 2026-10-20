@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use tauri::{AppHandle, Runtime};
 
@@ -28,6 +28,10 @@ pub struct Shared {
     cleaning: AtomicUsize,
     /// Whether the last check found any volume below its threshold.
     low: AtomicBool,
+    /// Held across every read, edit and write of the config file from the
+    /// window, so two quick edits (Ignore on two rows, or Ignore and Save)
+    /// cannot both start from the old text and lose one of them.
+    config_write: Mutex<()>,
 }
 
 impl Shared {
@@ -41,7 +45,16 @@ impl Shared {
             tools: OnceLock::new(),
             cleaning: AtomicUsize::new(0),
             low: AtomicBool::new(false),
+            config_write: Mutex::new(()),
         }
+    }
+
+    /// Takes the config write lock. See `config_write`. A panic in another
+    /// writer leaves the file as it was, so a poisoned lock is still usable.
+    pub fn lock_config(&self) -> MutexGuard<'_, ()> {
+        self.config_write
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Records the latest low/not-low reading and updates the menu bar icon.

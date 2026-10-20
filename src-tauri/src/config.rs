@@ -619,7 +619,6 @@ fn parse_uuid(raw: &str) -> Result<String> {
 }
 
 /// Expands a leading `~` and requires the result to be absolute.
-/// Expands a leading `~` and refuses relative paths.
 pub fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
     let path = if raw == "~" {
         home.to_path_buf()

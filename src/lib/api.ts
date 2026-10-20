@@ -47,6 +47,8 @@ export interface PreviewItem {
   reason: string
   /** In the config's `ignore` list: shown, but never removed. */
   ignored: boolean
+  /** Holds a folder in the `ignore` list, so it is never removed either. */
+  holds_ignored: boolean
 }
 
 export interface PreviewTask {
@@ -103,14 +105,22 @@ export const setIgnored = (path: string, ignored: boolean) =>
 // the same page.
 const IGNORE_CHANGED = 'picard:ignore-changed'
 
-export function notifyIgnoreChanged(): void {
-  window.dispatchEvent(new Event(IGNORE_CHANGED))
+export interface IgnoreChange {
+  /** The path as the sending tab knows it: absolute from Clean, as written from Settings. */
+  path: string
+  ignored: boolean
+  source: 'clean' | 'settings'
+}
+
+export function notifyIgnoreChanged(change: IgnoreChange): void {
+  window.dispatchEvent(new CustomEvent<IgnoreChange>(IGNORE_CHANGED, { detail: change }))
 }
 
 /** Calls `handler` when either tab changes the ignore list. Returns an unlisten function. */
-export function onIgnoreChanged(handler: () => void): () => void {
-  window.addEventListener(IGNORE_CHANGED, handler)
-  return () => window.removeEventListener(IGNORE_CHANGED, handler)
+export function onIgnoreChanged(handler: (change: IgnoreChange) => void): () => void {
+  const listener = (e: Event) => handler((e as CustomEvent<IgnoreChange>).detail)
+  window.addEventListener(IGNORE_CHANGED, listener)
+  return () => window.removeEventListener(IGNORE_CHANGED, listener)
 }
 
 /** Opens the folder picker; resolves to `~/…` or an absolute path, or null if cancelled. */

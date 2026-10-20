@@ -15,10 +15,11 @@ mod size;
 pub mod stale_dirs;
 mod tool_caches;
 
+use std::collections::HashSet;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -83,6 +84,73 @@ pub struct Report {
     pub halted: Option<String>,
 }
 
+/// Folders the user asked Picard to leave alone (`ignore` in the config).
+///
+/// A candidate is protected when it is an ignored folder, or when it holds
+/// one: removing a worktree would delete an ignored `node_modules` inside it.
+/// Protection never reaches down: ignoring a project folder does not protect
+/// the `node_modules` inside it. Paths compare by their components, both as
+/// given and as resolved, so `~/w/x` still matches after macOS reports it
+/// through a symlinked parent such as `/var`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IgnoreList {
+    paths: HashSet<PathBuf>,
+}
+
+/// Why `IgnoreList` protects a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protected {
+    /// The path is in the list.
+    Ignored,
+    /// The path holds a folder in the list.
+    HoldsIgnored,
+}
+
+impl Protected {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Protected::Ignored => "is ignored",
+            Protected::HoldsIgnored => "holds an ignored folder",
+        }
+    }
+}
+
+impl IgnoreList {
+    /// Builds the list from config entries. An entry that cannot be resolved,
+    /// for example because the folder is gone, still matches by its own path.
+    pub fn new(entries: &[PathBuf]) -> Self {
+        let mut paths = HashSet::new();
+        for entry in entries {
+            paths.insert(entry.clone());
+            if let Ok(canon) = entry.canonicalize() {
+                paths.insert(canon);
+            }
+        }
+        Self { paths }
+    }
+
+    /// Whether removing `path` would remove an ignored folder, and why.
+    pub fn protects(&self, path: &Path) -> Option<Protected> {
+        if self.paths.is_empty() {
+            return None;
+        }
+        let canon = path.canonicalize().ok();
+        let forms = std::iter::once(path).chain(canon.as_deref());
+        let mut found = None;
+        for form in forms {
+            for entry in &self.paths {
+                if entry == form {
+                    return Some(Protected::Ignored);
+                }
+                if entry.starts_with(form) {
+                    found = Some(Protected::HoldsIgnored);
+                }
+            }
+        }
+        found
+    }
+}
+
 /// What a task may touch on one volume.
 pub struct Ctx<'a> {
     /// Canonical roots on this volume. Roots that cannot be resolved are left out.
@@ -96,6 +164,10 @@ pub struct Ctx<'a> {
     pub exclude: &'a GlobSet,
     pub now: SystemTime,
     pub sizes: &'a SizeCache,
+    /// Ignored folders, checked again on the resolved path just before each
+    /// removal. Not part of `check_target`, because scans must still list them.
+    /// Behind a lock so a run can refresh it between tasks.
+    keep: RwLock<IgnoreList>,
 }
 
 impl<'a> Ctx<'a> {
@@ -123,6 +195,22 @@ impl<'a> Ctx<'a> {
             exclude,
             now,
             sizes,
+            keep: RwLock::default(),
+        }
+    }
+
+    /// Replaces the ignore list that removals check.
+    pub fn set_keep(&self, list: IgnoreList) {
+        *self.keep.write().unwrap_or_else(PoisonError::into_inner) = list;
+    }
+
+    /// Refuses a resolved path that is ignored or holds an ignored folder.
+    /// Call it with the path `check_target` returned, just before removing.
+    pub fn refuse_kept(&self, canon: &Path) -> Result<(), String> {
+        let keep = self.keep.read().unwrap_or_else(PoisonError::into_inner);
+        match keep.protects(canon) {
+            Some(why) => Err(why.reason().to_string()),
+            None => Ok(()),
         }
     }
 
@@ -392,7 +480,7 @@ pub fn remove_dirs(ctx: &Ctx, candidates: &[Candidate]) -> Report {
             report.halted = Some("the volume is no longer mounted".to_string());
             break;
         }
-        let canon = match check_target(&c.path, ctx) {
+        let canon = match check_target(&c.path, ctx).and_then(|p| ctx.refuse_kept(&p).map(|()| p)) {
             Ok(p) => p,
             Err(why) => {
                 log::warn!("not removing {}: {why}", c.path.display());
@@ -530,6 +618,56 @@ mod tests {
         symlink(fx.dir.path().join("outside"), fx.root.join("sneaky")).unwrap();
         let err = check_target(&fx.root.join("sneaky/node_modules"), &fx.ctx()).unwrap_err();
         assert!(err.contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn ignore_list_protects_exact_folders_and_their_parents_through_symlinks() {
+        let fx = Fixture::new(&[]);
+        fx.file("w/node_modules/x", 1);
+        let real = fx.root.join("w/node_modules");
+        let link = fx.dir.path().join("link");
+        std::os::unix::fs::symlink(&fx.root, &link).unwrap();
+        let ignore = IgnoreList::new(&[link.join("w/node_modules")]);
+        assert_eq!(ignore.protects(&real), Some(Protected::Ignored));
+        assert_eq!(
+            ignore.protects(&real.canonicalize().unwrap()),
+            Some(Protected::Ignored)
+        );
+        assert_eq!(
+            ignore.protects(&fx.root.join("w")),
+            Some(Protected::HoldsIgnored)
+        );
+        assert_eq!(ignore.protects(&real.join("x")), None, "never reaches down");
+        assert_eq!(
+            ignore.protects(&fx.root.join("w2")),
+            None,
+            "components, not text"
+        );
+        let gone = IgnoreList::new(&[PathBuf::from("/nowhere/at/all")]);
+        assert_eq!(
+            gone.protects(Path::new("/nowhere/at/all")),
+            Some(Protected::Ignored)
+        );
+        assert_eq!(IgnoreList::default().protects(&real), None);
+    }
+
+    #[test]
+    fn removal_refuses_kept_paths_even_when_a_task_proposes_them() {
+        let fx = Fixture::new(&[]);
+        fx.file("w/node_modules/x", 1);
+        let target = fx.root.join("w/node_modules");
+        let ctx = fx.ctx();
+        ctx.set_keep(IgnoreList::new(std::slice::from_ref(&target)));
+        let cand = Candidate {
+            path: fx.root.join("w"),
+            bytes: 1,
+            reason: String::new(),
+            estimate: Estimate::Exact,
+        };
+        let report = remove_dirs(&ctx, &[cand]);
+        assert!(report.removed.is_empty());
+        assert_eq!(report.failed[0].1, "holds an ignored folder");
+        assert!(target.exists());
     }
 
     #[test]

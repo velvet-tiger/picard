@@ -219,7 +219,8 @@ impl GitWorktrees {
     }
 
     fn remove_one(&self, ctx: &Ctx, in_use: &InUse, c: &Candidate) -> Result<(), String> {
-        check_target(&c.path, ctx)?;
+        let canon = check_target(&c.path, ctx)?;
+        ctx.refuse_kept(&canon)?;
         if in_use.contains(&c.path) {
             return Err("now in use by a running process".to_string());
         }

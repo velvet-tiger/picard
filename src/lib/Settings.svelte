@@ -51,7 +51,7 @@
     try {
       await setIgnored(folder, false)
       // Reloads this list too, through the listener below.
-      notifyIgnoreChanged()
+      notifyIgnoreChanged({ path: folder, ignored: false, source: 'settings' })
     } catch (e) {
       ignoreError = errorText(e)
     } finally {
@@ -59,7 +59,7 @@
     }
   }
 
-  $effect(() => onIgnoreChanged(loadIgnored))
+  $effect(() => onIgnoreChanged(() => loadIgnored()))
 
   // The time to restore when the daily scan is ticked again after unticking it.
   let lastDailyTime = '03:00'

@@ -124,7 +124,13 @@ pub fn apply(text: &str, settings: &Settings, home: &Path) -> Result<String> {
 pub fn ignored(text: &str, home: &Path) -> Result<Vec<String>> {
     config::parse(text, home)?;
     let doc: DocumentMut = text.parse().context("config.toml is not valid TOML")?;
-    Ok(string_array(&doc, "ignore"))
+    // A hand-edited file may repeat an entry. Listing it once keeps the
+    // Settings list from showing, and keying on, the same folder twice.
+    let mut seen = std::collections::HashSet::new();
+    Ok(string_array(&doc, "ignore")
+        .into_iter()
+        .filter(|e| seen.insert(e.clone()))
+        .collect())
 }
 
 /// Adds `folder` to the `ignore` list, or removes every entry naming it, and
@@ -417,6 +423,18 @@ mod tests {
         assert_eq!(set_ignored(&text, &via_real, true, home()).unwrap(), text);
         let removed = set_ignored(&text, &via_real, false, home()).unwrap();
         assert!(ignored(&removed, home()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ignored_lists_a_repeated_entry_once_and_remove_clears_every_copy() {
+        let text = DEFAULT_TOML.replacen(
+            "exclude = []\n",
+            "exclude = []\nignore = [\"~/a\", \"~/b\", \"~/a\"]\n",
+            1,
+        );
+        assert_eq!(ignored(&text, home()).unwrap(), vec!["~/a", "~/b"]);
+        let out = set_ignored(&text, "~/a", false, home()).unwrap();
+        assert_eq!(ignored(&out, home()).unwrap(), vec!["~/b"]);
     }
 
     #[test]

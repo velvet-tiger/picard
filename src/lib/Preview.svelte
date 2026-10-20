@@ -5,6 +5,7 @@
     getHistory,
     setIgnored,
     notifyIgnoreChanged,
+    onIgnoreChanged,
     errorText,
     formatBytes,
     itemTitle,
@@ -43,9 +44,14 @@
 
   // Paths whose Ignore or Unignore request is still in flight, keyed like `checked`.
   let toggling = $state<Record<string, boolean>>({})
+  // Cleaning or rescanning mid-toggle could act on, or show, the list as it was.
+  const busyToggling = $derived(Object.values(toggling).some(Boolean))
 
-  /** Items that can be ticked: everything except ignored ones. */
-  const selectable = (task: PreviewTask) => task.items.filter((i) => !i.ignored)
+  /** Never removed: ignored, or holding an ignored folder (see IgnoreList in tasks/mod.rs). */
+  const isProtected = (i: PreviewItem) => i.ignored || i.holds_ignored
+
+  /** Items that can be ticked: everything not protected. */
+  const selectable = (task: PreviewTask) => task.items.filter((i) => !isProtected(i))
 
   /** What a volume could free now. Recomputed here so it follows Ignore clicks. */
   const volumeTotal = (v: VolumePreview) =>
@@ -69,7 +75,7 @@
       // Everything not ignored starts ticked; one click on "Clean selected" removes it all.
       checked = Object.fromEntries(
         found.flatMap((v) =>
-          v.tasks.flatMap((t) => t.items.map((i) => [key(v.mount, i.path), !i.ignored])),
+          v.tasks.flatMap((t) => t.items.map((i) => [key(v.mount, i.path), !isProtected(i)])),
         ),
       )
     } catch (e) {
@@ -131,25 +137,42 @@
   }
 
   /**
-   * Ignores an item, or stops ignoring it. An ignored item is unticked; one
-   * that stops being ignored stays unticked until you tick it.
+   * Ignores an item, or stops ignoring it. The item is unticked before the
+   * request goes out, so a quick Clean cannot send it, and stays unticked
+   * until you tick it again.
    */
   async function toggleIgnore(mount: string, item: PreviewItem) {
     const k = key(mount, item.path)
     const ignore = !item.ignored
+    checked[k] = false
     toggling[k] = true
     error = null
     try {
       await setIgnored(item.path, ignore)
       item.ignored = ignore
-      checked[k] = false
-      notifyIgnoreChanged()
+      notifyIgnoreChanged({ path: item.path, ignored: ignore, source: 'clean' })
     } catch (e) {
       error = errorText(e)
     } finally {
       toggling[k] = false
     }
   }
+
+  // Settings sends entries as written (`~/…` or absolute). A folder written
+  // through a symlink will not match here; the row then stays marked until
+  // Rescan, which is safe because the backend decides what is removed.
+  $effect(() =>
+    onIgnoreChanged((change) => {
+      if (change.source === 'clean') return
+      for (const v of volumes)
+        for (const t of v.tasks)
+          for (const i of t.items)
+            if (i.path === change.path || tildePath(i.path) === change.path) {
+              i.ignored = change.ignored
+              checked[key(v.mount, i.path)] = false
+            }
+    }),
+  )
 
   scan()
 </script>
@@ -158,7 +181,7 @@
   <div class="row">
     <h1>Clean up</h1>
     <span class="spacer"></span>
-    <button onclick={scan} disabled={scanning || cleaning}>Rescan</button>
+    <button onclick={scan} disabled={scanning || cleaning || busyToggling}>Rescan</button>
   </div>
   <p class="muted">
     Nothing is removed until you press Clean. Picard re-checks every item just before removing it.
@@ -241,7 +264,7 @@
             <ul>
               {#each t.items as i}
                 {@const k = key(v.mount, i.path)}
-                <li class="candidate" class:ignored={i.ignored}>
+                <li class="candidate" class:ignored={isProtected(i)}>
                   <!-- The row already shows the path; a tooltip only helps when shortPath has elided part of it. -->
                   <label
                     class="item"
@@ -250,13 +273,17 @@
                     <input
                       type="checkbox"
                       bind:checked={checked[k]}
-                      disabled={i.ignored || cleaning}
+                      disabled={isProtected(i) || cleaning}
                     />
                     <span class="text">
                       <span class="title"
                         >{itemTitle(t.task, i.path)}
                         <span class="muted reason"
-                          >{i.ignored ? 'ignored, never cleaned' : i.reason}</span
+                          >{i.ignored
+                            ? 'ignored, never cleaned'
+                            : i.holds_ignored
+                              ? 'holds an ignored folder, never cleaned'
+                              : i.reason}</span
                         ></span
                       >
                       <span class="path muted">{shortPath(i.path)}</span>
@@ -285,7 +312,11 @@
       <button onclick={() => setAll(false)} disabled={cleaning}>Select none</button>
       <span class="spacer"></span>
       <span class="muted">{selectedCount} selected, {formatBytes(selectedBytes)}</span>
-      <button class="primary" onclick={clean} disabled={cleaning || selectedCount === 0}>
+      <button
+        class="primary"
+        onclick={clean}
+        disabled={cleaning || busyToggling || selectedCount === 0}
+      >
         {cleaning ? 'Cleaning…' : 'Clean selected'}
       </button>
     </div>
