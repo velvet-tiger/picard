@@ -450,7 +450,7 @@
       <label class="row">
         <input
           type="checkbox"
-          checked={launchAtLogin}
+          bind:checked={launchAtLogin}
           onchange={(e) => toggleLogin(e.currentTarget.checked)}
         />
         Open Picard when you log in

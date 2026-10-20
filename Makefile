@@ -42,8 +42,9 @@ lint: ## rustfmt check, clippy (warnings are errors), svelte-check
 	pnpm -s check
 
 .PHONY: test
-test: ## Run the Rust tests
+test: ## Run the Rust and JavaScript tests
 	$(CARGO) test $(CARGO_FLAGS)
+	pnpm -s test
 
 .PHONY: test-all
 test-all: test ## Also run the disk image test (attaches and detaches a 200 MB image)
@@ -63,6 +64,12 @@ app: ## Quick debug build of Picard.app
 
 .PHONY: dmg
 dmg: check ## Release Picard.app and .dmg for Apple Silicon (runs check first)
+	$(MAKE) bundle
+
+# The release workflow runs `check` in a job of its own, then this one in the
+# job that holds the signing secrets, so the test dependencies never see them.
+.PHONY: bundle
+bundle: ## Release Picard.app and .dmg without running check
 	pnpm tauri build --bundles app,dmg
 	@echo "Built:"; ls -1d $(APP) $(RELEASE_BUNDLE)/dmg/*.dmg
 
