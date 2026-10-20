@@ -40,10 +40,22 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: read
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
+      # A hand-run release could name anything. Only a version tag is built,
+      # and the release job needs this job, so it never sees another name.
+      - name: Check the tag name
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::\"$TAG\" is not a version tag such as v1.2.3 or v1.2.3-rc.1."
+            exit 1
+          fi
+
+      # The full ref, so a branch with the same name as the tag is never built.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          ref: refs/tags/${{ env.TAG }}
           persist-credentials: false
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
@@ -71,17 +83,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.TAG }}
+          ref: refs/tags/${{ env.TAG }}
           # Full history, so the next step can see whether main holds the tag.
           fetch-depth: 0
           # The release step gets its token from GH_TOKEN. Not storing it in
           # .git/config keeps it from every other step.
           persist-credentials: false
 
-      # Anyone who can push a tag could otherwise sign and publish a commit
-      # that never reached main.
+      # This catches a tag pushed on the wrong commit by mistake. It cannot
+      # stop someone who edits this file in the tagged commit. Only
+      # repository settings, such as a protected environment, can do that.
       - name: Check main holds the tag
         run: |
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "refs/tags/$TAG^{commit}")" ]]; then
+            echo "::error::The checked-out commit is not the commit tagged $TAG."
+            exit 1
+          fi
           if ! git merge-base --is-ancestor "refs/tags/$TAG" refs/remotes/origin/main; then
             echo "::error::Tag $TAG is not on main. Merge the commit into main before tagging it."
             exit 1
