@@ -10,6 +10,7 @@
     tildePath,
     TASK_LABELS,
     type VolumePreview,
+    type PreviewTask,
     type RunResult,
     type HistoryEntry,
   } from './api'
@@ -100,6 +101,16 @@
     checked = Object.fromEntries(Object.keys(checked).map((k) => [k, value]))
   }
 
+  /** How many of one task's items on one volume are ticked. */
+  function taskTickedCount(mount: string, task: PreviewTask): number {
+    return task.items.filter((i) => checked[key(mount, i.path)]).length
+  }
+
+  /** Ticks or unticks every item of one task on one volume, leaving other tasks alone. */
+  function setTask(mount: string, task: PreviewTask, value: boolean) {
+    for (const i of task.items) checked[key(mount, i.path)] = value
+  }
+
   scan()
 </script>
 
@@ -165,7 +176,22 @@
           <span class="muted">up to {v.total_text}</span>
         </div>
         {#each v.tasks as t}
-          <h3>{TASK_LABELS[t.task] ?? t.task}</h3>
+          {#if !t.error && t.items.length > 0}
+            {@const ticked = taskTickedCount(v.mount, t)}
+            <h3>
+              <label class="group">
+                <input
+                  type="checkbox"
+                  checked={ticked === t.items.length}
+                  indeterminate={ticked > 0 && ticked < t.items.length}
+                  onchange={(e) => setTask(v.mount, t, e.currentTarget.checked)}
+                />
+                {TASK_LABELS[t.task] ?? t.task}
+              </label>
+            </h3>
+          {:else}
+            <h3>{TASK_LABELS[t.task] ?? t.task}</h3>
+          {/if}
           {#if t.error}
             <p class="error">Could not scan: {t.error}</p>
           {:else if t.items.length === 0}
@@ -227,6 +253,15 @@
     letter-spacing: 0.04em;
     color: var(--muted);
     margin: 12px 0 4px;
+  }
+  .group {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+  }
+  .group input {
+    margin: 0;
   }
   ul {
     list-style: none;
