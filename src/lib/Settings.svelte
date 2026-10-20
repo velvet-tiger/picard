@@ -353,23 +353,29 @@
                 </span>
               </label>
             {:else if task.type === 'cargo_clean'}
+              <!-- One row for one rule: unticking is mode = "all", which ignores the day count. -->
               <div class="field">
-                <span>Clean</span>
+                <label class="check">
+                  <input
+                    type="checkbox"
+                    checked={task.mode === 'stale'}
+                    onchange={(e) => (task.mode = e.currentTarget.checked ? 'stale' : 'all')}
+                  />
+                  Only projects untouched for
+                </label>
                 <span class="control">
-                  <select bind:value={task.mode}>
-                    <option value="stale">Idle projects</option>
-                    <option value="all">Every project</option>
-                  </select>
+                  <input
+                    type="number"
+                    min="0"
+                    aria-label="Days untouched"
+                    disabled={task.mode === 'all'}
+                    bind:value={task.stale_days}
+                  />
+                  <span class="unit">days</span>
                 </span>
               </div>
-              {#if task.mode === 'stale'}
-                <div class="field">
-                  <span>Projects untouched for</span>
-                  <span class="control">
-                    <input type="number" min="0" bind:value={task.stale_days} />
-                    <span class="unit">days</span>
-                  </span>
-                </div>
+              {#if task.mode === 'all'}
+                <p class="muted">Cleans every project, including ones you are working on.</p>
               {/if}
             {:else if task.type === 'python_venv'}
               <div class="field">

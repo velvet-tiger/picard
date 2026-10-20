@@ -185,6 +185,39 @@ describe('Settings', () => {
     expect(sent('set_ignored')).toEqual([{ path: '~/keep/this', ignored: false }])
   })
 
+  it('cleans every Cargo project once the untouched box is unticked', async () => {
+    const { sent } = backend({
+      get_settings: () => ({
+        ...config(),
+        tasks: [{ type: 'cargo_clean', enabled: true, mode: 'stale', stale_days: 5 }],
+      }),
+    })
+    await renderLoaded()
+    const box = screen.getByRole('checkbox', { name: 'Only projects untouched for' })
+    const days = screen.getByRole('spinbutton', { name: 'Days untouched' })
+    expect(box).toBeChecked()
+    expect(days).toBeEnabled()
+
+    await fireEvent.click(box)
+
+    expect(days).toBeDisabled()
+    expect(
+      screen.getByText('Cleans every project, including ones you are working on.'),
+    ).toBeInTheDocument()
+    await fireEvent.click(saveButton())
+    await waitFor(() =>
+      expect(sent('save_settings')).toEqual([
+        {
+          settings: expect.objectContaining({
+            tasks: expect.arrayContaining([
+              expect.objectContaining({ type: 'cargo_clean', mode: 'all', stale_days: 5 }),
+            ]),
+          }),
+        },
+      ]),
+    )
+  })
+
   it('turns on Open at login', async () => {
     const { sent } = backend({ set_launch_at_login: () => null })
     await renderLoaded()
