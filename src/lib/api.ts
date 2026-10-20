@@ -205,7 +205,17 @@ export const onShowTab = (handler: (tab: string) => void) =>
 
 /** Errors from invoke arrive as strings; anything else is shown as-is. */
 export function errorText(e: unknown): string {
-  return typeof e === 'string' ? e : e instanceof Error ? e.message : JSON.stringify(e)
+  if (typeof e === 'string') return e
+  if (e instanceof Error) return e.message
+  // JSON.stringify gives undefined for undefined, functions and symbols, and
+  // throws a TypeError for a BigInt or a circular object. This runs inside
+  // catch blocks, so it must not throw.
+  try {
+    return JSON.stringify(e) ?? String(e)
+  } catch (err) {
+    if (err instanceof TypeError) return String(e)
+    throw err
+  }
 }
 
 /** Replaces the home folder with `~`. */

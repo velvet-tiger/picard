@@ -42,8 +42,9 @@ lint: ## rustfmt check, clippy (warnings are errors), svelte-check
 	pnpm -s check
 
 .PHONY: test
-test: ## Run the Rust tests
+test: ## Run the Rust and JavaScript tests
 	$(CARGO) test $(CARGO_FLAGS)
+	pnpm -s test
 
 .PHONY: test-all
 test-all: test ## Also run the disk image test (attaches and detaches a 200 MB image)

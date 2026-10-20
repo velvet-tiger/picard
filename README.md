@@ -214,6 +214,7 @@ You need Rust, Node.js, pnpm and the Xcode command-line tools.
 | `make setup` | Install JavaScript dependencies |
 | `make dev` | Run Picard from source, rebuilding on change |
 | `make check` | rustfmt, clippy, svelte-check and the tests |
+| `make test` | The Rust tests, then the JavaScript tests |
 | `make test-all` | The tests plus one that attaches a 200 MB disk image |
 | `make scan` | Show what Picard would remove with your config |
 | `make dmg` | Run the checks, then build the release `.app` and `.dmg` |
