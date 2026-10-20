@@ -66,8 +66,8 @@ app: ## Quick debug build of Picard.app
 dmg: check ## Release Picard.app and .dmg for Apple Silicon (runs check first)
 	$(MAKE) bundle
 
-# The release workflow runs `check` in its own step, then this one with the
-# signing secrets, so the test dependencies never see them.
+# The release workflow runs `check` in a job of its own, then this one in the
+# job that holds the signing secrets, so the test dependencies never see them.
 .PHONY: bundle
 bundle: ## Release Picard.app and .dmg without running check
 	pnpm tauri build --bundles app,dmg
