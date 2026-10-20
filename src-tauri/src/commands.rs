@@ -17,7 +17,7 @@ use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::history::{self, Entry};
 use crate::poll;
-use crate::runner::{self, TaskScan, VolumeRun};
+use crate::runner::{self, CleanRequest, TaskScan, VolumeRun};
 use crate::settings::{self, Settings};
 use crate::state::Shared;
 use crate::volume::Volume;
@@ -198,7 +198,7 @@ pub async fn run_selected<R: Runtime>(
                 &shared.sizes,
                 &shared.paths,
                 &tools,
-                Some(chosen),
+                CleanRequest::Selected(chosen),
             );
             out.push(run_view(&volume.name, result.map_err(|e| format!("{e:#}"))));
         }

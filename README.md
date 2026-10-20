@@ -37,6 +37,16 @@ One thing to know: removing a worktree also deletes files git ignores inside it,
 
 Picard never switches modes by itself.
 
+### Daily scan
+
+Picard normally acts only when a drive drops below its threshold. Set `daily_scan` to also scan once a day at a set local time, even when space is fine. It follows the mode:
+
+- **Ask**: Picard notifies you if anything can be cleaned, for example "Daily scan of Startup disk: 120 GB free (12%). About 8.4 GB can be cleaned." If nothing can be cleaned, it stays quiet. A drive that is already low gets its low-space alert instead.
+- **Auto**: Picard runs every task in full on each drive. It does not stop early once space is free, as a low-space cleanup does. It tells you how much it freed.
+- **Off**: nothing happens.
+
+If your Mac is asleep or Picard is closed at that time, the scan runs at the next check that day. It never runs twice in one day. Picard records the date of the last scan in `daily-scan.txt`, next to the config.
+
 ## The menu bar icon
 
 | Icon | Meaning |
@@ -64,6 +74,7 @@ min_free_gb = 30          # low below this; or use min_free_pct = 10 instead
 recover_margin_gb = 10    # stop cleaning once threshold + margin is free
 cooldown_minutes = 60     # wait before alerting again while still low
 mode = "ask"              # auto | ask | off
+daily_scan = "03:00"      # also scan once a day at this local time; leave out to turn off
 roots = ["~/working"]     # Picard only removes things inside these folders
 exclude = ["**/keep-*/**"] # glob patterns Picard never touches
 

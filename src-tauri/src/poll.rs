@@ -2,13 +2,15 @@
 //!
 //! It wakes every `poll_minutes`, and also as soon as the config file changes or
 //! a drive is mounted or unmounted under `/Volumes`. File-system watchers run
-//! on their own thread and send `Wake` messages into the loop.
+//! on their own thread and send `Wake` messages into the loop. When
+//! `daily_scan` is set it also wakes at that time and runs the daily scan.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::{Local, NaiveDate};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_notification::{Action, ActionType, NotificationExt};
@@ -19,8 +21,8 @@ use tokio::sync::mpsc;
 use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::env::ToolEnv;
-use crate::monitor::{self, States};
-use crate::runner;
+use crate::monitor::{self, State, States};
+use crate::runner::{self, CleanRequest, VolumeRun};
 use crate::state::Shared;
 use crate::tray::{MenuView, Tray};
 use crate::volume::{self, UnavailableRoot, UuidCache, Volume};
@@ -72,6 +74,76 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 // Used only when there is no valid config yet, so a fixed config error still
 // gets retried even if no file event arrives.
 const FALLBACK_POLL: Duration = Duration::from_secs(5 * 60);
+
+// Added to the wait for the daily scan so the loop wakes just after the
+// scheduled minute starts rather than a moment before it.
+const DAILY_SCAN_SLACK: Duration = Duration::from_secs(1);
+
+const DAILY_STAMP_FORMAT: &str = "%Y-%m-%d";
+
+/// Reads the date of the last daily scan. A missing file means it has never
+/// run. An unreadable or malformed one is logged and treated the same way,
+/// which can at worst repeat one scan; refusing to scan would be worse.
+pub(crate) fn read_daily_stamp(path: &Path) -> Option<NaiveDate> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            log::warn!(
+                "reading {} failed, treating the daily scan as not run: {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    match NaiveDate::parse_from_str(text.trim(), DAILY_STAMP_FORMAT) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            log::warn!(
+                "{} holds {text:?}, not a date; treating the daily scan as not run: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Records the date of the daily scan, so a restart later that day does not repeat it.
+pub(crate) fn write_daily_stamp(path: &Path, date: NaiveDate) -> Result<()> {
+    std::fs::write(path, format!("{}\n", date.format(DAILY_STAMP_FORMAT)))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// What started a cleanup. It decides how much is removed and what is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    /// A volume fell below its threshold: clean until it is back above it.
+    LowSpace,
+    /// The daily scan in auto mode: run every task in full.
+    Daily,
+}
+
+impl Trigger {
+    fn request(self) -> CleanRequest {
+        match self {
+            Trigger::LowSpace => CleanRequest::UntilTarget,
+            Trigger::Daily => CleanRequest::Everything,
+        }
+    }
+
+    /// The notification for a finished run, or `None` if it is not worth one.
+    fn report(
+        self,
+        name: &str,
+        run: &Result<VolumeRun, String>,
+        after: Option<DiskSpace>,
+    ) -> Option<(String, String)> {
+        match self {
+            Trigger::LowSpace => Some(runner::outcome_message(name, run, after)),
+            Trigger::Daily => runner::daily_outcome_message(name, run, after),
+        }
+    }
+}
 
 /// Writes the default config if none exists. Returns true if it wrote one.
 pub fn ensure_config_file(path: &Path) -> Result<bool> {
@@ -168,6 +240,9 @@ pub struct Poller<R: Runtime> {
     config: Option<Config>,
     config_error: bool,
     states: States,
+    /// Local date of the last daily scan. Read from disk at start, then kept
+    /// here, so a failed stamp write cannot make the scan repeat.
+    last_daily_scan: Option<NaiveDate>,
 }
 
 impl<R: Runtime> Poller<R> {
@@ -179,6 +254,7 @@ impl<R: Runtime> Poller<R> {
             config: None,
             config_error: false,
             states: States::new(),
+            last_daily_scan: None,
         }
     }
 
@@ -191,12 +267,11 @@ impl<R: Runtime> Poller<R> {
             Err(e) => log::error!("resolving tool PATH failed; cleanup tasks are off: {e}"),
         }
         self.reload_config();
+        self.last_daily_scan = read_daily_stamp(&self.shared.paths.daily_scan);
         loop {
             self.check().await;
-            let wait = self
-                .config
-                .as_ref()
-                .map_or(FALLBACK_POLL, |c| Duration::from_secs(c.poll_minutes * 60));
+            self.daily_scan_if_due().await;
+            let wait = self.next_wait();
             match tokio::time::timeout(wait, rx.recv()).await {
                 Err(_elapsed) => {}
                 Ok(None) => {
@@ -215,6 +290,77 @@ impl<R: Runtime> Poller<R> {
                     }
                 }
             }
+        }
+    }
+
+    /// How long to sleep: until the next poll or the next daily scan, whichever is sooner.
+    fn next_wait(&self) -> Duration {
+        let Some(config) = &self.config else {
+            return FALLBACK_POLL;
+        };
+        let poll = Duration::from_secs(config.poll_minutes.saturating_mul(60));
+        match config.daily_scan {
+            Some(at) => {
+                let now = Local::now().naive_local();
+                let daily = monitor::until_daily_scan(at, now, self.last_daily_scan);
+                poll.min(daily + DAILY_SCAN_SLACK)
+            }
+            None => poll,
+        }
+    }
+
+    /// Runs the daily scan if it is due, following the mode: auto cleans every
+    /// volume in full, ask notifies about what could be cleaned, off does nothing.
+    async fn daily_scan_if_due(&mut self) {
+        let Some(config) = self.config.clone() else {
+            return;
+        };
+        let Some(at) = config.daily_scan else {
+            return;
+        };
+        let today = Local::now().naive_local();
+        if !monitor::daily_scan_due(at, today, self.last_daily_scan) {
+            return;
+        }
+        // Recorded before the scan runs, so a scan that fails or panics waits
+        // until tomorrow instead of retrying on every poll. Off mode records it
+        // too; otherwise the scan would stay due and the loop would never sleep.
+        self.last_daily_scan = Some(today.date());
+        if let Err(e) = write_daily_stamp(&self.shared.paths.daily_scan, today.date()) {
+            log::error!("could not record the daily scan; a restart today may repeat it: {e:#}");
+        }
+        log::info!("daily scan: mode {:?}", config.mode);
+        if config.mode == Mode::Off {
+            return;
+        }
+        let Some(found) = self.scan_volumes(&config).await else {
+            return;
+        };
+        let mut cleaned = false;
+        for (volume, space) in found.readings {
+            if config.mode == Mode::Auto {
+                cleaned |= self.clean(&config, volume, Trigger::Daily).await;
+                continue;
+            }
+            // A low volume has already had its low-space alert; the cooldown
+            // decides when it gets the next one.
+            if matches!(self.states.get(&volume.mount), Some(State::Fired { .. })) {
+                log::info!(
+                    "daily scan: {} already alerted as low, skipping",
+                    volume.name
+                );
+                continue;
+            }
+            let name = volume.name.clone();
+            let cleanable = self.cleanable(&config, volume).await;
+            match monitor::daily_scan_message(&name, space, cleanable) {
+                Some((title, body)) => self.notify(&title, &body),
+                None => log::info!("daily scan: nothing to offer on {name}"),
+            }
+        }
+        // Refresh the menu with the space the cleanup freed.
+        if cleaned {
+            self.check().await;
         }
     }
 
@@ -269,7 +415,7 @@ impl<R: Runtime> Poller<R> {
             if config.mode == Mode::Auto {
                 let volume = found.readings.iter().find(|(v, _)| v.mount == alert.mount);
                 if let Some((volume, _)) = volume {
-                    self.clean(&config, volume.clone()).await;
+                    self.clean(&config, volume.clone(), Trigger::LowSpace).await;
                     cleaned = true;
                     continue;
                 }
@@ -341,14 +487,19 @@ impl<R: Runtime> Poller<R> {
     }
 
     /// Runs the cleanup tasks on one volume and reports the result.
-    async fn clean(&self, config: &Config, volume: Volume) {
-        log::info!("auto mode: cleaning {}", volume.name);
+    /// Returns true if the run removed anything.
+    async fn clean(&self, config: &Config, volume: Volume, trigger: Trigger) -> bool {
+        log::info!("auto mode ({trigger:?}): cleaning {}", volume.name);
         let Some(tools) = self.shared.tools() else {
+            let title = match trigger {
+                Trigger::LowSpace => format!("{} is low", volume.name),
+                Trigger::Daily => format!("Daily scan of {} failed", volume.name),
+            };
             self.notify(
-                &format!("{} is low", volume.name),
+                &title,
                 "Cleanup is off because tool paths could not be resolved. See the log.",
             );
-            return;
+            return false;
         };
         let _cleaning = self.shared.start_cleaning(&self.app);
         let config = config.clone();
@@ -356,30 +507,32 @@ impl<R: Runtime> Poller<R> {
         let paths = self.shared.paths.clone();
         let name = volume.name.clone();
         let outcome = tauri::async_runtime::spawn_blocking(move || {
-            let run = runner::clean_volume(&config, &volume, &sizes, &paths, &tools, None);
+            let run =
+                runner::clean_volume(&config, &volume, &sizes, &paths, &tools, trigger.request());
             let after = disk::query(&volume.mount).ok();
             (run, after)
         })
         .await;
-        let (title, body) = match outcome {
-            Ok((run, after)) => {
-                let run = run.map_err(|e| format!("{e:#}"));
-                if let Ok(r) = &run {
-                    log::info!(
-                        "auto mode: {name}: removed {}, failed {}, stopped {:?}",
-                        r.removed.len(),
-                        r.failed.len(),
-                        r.stopped
-                    );
-                }
-                runner::outcome_message(&name, &run, after)
-            }
+        let (run, after) = match outcome {
+            Ok((run, after)) => (run.map_err(|e| format!("{e:#}")), after),
             Err(e) => {
                 log::error!("cleanup task for {name} panicked or was cancelled: {e}");
-                runner::outcome_message(&name, &Err(e.to_string()), None)
+                (Err(e.to_string()), None)
             }
         };
-        self.notify(&title, &body);
+        if let Ok(r) = &run {
+            log::info!(
+                "auto mode: {name}: removed {}, failed {}, stopped {:?}",
+                r.removed.len(),
+                r.failed.len(),
+                r.stopped
+            );
+        }
+        match trigger.report(&name, &run, after) {
+            Some((title, body)) => self.notify(&title, &body),
+            None => log::info!("auto mode ({trigger:?}): nothing removed on {name}"),
+        }
+        run.is_ok_and(|r| !r.removed.is_empty())
     }
 
     fn notify(&self, title: &str, body: &str) {
@@ -426,6 +579,18 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn daily_stamp_round_trips_and_tolerates_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daily-scan.txt");
+        assert_eq!(read_daily_stamp(&path), None);
+        let date = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        write_daily_stamp(&path, date).unwrap();
+        assert_eq!(read_daily_stamp(&path), Some(date));
+        std::fs::write(&path, "yesterday").unwrap();
+        assert_eq!(read_daily_stamp(&path), None);
     }
 
     #[test]

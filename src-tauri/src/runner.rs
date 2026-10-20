@@ -2,7 +2,8 @@
 //!
 //! Tasks run in config order. Before each task the runner re-reads free space
 //! and stops once the volume is back above `threshold + recover_margin`, so the
-//! cheap, safe tasks listed first are often the only ones that run.
+//! cheap, safe tasks listed first are often the only ones that run. The daily
+//! scan in auto mode is the exception: it runs every task in full.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -26,6 +27,8 @@ use crate::volume::Volume;
 pub struct DataPaths {
     pub history: PathBuf,
     pub lock: PathBuf,
+    /// The local date of the last daily scan, as `YYYY-MM-DD`.
+    pub daily_scan: PathBuf,
 }
 
 impl DataPaths {
@@ -34,6 +37,7 @@ impl DataPaths {
         Self {
             history: dir.join("history.jsonl"),
             lock: dir.join("run.lock"),
+            daily_scan: dir.join("daily-scan.txt"),
         }
     }
 }
@@ -184,11 +188,42 @@ pub fn outcome_message(
     }
 }
 
+/// Notification for the daily scan's cleanup on volume `name`, or `None`
+/// when it removed nothing. A daily scan runs on healthy disks too, so
+/// "nothing to clean" is not news worth a notification.
+pub fn daily_outcome_message(
+    name: &str,
+    run: &Result<VolumeRun, String>,
+    after: Option<disk::DiskSpace>,
+) -> Option<(String, String)> {
+    match run {
+        Err(e) => Some((
+            format!("Daily scan of {name} failed"),
+            format!("Cleanup failed: {e}. See the log."),
+        )),
+        Ok(r) if r.removed.is_empty() => None,
+        Ok(_) => Some(outcome_message(name, run, after)),
+    }
+}
+
+/// What `clean_volume` should remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanRequest {
+    /// Clean until the volume is back above its threshold plus margin.
+    UntilTarget,
+    /// Run every task in full, however much space is free. For the daily scan.
+    Everything,
+    /// Only these paths. See `Scope::Selected`.
+    Selected(HashSet<PathBuf>),
+}
+
 /// How much of a volume a run may clean.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// Every candidate, stopping between tasks once free space reaches this many bytes.
     UntilFree(u64),
+    /// Every candidate of every task, with no early stop.
+    All,
     /// Only these paths, and only if a fresh scan still proposes them. Used for
     /// the Preview window: a stale or tampered selection can never remove
     /// anything Picard would not have proposed itself. No early stop, because
@@ -199,7 +234,7 @@ pub enum Scope {
 impl Scope {
     fn filter(&self, candidates: Vec<Candidate>) -> Vec<Candidate> {
         match self {
-            Scope::UntilFree(_) => candidates,
+            Scope::UntilFree(_) | Scope::All => candidates,
             Scope::Selected(chosen) => candidates
                 .into_iter()
                 .filter(|c| chosen.contains(&c.path))
@@ -231,20 +266,20 @@ pub fn preview_volume(
 }
 
 /// Cleans one volume for real: takes the lock, runs the tasks and writes history.
-/// With no `selection`, it cleans until the volume is back above its target.
-/// With one, it removes only those paths (see `Scope::Selected`).
+/// `request` says how much to remove; see `CleanRequest`.
 pub fn clean_volume(
     config: &Config,
     volume: &Volume,
     sizes: &SizeCache,
     paths: &DataPaths,
     env: &ToolEnv,
-    selection: Option<HashSet<PathBuf>>,
+    request: CleanRequest,
 ) -> Result<VolumeRun> {
     let _lock = RunLock::acquire(&paths.lock)?;
-    let scope = match selection {
-        Some(chosen) => Scope::Selected(chosen),
-        None => Scope::UntilFree(target_free(
+    let scope = match request {
+        CleanRequest::Selected(chosen) => Scope::Selected(chosen),
+        CleanRequest::Everything => Scope::All,
+        CleanRequest::UntilTarget => Scope::UntilFree(target_free(
             config,
             volume,
             disk::query(&volume.mount)?.total_bytes,
@@ -339,6 +374,21 @@ mod tests {
             fx.root.join("rs/target").exists(),
             "cargo task must not run"
         );
+    }
+
+    #[test]
+    fn scope_all_runs_every_task_even_when_space_is_free() {
+        let fx = fixture();
+        let run = run_tasks(
+            &two_tasks(),
+            &fx.ctx(),
+            &Scope::All,
+            &|| Ok(u64::MAX),
+            &mut |_, _| {},
+        );
+        assert_eq!(run.removed.len(), 2, "{run:?}");
+        assert!(run.stopped.is_none());
+        assert!(!fx.root.join("rs/target").exists());
     }
 
     #[test]
@@ -463,9 +513,35 @@ mod tests {
     }
 
     #[test]
+    fn daily_outcome_is_quiet_when_nothing_was_removed() {
+        assert_eq!(
+            daily_outcome_message("D", &Ok(VolumeRun::default()), None),
+            None
+        );
+        let failed = daily_outcome_message("D", &Err("locked".into()), None).unwrap();
+        assert_eq!(failed.0, "Daily scan of D failed");
+        let run = VolumeRun {
+            removed: vec![(
+                "node_modules",
+                Removed {
+                    path: PathBuf::from("/x"),
+                    bytes: 1_000_000_000,
+                },
+            )],
+            ..VolumeRun::default()
+        };
+        let done = daily_outcome_message("D", &Ok(run), None).unwrap();
+        assert_eq!(
+            done,
+            ("Picard cleaned D".to_string(), "Freed 1.0 GB.".to_string())
+        );
+    }
+
+    #[test]
     fn data_paths_sit_beside_the_config() {
         let p = DataPaths::beside(Path::new("/x/Picard/config.toml"));
         assert_eq!(p.history, PathBuf::from("/x/Picard/history.jsonl"));
         assert_eq!(p.lock, PathBuf::from("/x/Picard/run.lock"));
+        assert_eq!(p.daily_scan, PathBuf::from("/x/Picard/daily-scan.txt"));
     }
 }

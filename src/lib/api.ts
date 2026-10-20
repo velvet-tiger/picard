@@ -33,6 +33,8 @@ export interface Settings {
   recover_margin_gb: number
   cooldown_minutes: number
   mode: Mode
+  /** Daily scan time as `HH:MM`, or null when the daily scan is off. */
+  daily_scan: string | null
   roots: string[]
   exclude: string[]
   tasks: Task[]

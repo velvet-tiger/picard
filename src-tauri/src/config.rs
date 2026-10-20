@@ -11,6 +11,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use chrono::NaiveTime;
 use globset::Glob;
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,7 @@ min_free_gb = 30          # default threshold; or use min_free_pct = 10 instead
 recover_margin_gb = 10
 cooldown_minutes = 60
 mode = "ask"              # auto | ask | off
+# daily_scan = "03:00"    # also scan once a day at this local time (24-hour)
 roots = ["~/working"]
 exclude = []
 
@@ -374,6 +376,9 @@ pub struct Config {
     pub recover_margin_bytes: u64,
     pub cooldown_minutes: u64,
     pub mode: Mode,
+    /// Local time of day for the daily scan, which runs whether or not a
+    /// volume is low. `None` turns it off.
+    pub daily_scan: Option<NaiveTime>,
     /// Absolute paths, with `~` expanded. Not canonicalised: a root on an
     /// unmounted drive must still be listed so the menu can show it greyed out.
     pub roots: Vec<PathBuf>,
@@ -409,6 +414,7 @@ struct RawConfig {
     recover_margin_gb: Option<f64>,
     cooldown_minutes: Option<u64>,
     mode: Option<Mode>,
+    daily_scan: Option<String>,
     roots: Option<Vec<String>>,
     #[serde(default)]
     exclude: Vec<String>,
@@ -492,12 +498,26 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
         recover_margin_bytes: (margin_gb * BYTES_PER_GB) as u64,
         cooldown_minutes: raw.cooldown_minutes.unwrap_or(60),
         mode: raw.mode.unwrap_or(Mode::Ask),
+        daily_scan: raw
+            .daily_scan
+            .as_deref()
+            .map(parse_daily_time)
+            .transpose()?,
         roots,
         exclude: raw.exclude,
         volumes,
         tasks: raw.task,
         tools: parse_tools(&raw.tools, home)?,
     })
+}
+
+/// The format `daily_scan` is written in, and the one the Settings window sends.
+pub const DAILY_SCAN_FORMAT: &str = "%H:%M";
+
+/// Parses a `daily_scan` value such as `"03:00"` (24-hour, local time).
+fn parse_daily_time(raw: &str) -> Result<NaiveTime> {
+    NaiveTime::parse_from_str(raw.trim(), DAILY_SCAN_FORMAT)
+        .with_context(|| format!("daily_scan must be a 24-hour time like \"03:00\", got {raw:?}"))
 }
 
 /// Checks task options that serde cannot.
@@ -682,6 +702,23 @@ mod tests {
     fn rejects_out_of_range_thresholds() {
         assert!(parse_err("min_free_pct = 101\nroots = [\"/a\"]").contains("between 0 and 100"));
         assert!(parse_err("min_free_gb = -1\nroots = [\"/a\"]").contains("zero or more"));
+    }
+
+    #[test]
+    fn daily_scan_is_off_unless_set() {
+        assert_eq!(parse_ok(DEFAULT_TOML).daily_scan, None);
+        let c = parse_ok("daily_scan = \"03:30\"\nmin_free_gb = 1\nroots = [\"/a\"]");
+        assert_eq!(c.daily_scan, NaiveTime::from_hms_opt(3, 30, 0));
+    }
+
+    #[test]
+    fn rejects_bad_daily_scan_times() {
+        for bad in ["25:00", "12:60", "noon", "", "03:00:00", "3pm"] {
+            let e = parse_err(&format!(
+                "daily_scan = {bad:?}\nmin_free_gb = 1\nroots = [\"/a\"]"
+            ));
+            assert!(e.contains("daily_scan"), "{bad:?}: {e}");
+        }
     }
 
     #[test]

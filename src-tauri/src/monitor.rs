@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+
 use crate::config::{Config, Mode};
 use crate::disk::DiskSpace;
 use crate::volume::Volume;
@@ -87,6 +89,26 @@ impl Alert {
     }
 }
 
+/// Notification title and body for the daily scan in ask mode, for example
+/// "Daily scan of Startup disk" and "120 GB free (12%). About 8.5 GB can be
+/// cleaned." `None` when nothing can be cleaned or the estimate failed, since
+/// a daily scan of a healthy disk with nothing to offer is not worth a ping.
+pub fn daily_scan_message(
+    name: &str,
+    space: DiskSpace,
+    cleanable: Option<u64>,
+) -> Option<(String, String)> {
+    let bytes = cleanable.filter(|&b| b > 0)?;
+    Some((
+        format!("Daily scan of {name}"),
+        format!(
+            "{}. About {} can be cleaned.",
+            crate::disk::format_free(space),
+            crate::disk::format_bytes(bytes)
+        ),
+    ))
+}
+
 /// True if `space` on `volume` is below that volume's threshold.
 pub fn is_low(config: &Config, volume: &Volume, space: DiskSpace) -> bool {
     space.free_bytes
@@ -146,6 +168,34 @@ pub fn evaluate(
         }
     }
     (next, alerts)
+}
+
+/// Whether the daily scan should run now.
+///
+/// It is due once the local time reaches `at`, unless it already ran today.
+/// So a scan missed while the Mac slept or Picard was closed runs at the next
+/// check that day, and never twice in one day. `last` is the local date of
+/// the last scan; a date after today (the clock moved back) counts as not today.
+pub fn daily_scan_due(at: NaiveTime, now: NaiveDateTime, last: Option<NaiveDate>) -> bool {
+    now.time() >= at && last != Some(now.date())
+}
+
+/// How long until the daily scan is next due. Zero if it is due now.
+///
+/// Uses wall-clock local time without time zones, so across a daylight saving
+/// change the wait can be an hour off. That is harmless: the poll loop also
+/// wakes every `poll_minutes` and checks `daily_scan_due` each time.
+pub fn until_daily_scan(at: NaiveTime, now: NaiveDateTime, last: Option<NaiveDate>) -> Duration {
+    if daily_scan_due(at, now, last) {
+        return Duration::ZERO;
+    }
+    let today = now.date();
+    let date = if now.time() < at && last != Some(today) {
+        today
+    } else {
+        today.succ_opt().unwrap_or(today)
+    };
+    (date.and_time(at) - now).to_std().unwrap_or(Duration::ZERO)
 }
 
 #[cfg(test)]
@@ -310,6 +360,19 @@ mod tests {
     }
 
     #[test]
+    fn daily_scan_message_only_when_something_can_be_cleaned() {
+        assert_eq!(daily_scan_message("D", space(120, 994), None), None);
+        assert_eq!(daily_scan_message("D", space(120, 994), Some(0)), None);
+        assert_eq!(
+            daily_scan_message("Startup disk", space(120, 994), Some(8_500_000_000)),
+            Some((
+                "Daily scan of Startup disk".to_string(),
+                "120 GB free (12%). About 8.5 GB can be cleaned.".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn evaluate_drops_volumes_that_disappear() {
         let config = parse("min_free_gb = 30\nroots = [\"/a\"]", Path::new("/Users/t")).unwrap();
         let mut states = States::new();
@@ -319,5 +382,62 @@ mod tests {
         );
         let (next, _) = evaluate(&states, &[], &config, Instant::now());
         assert!(next.is_empty());
+    }
+
+    fn at(hour: u32, minute: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(hour, minute, 0).unwrap()
+    }
+
+    fn day(d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 10, d).unwrap()
+    }
+
+    fn when(d: u32, hour: u32, minute: u32) -> NaiveDateTime {
+        day(d).and_time(at(hour, minute))
+    }
+
+    #[test]
+    fn daily_scan_is_due_from_its_time_until_it_runs() {
+        assert!(!daily_scan_due(at(3, 0), when(20, 2, 59), None));
+        assert!(daily_scan_due(at(3, 0), when(20, 3, 0), None));
+        assert!(daily_scan_due(at(3, 0), when(20, 3, 0), Some(day(19))));
+        assert!(!daily_scan_due(at(3, 0), when(20, 3, 0), Some(day(20))));
+    }
+
+    #[test]
+    fn missed_daily_scan_runs_later_the_same_day() {
+        // The Mac slept through 03:00 and woke at 14:00.
+        assert!(daily_scan_due(at(3, 0), when(20, 14, 0), Some(day(19))));
+        assert!(!daily_scan_due(at(3, 0), when(20, 23, 59), Some(day(20))));
+    }
+
+    #[test]
+    fn clock_moved_back_past_last_scan_still_allows_a_scan() {
+        assert!(daily_scan_due(at(3, 0), when(20, 4, 0), Some(day(21))));
+    }
+
+    #[test]
+    fn waits_until_today_or_tomorrow() {
+        let hour = Duration::from_secs(3600);
+        assert_eq!(
+            until_daily_scan(at(3, 0), when(20, 1, 0), Some(day(19))),
+            2 * hour
+        );
+        // Already ran today: next is tomorrow at 03:00.
+        assert_eq!(
+            until_daily_scan(at(3, 0), when(20, 4, 0), Some(day(20))),
+            23 * hour
+        );
+        assert_eq!(
+            until_daily_scan(at(3, 0), when(20, 4, 0), None),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn early_scan_today_waits_for_tomorrow() {
+        // Ran at 01:00 today under an earlier time; the new 03:00 time waits a day.
+        let wait = until_daily_scan(at(3, 0), when(20, 2, 0), Some(day(20)));
+        assert_eq!(wait, Duration::from_secs(25 * 3600));
     }
 }

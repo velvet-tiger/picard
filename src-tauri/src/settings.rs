@@ -26,6 +26,8 @@ pub struct Settings {
     pub recover_margin_gb: f64,
     pub cooldown_minutes: u64,
     pub mode: Mode,
+    /// Daily scan time as `HH:MM`, or `None` when the daily scan is off.
+    pub daily_scan: Option<String>,
     /// As written in the file, so `~/working` stays `~/working`.
     pub roots: Vec<String>,
     pub exclude: Vec<String>,
@@ -53,6 +55,9 @@ pub fn read(text: &str, home: &Path) -> Result<Settings> {
         recover_margin_gb: cfg.recover_margin_bytes as f64 / BYTES_PER_GB,
         cooldown_minutes: cfg.cooldown_minutes,
         mode: cfg.mode,
+        daily_scan: cfg
+            .daily_scan
+            .map(|t| t.format(config::DAILY_SCAN_FORMAT).to_string()),
         roots,
         exclude: cfg.exclude,
         tasks: cfg.tasks,
@@ -92,6 +97,12 @@ pub fn apply(text: &str, settings: &Settings, home: &Path) -> Result<String> {
         Value::from(to_i64(settings.cooldown_minutes)?),
     );
     set(&mut doc, "mode", Value::from(mode_name(settings.mode)));
+    match &settings.daily_scan {
+        Some(at) => set(&mut doc, "daily_scan", Value::from(at.as_str())),
+        None => {
+            doc.remove("daily_scan");
+        }
+    }
     set(&mut doc, "roots", Value::Array(strings(&settings.roots)));
     set(
         &mut doc,
@@ -250,6 +261,25 @@ mod tests {
         let back = read(&out, home()).unwrap();
         assert_eq!(back.threshold, ThresholdSetting::Pct(10.0));
         assert_eq!(back.roots, vec!["~/working", "/Volumes/P/code"]);
+    }
+
+    #[test]
+    fn daily_scan_is_written_and_removed() {
+        let mut s = read(DEFAULT_TOML, home()).unwrap();
+        assert_eq!(s.daily_scan, None);
+        s.daily_scan = Some("03:15".into());
+        let on = apply(DEFAULT_TOML, &s, home()).unwrap();
+        assert_eq!(
+            read(&on, home()).unwrap().daily_scan.as_deref(),
+            Some("03:15")
+        );
+        s.daily_scan = None;
+        let off = apply(&on, &s, home()).unwrap();
+        assert!(!off.contains("daily_scan = \"03:15\""), "{off}");
+        assert_eq!(read(&off, home()).unwrap().daily_scan, None);
+        s.daily_scan = Some("".into());
+        let err = format!("{:#}", apply(DEFAULT_TOML, &s, home()).unwrap_err());
+        assert!(err.contains("daily_scan"), "{err}");
     }
 
     #[test]

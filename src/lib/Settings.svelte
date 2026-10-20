@@ -150,6 +150,29 @@
     </section>
 
     <section class="panel">
+      <h2>Daily scan</h2>
+      <div class="field">
+        <label class="row check">
+          <input
+            type="checkbox"
+            checked={settings.daily_scan !== null}
+            onchange={(e) => (settings!.daily_scan = e.currentTarget.checked ? '03:00' : null)}
+          />
+          Also scan once a day at
+        </label>
+        <span class="control">
+          {#if settings.daily_scan !== null}
+            <input type="time" required bind:value={settings.daily_scan} />
+          {/if}
+        </span>
+      </div>
+      <p class="muted">
+        Runs even when space is fine, and follows the mode above. Auto cleans everything stale, Ask
+        notifies you, Off does nothing.
+      </p>
+    </section>
+
+    <section class="panel">
       <h2>Threshold</h2>
       <div class="field">
         <span>Low when free space is below</span>

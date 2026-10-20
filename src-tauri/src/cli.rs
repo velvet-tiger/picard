@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::{self, Config};
 use crate::disk::{self, DiskSpace};
 use crate::env::ToolEnv;
-use crate::runner::{self, DataPaths, TaskScan, VolumeRun};
+use crate::runner::{self, CleanRequest, DataPaths, TaskScan, VolumeRun};
 use crate::tasks::SizeCache;
 use crate::volume::{self, Volume};
 
@@ -147,7 +147,14 @@ fn run(config: &Config, config_path: &std::path::Path, env: &ToolEnv) -> Result<
     let sizes = SizeCache::default();
     let mut code = 0;
     for (volume, _) in mounted_volumes(config) {
-        match runner::clean_volume(config, &volume, &sizes, &paths, env, None) {
+        match runner::clean_volume(
+            config,
+            &volume,
+            &sizes,
+            &paths,
+            env,
+            CleanRequest::UntilTarget,
+        ) {
             Ok(result) => {
                 print!("{}", format_run(&volume.name, &result));
                 if !result.failed.is_empty() {
