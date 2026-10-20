@@ -200,7 +200,11 @@
             <ul>
               {#each t.items as i}
                 <li>
-                  <label class="item" title={tildePath(i.path)}>
+                  <!-- The row already shows the path; a tooltip only helps when shortPath has elided part of it. -->
+                  <label
+                    class="item"
+                    title={shortPath(i.path) !== tildePath(i.path) ? tildePath(i.path) : undefined}
+                  >
                     <input type="checkbox" bind:checked={checked[key(v.mount, i.path)]} />
                     <span class="text">
                       <span class="title"
