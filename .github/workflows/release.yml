@@ -1,5 +1,6 @@
-# Builds Picard for Apple Silicon and attaches the .dmg to a draft GitHub
-# release. Push a tag such as v0.1.0, or run it by hand from the Actions tab.
+# Builds Picard for Apple Silicon, attaches the .dmg to a GitHub release and
+# publishes it with the version's CHANGELOG.md section as its notes. Push a
+# tag such as v0.1.0, or run it by hand from the Actions tab.
 #
 # Signing is optional. With all of these repository secrets set, the app is
 # signed with a Developer ID and notarised by the Tauri CLI:
@@ -71,9 +72,37 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.TAG }}
+          # Full history, so the next step can see whether main holds the tag.
+          fetch-depth: 0
           # The release step gets its token from GH_TOKEN. Not storing it in
           # .git/config keeps it from every other step.
           persist-credentials: false
+
+      # Anyone who can push a tag could otherwise sign and publish a commit
+      # that never reached main.
+      - name: Check main holds the tag
+        run: |
+          if ! git merge-base --is-ancestor "refs/tags/$TAG" refs/remotes/origin/main; then
+            echo "::error::Tag $TAG is not on main. Merge the commit into main before tagging it."
+            exit 1
+          fi
+
+      # A re-run must not replace the .dmg of a release people may already
+      # have downloaded. A draft is fine to replace.
+      - name: Refuse to replace a published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if is_draft=$(gh release view "$TAG" --json isDraft -q .isDraft 2>&1); then
+            if [[ "$is_draft" != "true" ]]; then
+              echo "::error::Release $TAG is already published. Delete it on GitHub first to build it again."
+              exit 1
+            fi
+          elif [[ "$is_draft" != *"release not found"* ]]; then
+            echo "::error::Could not look up release $TAG: $is_draft"
+            exit 1
+          fi
 
       - name: Check the tag matches the app version
         run: |
@@ -129,6 +158,35 @@ jobs:
             exit 1
           fi
 
+      # The notes are the install line plus this version's CHANGELOG.md
+      # section. A missing section fails here, before the long build.
+      - name: Write release notes
+        run: |
+          changes=$(awk -v head="## [$VERSION]" '
+            index($0, "## [") == 1 { if (found) exit; found = (index($0, head) == 1); next }
+            !found || /^\[[^]]+\]: / { next }
+            !started && /^[[:space:]]*$/ { next }
+            { started = 1; print }
+          ' CHANGELOG.md)
+          if [[ -z "${changes//[[:space:]]/}" ]]; then
+            echo "::error::CHANGELOG.md has no \"## [$VERSION]\" section, or the section is empty. Fill it in before tagging."
+            exit 1
+          fi
+          {
+            echo "Open the .dmg and drag Picard to Applications."
+            if [[ "$SIGNED" != "true" ]]; then
+              echo
+              echo "This build is not signed with a Developer ID, so macOS will refuse to open it at first."
+              echo "After copying it to Applications, run this once in Terminal:"
+              echo
+              echo '```bash'
+              echo "xattr -cr /Applications/Picard.app"
+              echo '```'
+            fi
+            echo
+            echo "$changes"
+          } > "$RUNNER_TEMP/notes.md"
+
       # Secrets that are not set arrive as empty strings. They are unset for
       # an ad-hoc build, because the Makefile's `?=` default for
       # APPLE_SIGNING_IDENTITY does not apply to a variable that is set but empty.
@@ -146,31 +204,23 @@ jobs:
           fi
           make bundle
 
+      # `make verify` passes an ad-hoc build too, so a signed build also needs
+      # the notarisation ticket that Tauri staples to the app.
       - name: Verify the build
-        run: make verify
-
-      - name: Write release notes
         run: |
-          {
-            echo "Picard $VERSION for Apple Silicon Macs."
-            echo
-            echo "Open the .dmg and drag Picard to Applications."
-            if [[ "$SIGNED" != "true" ]]; then
-              echo
-              echo "This build is not signed with a Developer ID, so macOS will refuse to open it at first."
-              echo "After copying it to Applications, run this once in Terminal:"
-              echo
-              echo '```bash'
-              echo "xattr -cr /Applications/Picard.app"
-              echo '```'
-            fi
-          } > "$RUNNER_TEMP/notes.md"
+          make verify
+          if [[ "$SIGNED" == "true" ]]; then
+            xcrun stapler validate src-tauri/target/release/bundle/macos/Picard.app
+          fi
 
-      # Re-running the workflow replaces the .dmg on the existing release
-      # instead of failing, so a failed upload can be retried.
-      - name: Create or update the draft release
+      # The release stays a draft until the .dmg is uploaded, so nobody sees it
+      # without its file. A failed run can be re-run while it is still a draft.
+      # A pre-release, or a release older than the latest, does not become
+      # the latest release.
+      - name: Upload the .dmg and publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           dmg="src-tauri/target/release/bundle/dmg/Picard_${VERSION}_aarch64.dmg"
           test -f "$dmg"
@@ -180,3 +230,17 @@ jobs:
             gh release create "$TAG" "$dmg" --draft --verify-tag \
               --title "Picard $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
           fi
+          if [[ "$VERSION" == *-* ]]; then
+            flags=(--prerelease --latest=false)
+          else
+            latest=$(gh release list --exclude-drafts --exclude-pre-releases --limit 1000 \
+              --json tagName,isLatest -q '.[] | select(.isLatest) | .tagName')
+            newest=$(printf '%s\n%s\n' "${latest#v}" "$VERSION" | sort -V | tail -1)
+            if [[ -n "$latest" && "$newest" != "$VERSION" ]]; then
+              flags=(--latest=false)
+            else
+              flags=(--latest)
+            fi
+          fi
+          gh release edit "$TAG" --title "Picard $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}" --draft=false
