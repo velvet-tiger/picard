@@ -74,11 +74,13 @@ impl Shared {
         }
     }
 
+    /// True while any cleanup started with `start_cleaning` is running.
+    pub fn is_cleaning(&self) -> bool {
+        self.cleaning.load(Ordering::SeqCst) > 0
+    }
+
     fn refresh_tray<R: Runtime>(&self, app: &AppHandle<R>) {
-        let state = TrayState::from_flags(
-            self.cleaning.load(Ordering::SeqCst) > 0,
-            self.low.load(Ordering::SeqCst),
-        );
+        let state = TrayState::from_flags(self.is_cleaning(), self.low.load(Ordering::SeqCst));
         tray::set_state(app, state);
     }
 

@@ -26,6 +26,7 @@ use crate::volume::Volume;
 type SharedState<'a> = State<'a, Arc<Shared>>;
 
 const STILL_STARTING: &str = "Picard is still starting up. Try again in a moment.";
+const CLEAN_RUNNING: &str = "A clean is running. Rescan when it finishes.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VolumeStatus {
@@ -229,12 +230,25 @@ fn protection_view(ignore: &IgnoreList, paths: &[String]) -> Vec<Option<&'static
         .collect()
 }
 
+/// A preview during a clean repeats the clean's work and lists folders it may
+/// be about to delete, so it is refused. The check is advisory: a clean that
+/// starts a moment later still re-checks every folder before removing it.
+fn refuse_while_cleaning(cleaning: bool) -> Result<(), String> {
+    if cleaning {
+        Err(CLEAN_RUNNING.to_string())
+    } else {
+        Ok(())
+    }
+}
+
 #[tauri::command]
 pub async fn preview(state: SharedState<'_>) -> Result<Vec<VolumePreview>, String> {
     let shared = Arc::clone(&state);
     blocking(move || {
+        refuse_while_cleaning(shared.is_cleaning())?;
         let config = load_config(&shared)?;
         let tools = shared.tools().ok_or(STILL_STARTING)?;
+        log::info!("preview scan started");
         let found = poll::scan(&config.roots, &shared.uuids);
         let mut out = Vec::new();
         for (volume, space) in &found.readings {
@@ -463,6 +477,12 @@ fn run_view(name: &str, result: Result<VolumeRun, String>) -> RunResult {
 mod tests {
     use super::*;
     use crate::tasks::{Candidate, Estimate, Removed};
+
+    #[test]
+    fn preview_is_refused_only_while_a_clean_runs() {
+        assert_eq!(refuse_while_cleaning(true), Err(CLEAN_RUNNING.to_string()));
+        assert_eq!(refuse_while_cleaning(false), Ok(()));
+    }
 
     fn volume() -> Volume {
         Volume {
