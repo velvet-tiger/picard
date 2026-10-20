@@ -162,6 +162,8 @@
     }
   }
 
+  let refreshCalls = 0
+
   /**
    * Asks the backend how the ignore list protects every listed row, and
    * updates them. Cheap: it reads the config and checks paths, with no scan.
@@ -173,7 +175,11 @@
       v.tasks.flatMap((t) => t.items.map((item) => ({ mount: v.mount, item }))),
     )
     if (rows.length === 0) return
+    const call = ++refreshCalls
     const found = await getProtection(rows.map((r) => r.item.path))
+    // Two quick toggles start two refreshes whose replies can arrive in either
+    // order. Only the newest one read the config after every write before it.
+    if (call !== refreshCalls) return
     if (found.length !== rows.length) {
       throw new Error(`get_protection returned ${found.length} answers for ${rows.length} rows`)
     }
