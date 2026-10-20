@@ -175,9 +175,68 @@ pub fn evaluate(
 /// It is due once the local time reaches `at`, unless it already ran today.
 /// So a scan missed while the Mac slept or Picard was closed runs at the next
 /// check that day, and never twice in one day. `last` is the local date of
-/// the last scan; a date after today (the clock moved back) counts as not today.
+/// the last scan; a date after today (the clock moved back, or a flight west
+/// across time zones) counts as not today, so at most one extra scan can follow.
 pub fn daily_scan_due(at: NaiveTime, now: NaiveDateTime, last: Option<NaiveDate>) -> bool {
     now.time() >= at && last != Some(now.date())
+}
+
+/// Added to the wait for the daily scan so the loop wakes just after the
+/// scheduled minute starts rather than a moment before it.
+pub const DAILY_SCAN_SLACK: Duration = Duration::from_secs(1);
+
+/// How long the poll loop sleeps: until the next poll or the next daily scan,
+/// whichever is sooner. `daily` is `None` when the daily scan is off.
+pub fn next_wait(
+    poll: Duration,
+    daily: Option<NaiveTime>,
+    now: NaiveDateTime,
+    last: Option<NaiveDate>,
+) -> Duration {
+    match daily {
+        Some(at) => poll.min(until_daily_scan(at, now, last) + DAILY_SCAN_SLACK),
+        None => poll,
+    }
+}
+
+/// The last-scan date to keep after `daily_scan` changes from `old` to `new`.
+///
+/// Turning the scan on, or moving its time, once that time has already passed
+/// today counts today as done. The user asked for a scheduled scan, so saving
+/// the setting at 14:00 must not start a full cleanup straight away; the first
+/// scan waits for the next scheduled time. Any other change keeps `last`.
+pub fn last_scan_after_change(
+    old: Option<NaiveTime>,
+    new: Option<NaiveTime>,
+    now: NaiveDateTime,
+    last: Option<NaiveDate>,
+) -> Option<NaiveDate> {
+    match new {
+        Some(at) if old != new && now.time() >= at => Some(now.date()),
+        _ => last,
+    }
+}
+
+/// What the daily scan does with one volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DailyAction {
+    /// Auto mode: run every task in full.
+    Clean,
+    /// Ask mode: preview, and notify if anything can be cleaned.
+    Offer,
+    /// Nothing: off mode, or a low volume in ask mode that already had its
+    /// low-space alert (the cooldown decides when it gets the next one).
+    Skip,
+}
+
+/// Chooses the daily scan's action for a volume in `state` under `mode`.
+pub fn daily_action(mode: Mode, state: Option<State>) -> DailyAction {
+    match (mode, state) {
+        (Mode::Off, _) => DailyAction::Skip,
+        (Mode::Auto, _) => DailyAction::Clean,
+        (Mode::Ask, Some(State::Fired { .. })) => DailyAction::Skip,
+        (Mode::Ask, _) => DailyAction::Offer,
+    }
 }
 
 /// How long until the daily scan is next due. Zero if it is due now.
@@ -432,6 +491,69 @@ mod tests {
             until_daily_scan(at(3, 0), when(20, 4, 0), None),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn next_wait_is_the_sooner_of_poll_and_daily_scan() {
+        let poll = Duration::from_secs(300);
+        let now = when(20, 2, 58);
+        assert_eq!(next_wait(poll, None, now, None), poll);
+        assert_eq!(
+            next_wait(poll, Some(at(3, 0)), now, None),
+            Duration::from_secs(121)
+        );
+        assert_eq!(
+            next_wait(poll, Some(at(3, 0)), when(20, 4, 0), Some(day(20))),
+            poll
+        );
+        // Due now: wakes after the slack only, never with a zero wait.
+        assert_eq!(
+            next_wait(poll, Some(at(3, 0)), when(20, 4, 0), None),
+            DAILY_SCAN_SLACK
+        );
+    }
+
+    #[test]
+    fn enabling_after_the_time_has_passed_waits_for_tomorrow() {
+        let now = when(20, 14, 0);
+        // Turned on at 14:00 for 03:00: today counts as done.
+        assert_eq!(
+            last_scan_after_change(None, Some(at(3, 0)), now, None),
+            Some(day(20))
+        );
+        // Moved from 22:00 to 03:00 at 14:00: same.
+        assert_eq!(
+            last_scan_after_change(Some(at(22, 0)), Some(at(3, 0)), now, Some(day(19))),
+            Some(day(20))
+        );
+        // Turned on for later today: today's scan still runs.
+        assert_eq!(
+            last_scan_after_change(None, Some(at(22, 0)), now, Some(day(19))),
+            Some(day(19))
+        );
+        // Unchanged or turned off: kept as is, so a missed scan still catches up.
+        assert_eq!(
+            last_scan_after_change(Some(at(3, 0)), Some(at(3, 0)), now, Some(day(19))),
+            Some(day(19))
+        );
+        assert_eq!(
+            last_scan_after_change(Some(at(3, 0)), None, now, Some(day(19))),
+            Some(day(19))
+        );
+    }
+
+    #[test]
+    fn daily_action_follows_the_mode() {
+        let fired = Some(State::Fired { at: Instant::now() });
+        assert_eq!(daily_action(Mode::Off, None), DailyAction::Skip);
+        assert_eq!(daily_action(Mode::Auto, None), DailyAction::Clean);
+        assert_eq!(daily_action(Mode::Auto, fired), DailyAction::Clean);
+        assert_eq!(
+            daily_action(Mode::Ask, Some(State::Armed)),
+            DailyAction::Offer
+        );
+        assert_eq!(daily_action(Mode::Ask, None), DailyAction::Offer);
+        assert_eq!(daily_action(Mode::Ask, fired), DailyAction::Skip);
     }
 
     #[test]

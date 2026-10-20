@@ -5,12 +5,14 @@
 //! on their own thread and send `Wake` messages into the loop. When
 //! `daily_scan` is set it also wakes at that time and runs the daily scan.
 
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::{Local, NaiveDate};
+use chrono::{Local, NaiveDate, NaiveDateTime};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_notification::{Action, ActionType, NotificationExt};
@@ -21,8 +23,8 @@ use tokio::sync::mpsc;
 use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::env::ToolEnv;
-use crate::monitor::{self, State, States};
-use crate::runner::{self, CleanRequest, VolumeRun};
+use crate::monitor::{self, DailyAction, States};
+use crate::runner::{self, CleanRequest, LockBusy, VolumeRun};
 use crate::state::Shared;
 use crate::tray::{MenuView, Tray};
 use crate::volume::{self, UnavailableRoot, UuidCache, Volume};
@@ -75,10 +77,6 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 // gets retried even if no file event arrives.
 const FALLBACK_POLL: Duration = Duration::from_secs(5 * 60);
 
-// Added to the wait for the daily scan so the loop wakes just after the
-// scheduled minute starts rather than a moment before it.
-const DAILY_SCAN_SLACK: Duration = Duration::from_secs(1);
-
 const DAILY_STAMP_FORMAT: &str = "%Y-%m-%d";
 
 /// Reads the date of the last daily scan. A missing file means it has never
@@ -109,9 +107,29 @@ pub(crate) fn read_daily_stamp(path: &Path) -> Option<NaiveDate> {
 }
 
 /// Records the date of the daily scan, so a restart later that day does not repeat it.
+///
+/// Opened with `O_NOFOLLOW` and mode 600, so a symlink planted in its place
+/// cannot redirect the write to another file.
 pub(crate) fn write_daily_stamp(path: &Path, date: NaiveDate) -> Result<()> {
-    std::fs::write(path, format!("{}\n", date.format(DAILY_STAMP_FORMAT)))
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    writeln!(file, "{}", date.format(DAILY_STAMP_FORMAT))
         .with_context(|| format!("writing {}", path.display()))
+}
+
+/// How one cleanup ended, as far as the poll loop cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cleaned {
+    Removed,
+    NothingRemoved,
+    /// Another cleanup held the run lock, so this one did not start.
+    LockBusy,
 }
 
 /// What started a cleanup. It decides how much is removed and what is reported.
@@ -243,6 +261,9 @@ pub struct Poller<R: Runtime> {
     /// Local date of the last daily scan. Read from disk at start, then kept
     /// here, so a failed stamp write cannot make the scan repeat.
     last_daily_scan: Option<NaiveDate>,
+    /// Volumes whose daily clean found the run lock busy, with the scan's
+    /// date. Retried at each check that same day.
+    daily_retry: Option<(NaiveDate, Vec<PathBuf>)>,
 }
 
 impl<R: Runtime> Poller<R> {
@@ -255,6 +276,7 @@ impl<R: Runtime> Poller<R> {
             config_error: false,
             states: States::new(),
             last_daily_scan: None,
+            daily_retry: None,
         }
     }
 
@@ -266,12 +288,14 @@ impl<R: Runtime> Poller<R> {
             Ok(env) => self.shared.set_tools(env),
             Err(e) => log::error!("resolving tool PATH failed; cleanup tasks are off: {e}"),
         }
-        self.reload_config();
+        // Read before the first config load, which uses it to tell a first
+        // ever start from a restart.
         self.last_daily_scan = read_daily_stamp(&self.shared.paths.daily_scan);
+        self.reload_config();
         loop {
             self.check().await;
-            self.daily_scan_if_due().await;
-            let wait = self.next_wait();
+            self.daily_scan_if_due(Local::now().naive_local()).await;
+            let wait = self.next_wait(Local::now().naive_local());
             match tokio::time::timeout(wait, rx.recv()).await {
                 Err(_elapsed) => {}
                 Ok(None) => {
@@ -294,41 +318,41 @@ impl<R: Runtime> Poller<R> {
     }
 
     /// How long to sleep: until the next poll or the next daily scan, whichever is sooner.
-    fn next_wait(&self) -> Duration {
+    fn next_wait(&self, now: NaiveDateTime) -> Duration {
         let Some(config) = &self.config else {
             return FALLBACK_POLL;
         };
         let poll = Duration::from_secs(config.poll_minutes.saturating_mul(60));
-        match config.daily_scan {
-            Some(at) => {
-                let now = Local::now().naive_local();
-                let daily = monitor::until_daily_scan(at, now, self.last_daily_scan);
-                poll.min(daily + DAILY_SCAN_SLACK)
-            }
-            None => poll,
+        monitor::next_wait(poll, config.daily_scan, now, self.last_daily_scan)
+    }
+
+    /// Records `date` as the day of the last daily scan, in memory and on disk.
+    fn record_daily_scan(&mut self, date: NaiveDate) {
+        self.last_daily_scan = Some(date);
+        if let Err(e) = write_daily_stamp(&self.shared.paths.daily_scan, date) {
+            log::error!("could not record the daily scan; a restart today may repeat it: {e:#}");
         }
     }
 
     /// Runs the daily scan if it is due, following the mode: auto cleans every
     /// volume in full, ask notifies about what could be cleaned, off does nothing.
-    async fn daily_scan_if_due(&mut self) {
+    /// When it is not due, retries any clean that found the run lock busy.
+    async fn daily_scan_if_due(&mut self, now: NaiveDateTime) {
         let Some(config) = self.config.clone() else {
             return;
         };
         let Some(at) = config.daily_scan else {
             return;
         };
-        let today = Local::now().naive_local();
-        if !monitor::daily_scan_due(at, today, self.last_daily_scan) {
+        if !monitor::daily_scan_due(at, now, self.last_daily_scan) {
+            self.retry_daily_cleans(&config, now.date()).await;
             return;
         }
         // Recorded before the scan runs, so a scan that fails or panics waits
         // until tomorrow instead of retrying on every poll. Off mode records it
         // too; otherwise the scan would stay due and the loop would never sleep.
-        self.last_daily_scan = Some(today.date());
-        if let Err(e) = write_daily_stamp(&self.shared.paths.daily_scan, today.date()) {
-            log::error!("could not record the daily scan; a restart today may repeat it: {e:#}");
-        }
+        self.record_daily_scan(now.date());
+        self.daily_retry = None;
         log::info!("daily scan: mode {:?}", config.mode);
         if config.mode == Mode::Off {
             return;
@@ -336,27 +360,72 @@ impl<R: Runtime> Poller<R> {
         let Some(found) = self.scan_volumes(&config).await else {
             return;
         };
-        let mut cleaned = false;
+        let mut to_clean = Vec::new();
         for (volume, space) in found.readings {
-            if config.mode == Mode::Auto {
-                cleaned |= self.clean(&config, volume, Trigger::Daily).await;
-                continue;
+            let state = self.states.get(&volume.mount).copied();
+            match monitor::daily_action(config.mode, state) {
+                DailyAction::Clean => to_clean.push(volume),
+                DailyAction::Skip => log::info!("daily scan: skipping {}", volume.name),
+                DailyAction::Offer => {
+                    let name = volume.name.clone();
+                    let cleanable = self.cleanable(&config, volume).await;
+                    match monitor::daily_scan_message(&name, space, cleanable) {
+                        Some((title, body)) => self.notify(&title, &body),
+                        None => log::info!("daily scan: nothing to offer on {name}"),
+                    }
+                }
             }
-            // A low volume has already had its low-space alert; the cooldown
-            // decides when it gets the next one.
-            if matches!(self.states.get(&volume.mount), Some(State::Fired { .. })) {
-                log::info!(
-                    "daily scan: {} already alerted as low, skipping",
-                    volume.name
-                );
-                continue;
+        }
+        self.clean_daily(&config, now.date(), to_clean).await;
+    }
+
+    /// Retries the daily cleans that found the run lock busy, if they are
+    /// still for today and the mode is still auto.
+    async fn retry_daily_cleans(&mut self, config: &Config, today: NaiveDate) {
+        let Some((date, mounts)) = self.daily_retry.take() else {
+            return;
+        };
+        if date != today || config.mode != Mode::Auto {
+            log::info!("daily scan: dropping {} pending retry(s)", mounts.len());
+            return;
+        }
+        let Some(found) = self.scan_volumes(config).await else {
+            self.daily_retry = Some((date, mounts));
+            return;
+        };
+        // A volume that has since been unplugged is dropped.
+        let volumes = found
+            .readings
+            .into_iter()
+            .map(|(v, _)| v)
+            .filter(|v| mounts.contains(&v.mount))
+            .collect();
+        self.clean_daily(config, date, volumes).await;
+    }
+
+    /// Cleans each volume in full for the daily scan. Volumes whose clean
+    /// found the run lock busy are kept for a retry at the next check.
+    ///
+    /// A volume that `check` just cleaned for low space is cleaned again here,
+    /// in full, and can produce a second notification. That only happens when
+    /// a drive is low at the scheduled time, and the second run is still useful.
+    async fn clean_daily(&mut self, config: &Config, date: NaiveDate, volumes: Vec<Volume>) {
+        let mut busy = Vec::new();
+        let mut cleaned = false;
+        for volume in volumes {
+            let mount = volume.mount.clone();
+            match self.clean(config, volume, Trigger::Daily).await {
+                Cleaned::Removed => cleaned = true,
+                Cleaned::NothingRemoved => {}
+                Cleaned::LockBusy => busy.push(mount),
             }
-            let name = volume.name.clone();
-            let cleanable = self.cleanable(&config, volume).await;
-            match monitor::daily_scan_message(&name, space, cleanable) {
-                Some((title, body)) => self.notify(&title, &body),
-                None => log::info!("daily scan: nothing to offer on {name}"),
-            }
+        }
+        if !busy.is_empty() {
+            log::info!(
+                "daily scan: another cleanup is running; retrying {} volume(s) at the next check",
+                busy.len()
+            );
+            self.daily_retry = Some((date, busy));
         }
         // Refresh the menu with the space the cleanup freed.
         if cleaned {
@@ -375,6 +444,26 @@ impl<R: Runtime> Poller<R> {
                     c.roots.len()
                 );
                 let old_mode = self.config.as_ref().map(|old| old.mode);
+                // On the first load there is no previous config. A stamp on
+                // disk means the scan was set up before this start, so it is
+                // not a change; no stamp means it is being set up now.
+                let old_daily = match &self.config {
+                    Some(old) => old.daily_scan,
+                    None if self.last_daily_scan.is_some() => c.daily_scan,
+                    None => None,
+                };
+                let last = monitor::last_scan_after_change(
+                    old_daily,
+                    c.daily_scan,
+                    Local::now().naive_local(),
+                    self.last_daily_scan,
+                );
+                if let Some(date) = last
+                    && last != self.last_daily_scan
+                {
+                    log::info!("daily scan set after its time today; the first one runs tomorrow");
+                    self.record_daily_scan(date);
+                }
                 self.states = monitor::states_after_reload(
                     std::mem::take(&mut self.states),
                     old_mode,
@@ -459,7 +548,11 @@ impl<R: Runtime> Poller<R> {
     /// How much a preview scan finds on `volume`, for the ask-mode estimate.
     /// `None` if the scan cannot run yet or fails; the reason is logged.
     async fn cleanable(&self, config: &Config, volume: Volume) -> Option<u64> {
-        let tools = self.shared.tools()?;
+        let name = volume.name.clone();
+        let Some(tools) = self.shared.tools() else {
+            log::warn!("cleanup estimate for {name} skipped: tool paths are not resolved");
+            return None;
+        };
         let config = config.clone();
         let sizes = Arc::clone(&self.shared.sizes);
         let scanned = tauri::async_runtime::spawn_blocking(move || {
@@ -476,19 +569,18 @@ impl<R: Runtime> Poller<R> {
                     .sum(),
             ),
             Ok(Err(e)) => {
-                log::warn!("estimate for the low-space alert failed: {e:#}");
+                log::warn!("cleanup estimate for {name} failed: {e:#}");
                 None
             }
             Err(e) => {
-                log::warn!("estimate task failed: {e}");
+                log::warn!("cleanup estimate task for {name} failed: {e}");
                 None
             }
         }
     }
 
     /// Runs the cleanup tasks on one volume and reports the result.
-    /// Returns true if the run removed anything.
-    async fn clean(&self, config: &Config, volume: Volume, trigger: Trigger) -> bool {
+    async fn clean(&self, config: &Config, volume: Volume, trigger: Trigger) -> Cleaned {
         log::info!("auto mode ({trigger:?}): cleaning {}", volume.name);
         let Some(tools) = self.shared.tools() else {
             let title = match trigger {
@@ -499,7 +591,7 @@ impl<R: Runtime> Poller<R> {
                 &title,
                 "Cleanup is off because tool paths could not be resolved. See the log.",
             );
-            return false;
+            return Cleaned::NothingRemoved;
         };
         let _cleaning = self.shared.start_cleaning(&self.app);
         let config = config.clone();
@@ -514,6 +606,13 @@ impl<R: Runtime> Poller<R> {
         })
         .await;
         let (run, after) = match outcome {
+            // The daily scan retries later. A low-space clean reports it, as
+            // before, and the cooldown decides when it tries again.
+            Ok((Err(e), _))
+                if trigger == Trigger::Daily && e.downcast_ref::<LockBusy>().is_some() =>
+            {
+                return Cleaned::LockBusy;
+            }
             Ok((run, after)) => (run.map_err(|e| format!("{e:#}")), after),
             Err(e) => {
                 log::error!("cleanup task for {name} panicked or was cancelled: {e}");
@@ -532,7 +631,11 @@ impl<R: Runtime> Poller<R> {
             Some((title, body)) => self.notify(&title, &body),
             None => log::info!("auto mode ({trigger:?}): nothing removed on {name}"),
         }
-        run.is_ok_and(|r| !r.removed.is_empty())
+        if run.is_ok_and(|r| !r.removed.is_empty()) {
+            Cleaned::Removed
+        } else {
+            Cleaned::NothingRemoved
+        }
     }
 
     fn notify(&self, title: &str, body: &str) {
@@ -591,6 +694,18 @@ mod tests {
         assert_eq!(read_daily_stamp(&path), Some(date));
         std::fs::write(&path, "yesterday").unwrap();
         assert_eq!(read_daily_stamp(&path), None);
+    }
+
+    #[test]
+    fn daily_stamp_write_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("precious.txt");
+        std::fs::write(&target, "keep me").unwrap();
+        let path = dir.path().join("daily-scan.txt");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        assert!(write_daily_stamp(&path, date).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
     }
 
     #[test]

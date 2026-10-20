@@ -41,11 +41,11 @@ Picard never switches modes by itself.
 
 Picard normally acts only when a drive drops below its threshold. Set `daily_scan` to also scan once a day at a set local time, even when space is fine. It follows the mode:
 
-- **Ask**: Picard notifies you if anything can be cleaned, for example "Daily scan of Startup disk: 120 GB free (12%). About 8.4 GB can be cleaned." If nothing can be cleaned, it stays quiet. A drive that is already low gets its low-space alert instead.
-- **Auto**: Picard runs every task in full on each drive. It does not stop early once space is free, as a low-space cleanup does. It tells you how much it freed.
+- **Ask**: Picard notifies you if anything can be cleaned, for example "Daily scan of Startup disk: 120 GB free (12%). About 8.5 GB can be cleaned." If nothing can be cleaned, it stays quiet. A drive that is already low gets its low-space alert instead.
+- **Auto**: Picard runs every task in full on each drive. It does not stop early once space is free, as a low-space cleanup does. So tasks at the end of the list, including your `command` scripts, run every day. Picard tells you how much it freed, and tells you if every removal failed. If another cleanup is running at that moment, Picard tries that drive again at the next check. If a drive is low at the scan time, it gets a low-space cleanup and then the full one, so you may see two notifications.
 - **Off**: nothing happens.
 
-If your Mac is asleep or Picard is closed at that time, the scan runs at the next check that day. It never runs twice in one day. Picard records the date of the last scan in `daily-scan.txt`, next to the config.
+If your Mac is asleep or Picard is closed at that time, the scan runs at the next check that day. That can be up to `poll_minutes` after the Mac wakes. It never runs twice in one day. If you turn the daily scan on, or change its time, after that time has passed today, the first scan runs tomorrow. Picard records the date of the last scan in `daily-scan.txt`, next to the config.
 
 ## The menu bar icon
 

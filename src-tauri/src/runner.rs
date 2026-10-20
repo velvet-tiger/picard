@@ -12,7 +12,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::Utc;
 
 use crate::config::Config;
@@ -42,6 +42,19 @@ impl DataPaths {
     }
 }
 
+/// The run lock is held by another cleanup. A separate type, so callers can
+/// retry later instead of treating it as a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockBusy;
+
+impl std::fmt::Display for LockBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another cleanup is already running")
+    }
+}
+
+impl std::error::Error for LockBusy {}
+
 /// Exclusive lock held for the whole of a cleanup run. Uses `flock`, so it also
 /// stops the CLI and the menu bar app from cleaning at the same time. The OS
 /// releases it when the file is closed, including if Picard crashes.
@@ -65,7 +78,7 @@ impl RunLock {
         if rc != 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                bail!("another cleanup is already running");
+                return Err(LockBusy.into());
             }
             return Err(err).with_context(|| format!("locking {}", path.display()));
         }
@@ -189,8 +202,9 @@ pub fn outcome_message(
 }
 
 /// Notification for the daily scan's cleanup on volume `name`, or `None`
-/// when it removed nothing. A daily scan runs on healthy disks too, so
-/// "nothing to clean" is not news worth a notification.
+/// when it removed nothing and nothing failed. A daily scan runs on healthy
+/// disks too, so "nothing to clean" is not news worth a notification, but a
+/// run where every removal failed is.
 pub fn daily_outcome_message(
     name: &str,
     run: &Result<VolumeRun, String>,
@@ -201,7 +215,17 @@ pub fn daily_outcome_message(
             format!("Daily scan of {name} failed"),
             format!("Cleanup failed: {e}. See the log."),
         )),
-        Ok(r) if r.removed.is_empty() => None,
+        Ok(r) if r.removed.is_empty() && r.failed.is_empty() => None,
+        Ok(r) if r.removed.is_empty() => {
+            let items = match r.failed.len() {
+                1 => "1 item".to_string(),
+                n => format!("{n} items"),
+            };
+            Some((
+                format!("Daily scan of {name} had problems"),
+                format!("{items} could not be cleaned. See the log."),
+            ))
+        }
         Ok(_) => Some(outcome_message(name, run, after)),
     }
 }
@@ -475,6 +499,7 @@ mod tests {
             .err()
             .expect("second lock must fail");
         assert!(err.to_string().contains("already running"), "{err}");
+        assert!(err.downcast_ref::<LockBusy>().is_some(), "{err:?}");
         drop(first);
         assert!(RunLock::acquire(&path).is_ok());
     }
@@ -520,6 +545,20 @@ mod tests {
         );
         let failed = daily_outcome_message("D", &Err("locked".into()), None).unwrap();
         assert_eq!(failed.0, "Daily scan of D failed");
+        let all_failed = VolumeRun {
+            failed: vec![
+                ("node_modules", PathBuf::from("/a"), "denied".into()),
+                ("node_modules", PathBuf::from("/b"), "denied".into()),
+            ],
+            ..VolumeRun::default()
+        };
+        assert_eq!(
+            daily_outcome_message("D", &Ok(all_failed), None),
+            Some((
+                "Daily scan of D had problems".to_string(),
+                "2 items could not be cleaned. See the log.".to_string()
+            ))
+        );
         let run = VolumeRun {
             removed: vec![(
                 "node_modules",

@@ -23,6 +23,17 @@
   let savedJson = $state('')
   let confirmingClose = $state(false)
   const dirty = $derived(settings !== null && JSON.stringify(settings) !== savedJson)
+  // WebKit sets a cleared or half-typed time field to ''. Saving that would only
+  // fail with a parse error, so Save waits until a time is picked.
+  const dailyTimeMissing = $derived(settings?.daily_scan === '')
+  // The time to restore when the daily scan is ticked again after unticking it.
+  let lastDailyTime = '03:00'
+
+  function setDailyScan(on: boolean) {
+    if (!settings) return
+    if (!on && settings.daily_scan) lastDailyTime = settings.daily_scan
+    settings.daily_scan = on ? lastDailyTime : null
+  }
 
   const MODES = [
     { value: 'ask', label: 'Ask', help: 'Notify and wait for you to choose Clean.' },
@@ -156,7 +167,7 @@
           <input
             type="checkbox"
             checked={settings.daily_scan !== null}
-            onchange={(e) => (settings!.daily_scan = e.currentTarget.checked ? '03:00' : null)}
+            onchange={(e) => setDailyScan(e.currentTarget.checked)}
           />
           Also scan once a day at
         </label>
@@ -166,9 +177,13 @@
           {/if}
         </span>
       </div>
+      {#if dailyTimeMissing}
+        <p class="error">Pick a time, or untick the daily scan.</p>
+      {/if}
       <p class="muted">
-        Runs even when space is fine, and follows the mode above. Auto cleans everything stale, Ask
-        notifies you, Off does nothing.
+        Runs even when space is fine, and follows the mode above. Auto runs every task in full,
+        including custom commands. Ask notifies you. Off does nothing. If the time has already
+        passed today, the first scan is tomorrow.
       </p>
     </section>
 
@@ -398,7 +413,7 @@
         {#if saved && !dirty}<span class="ok">Saved. Picard has reloaded the settings.</span>{/if}
         <span class="spacer"></span>
         <button onclick={() => close()}>Close</button>
-        <button class="primary" onclick={save} disabled={saving}
+        <button class="primary" onclick={save} disabled={saving || dailyTimeMissing}
           >{saving ? 'Saving…' : 'Save'}</button
         >
       {/if}
