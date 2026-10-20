@@ -16,6 +16,16 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// them. Output past this size is treated as an error rather than trusted.
 const GIT_OUTPUT_CAP: usize = 256 * 1024 * 1024;
 
+/// `git status` for deciding whether removing a checkout loses work. Untracked
+/// files are listed explicitly, because `status.showUntrackedFiles=no` in repo
+/// or user config would otherwise hide files that removal deletes.
+pub const SAFETY_STATUS: &[&str] = &[
+    "status",
+    "--porcelain",
+    "--untracked-files=all",
+    "--ignore-submodules=all",
+];
+
 /// How to invoke git: which binary, and the PATH it runs with.
 #[derive(Debug, Clone)]
 pub struct GitCmd {
@@ -51,6 +61,14 @@ impl GitCmd {
         // Picard only reads, apart from `worktree remove`. Skipping optional
         // locks stops `git status` from contending with a live session's git.
         cmd.env("GIT_OPTIONAL_LOCKS", "0");
+        // A repo can claim to be a partial clone with missing objects. `status`
+        // then fetches them, and the fetch runs whatever program the repo
+        // config names, such as `core.sshCommand` or `remote.*.uploadpack`.
+        // Picard never needs the network. The first variable stops lazy fetch
+        // (git 2.45 and later). The second refuses every transport, which also
+        // covers older git, and environment beats repo `protocol.*.allow`.
+        cmd.env("GIT_NO_LAZY_FETCH", "1");
+        cmd.env("GIT_ALLOW_PROTOCOL", "none");
         if let Some(path) = &self.path_var {
             cmd.env("PATH", path);
         }
@@ -135,16 +153,20 @@ impl GitCmd {
     /// Why git must not run `status` or `worktree remove` in `dir`, if anything.
     ///
     /// Both commands can run a clean filter. Filters defined in the repo's own
-    /// config are refused. Checked-out submodules are refused too, because
-    /// `status` recurses into them and each has its own config that this check
-    /// does not read. `git worktree remove` refuses those anyway.
+    /// config are refused.
     ///
     /// A submodule that was never checked out is only an empty folder, with no
-    /// config of its own, and git removes such a worktree. Claude Code's agent
-    /// worktrees look like this, so they are not refused. A gitlink folder that
-    /// holds anything at all is refused, because git would delete those files
-    /// without listing them in `status`. Every check here only reads, and runs
-    /// nothing.
+    /// config of its own. Claude Code's agent worktrees look like this. A
+    /// gitlink folder that holds anything other than a submodule checkout is
+    /// refused, because git would delete those files without listing them in
+    /// `status`.
+    ///
+    /// A checked-out submodule keeps its repository in `<git dir>/modules`,
+    /// which removing the worktree deletes. So each checkout must have no
+    /// filters, no submodules of its own and no uncommitted changes, and each
+    /// repository there must hold no commit missing from its remote branches.
+    /// Only then is nothing lost. The checkout is checked before git runs
+    /// `status` in it, and nothing here runs a program the repos name.
     pub fn unsafe_to_inspect(&self, dir: &Path) -> Result<Option<String>> {
         let filters = self.untrusted_filters(dir)?;
         if !filters.is_empty() {
@@ -153,22 +175,176 @@ impl GitCmd {
                 filters.join(", ")
             )));
         }
-        let git_dir = self.output(dir, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
-        let modules = Path::new(git_dir.trim()).join("modules");
-        if std::fs::symlink_metadata(&modules).is_ok() {
-            return Ok(Some(format!(
-                "contains checked-out submodules ({} exists)",
-                modules.display()
-            )));
-        }
+        let modules = self.submodule_store_root(dir)?;
+        let has_stores = std::fs::symlink_metadata(&modules).is_ok();
         let index = self.output(dir, &["ls-files", "--stage", "-z"])?;
         for gitlink in index_gitlinks(&index) {
-            if let Some(why) = submodule_folder_problem(&dir.join(gitlink)) {
+            let folder = dir.join(gitlink);
+            let Some(why) = submodule_folder_problem(&folder) else {
+                continue;
+            };
+            if !has_stores {
                 return Ok(Some(format!("submodule {gitlink} {why}")));
+            }
+            if let Some(why) = self.checkout_problem(&folder, &modules)? {
+                return Ok(Some(format!("submodule {gitlink} {why}")));
+            }
+        }
+        if has_stores {
+            for store in submodule_stores(&modules)? {
+                if let Some(why) = self.store_problem(&store)? {
+                    return Ok(Some(format!("submodule repo {}: {why}", store.display())));
+                }
             }
         }
         Ok(None)
     }
+
+    /// True if `dir` has submodule repositories that `git worktree remove`
+    /// would delete. Git only removes such a worktree with `--force`.
+    pub fn has_submodule_stores(&self, dir: &Path) -> Result<bool> {
+        let modules = self.submodule_store_root(dir)?;
+        Ok(std::fs::symlink_metadata(modules).is_ok())
+    }
+
+    /// `<git dir>/modules`, where git keeps the repositories of `dir`'s submodules.
+    pub fn submodule_store_root(&self, dir: &Path) -> Result<PathBuf> {
+        let git_dir = self.output(dir, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+        Ok(Path::new(git_dir.trim()).join("modules"))
+    }
+
+    /// Why a non-empty gitlink `folder` is unsafe, if it is. It must be a
+    /// submodule checkout whose repository is inside `modules`, with no repo
+    /// filters, no submodules of its own and nothing uncommitted.
+    ///
+    /// The checkout's top level must be `folder` itself. A `.git` file can
+    /// point at another submodule's repository, whose `core.worktree` names a
+    /// different folder. `status` would then check that folder, not this one.
+    fn checkout_problem(&self, folder: &Path, modules: &Path) -> Result<Option<String>> {
+        let git_dir = self.output(
+            folder,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+        )?;
+        let top = self.output(
+            folder,
+            &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+        )?;
+        let in_store = match (
+            Path::new(git_dir.trim()).canonicalize(),
+            modules.canonicalize(),
+            Path::new(top.trim()).canonicalize(),
+            folder.canonicalize(),
+        ) {
+            (Ok(repo), Ok(store), Ok(top), Ok(folder)) => {
+                repo.starts_with(&store) && repo != store && top == folder
+            }
+            _ => false,
+        };
+        if !in_store {
+            return Ok(Some(
+                "is not empty and is not a submodule checkout".to_string(),
+            ));
+        }
+        let filters = self.untrusted_filters(folder)?;
+        if !filters.is_empty() {
+            return Ok(Some(format!(
+                "config defines filters that git could run: {}",
+                filters.join(", ")
+            )));
+        }
+        let index = self.output(folder, &["ls-files", "--stage", "-z"])?;
+        if !index_gitlinks(&index).is_empty() {
+            return Ok(Some("has submodules of its own".to_string()));
+        }
+        let status = self.output(folder, SAFETY_STATUS)?;
+        if !status.trim().is_empty() {
+            return Ok(Some("has uncommitted changes".to_string()));
+        }
+        Ok(None)
+    }
+
+    /// Why deleting the submodule repository at `store` would lose work, if it
+    /// would. Every commit reachable from its HEAD, branches, tags, stash and
+    /// reflogs must also be on one of its remote-tracking branches. The reflog
+    /// counts because `submodule update` moves HEAD off work done on a
+    /// detached HEAD, and the reflog is then the only way back to it. A repo
+    /// with no remote therefore always fails. Nothing is fetched.
+    fn store_problem(&self, store: &Path) -> Result<Option<String>> {
+        if std::fs::symlink_metadata(store.join("modules")).is_ok() {
+            return Ok(Some("has submodules of its own".to_string()));
+        }
+        let unique = self.output(
+            store,
+            &[
+                "--git-dir=.",
+                "rev-list",
+                "--count",
+                "--all",
+                "--reflog",
+                "--not",
+                "--remotes",
+            ],
+        )?;
+        match unique.trim() {
+            "0" => Ok(None),
+            n => Ok(Some(format!(
+                "has {n} commit(s) that are on no remote branch"
+            ))),
+        }
+    }
+}
+
+/// The submodule repositories under `modules`. A submodule's name can contain
+/// `/`, so a repository can sit several folders down. A folder holding a
+/// regular `HEAD` file and an `objects` folder is a repository and is not
+/// searched further. A symlink, or a folder with only some of a repository's
+/// parts, is an error. The caller then keeps the worktree, because a
+/// repository it cannot check would be deleted unchecked.
+pub fn submodule_stores(modules: &Path) -> Result<Vec<PathBuf>> {
+    let mut stores = Vec::new();
+    let mut pending = vec![modules.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        if dir != modules {
+            if is_git_store(&dir) {
+                stores.push(dir);
+                continue;
+            }
+            if has_store_parts(&dir) {
+                bail!(
+                    "{} looks like a git repository but cannot be checked",
+                    dir.display()
+                );
+            }
+        }
+        let entries =
+            std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+            let kind = entry
+                .file_type()
+                .with_context(|| format!("reading {}", entry.path().display()))?;
+            if kind.is_symlink() {
+                bail!("{} is a symlink", entry.path().display());
+            }
+            if kind.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    stores.sort();
+    Ok(stores)
+}
+
+fn is_git_store(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join("HEAD")).is_ok_and(|m| m.is_file())
+        && std::fs::symlink_metadata(dir.join("objects")).is_ok_and(|m| m.is_dir())
+}
+
+/// True if `dir` holds any of the entries a git repository has.
+fn has_store_parts(dir: &Path) -> bool {
+    ["HEAD", "objects", "refs"]
+        .iter()
+        .any(|part| std::fs::symlink_metadata(dir.join(part)).is_ok())
 }
 
 /// Paths of the gitlinks (mode 160000) in `git ls-files --stage -z` output.
@@ -333,6 +509,84 @@ mod tests {
         let file = dir.path().join("file");
         std::fs::write(&file, "x").unwrap();
         assert!(submodule_folder_problem(&file).is_some());
+    }
+
+    #[test]
+    fn finds_submodule_repos_at_any_depth_and_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let modules = dir.path().join("modules");
+        for repo in ["lib", "vendor/deep/lib"] {
+            let r = modules.join(repo);
+            std::fs::create_dir_all(r.join("objects")).unwrap();
+            std::fs::write(r.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        }
+        // A repository's own folders are not searched for more repositories.
+        std::fs::create_dir_all(modules.join("lib/objects/HEAD")).unwrap();
+        assert_eq!(
+            submodule_stores(&modules).unwrap(),
+            vec![modules.join("lib"), modules.join("vendor/deep/lib")]
+        );
+        std::os::unix::fs::symlink(dir.path(), modules.join("vendor/link")).unwrap();
+        assert!(submodule_stores(&modules).is_err());
+    }
+
+    #[test]
+    fn a_repository_that_cannot_be_checked_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let modules = dir.path().join("modules");
+        // HEAD as a symlink, as `core.preferSymlinkRefs` writes it.
+        let odd = modules.join("odd");
+        std::fs::create_dir_all(odd.join("objects")).unwrap();
+        std::os::unix::fs::symlink("refs/heads/main", odd.join("HEAD")).unwrap();
+        let err = submodule_stores(&modules).unwrap_err().to_string();
+        assert!(err.contains("cannot be checked"), "{err}");
+    }
+
+    /// A repo claiming to be a partial clone with a missing tree. Without the
+    /// guards in `command`, `status` lazily fetches the tree over ssh and runs
+    /// the repo's `core.sshCommand`.
+    #[test]
+    fn status_never_lazily_fetches_through_a_repo_configured_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path().join("r");
+        let marker = dir.path().join("ssh-ran");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&r)
+                .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::create_dir_all(r.join("d")).unwrap();
+        git(&["init", "-q"]);
+        std::fs::write(r.join("d/f"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "a"]);
+        git(&["config", "extensions.partialClone", "origin"]);
+        git(&["config", "remote.origin.promisor", "true"]);
+        git(&["config", "remote.origin.url", "ssh://example.invalid/x"]);
+        let ssh = format!("touch '{}'", marker.display());
+        git(&["config", "core.sshCommand", &ssh]);
+        let tree = git(&["rev-parse", "HEAD:d"]);
+        std::fs::remove_file(r.join(".git/objects").join(&tree[..2]).join(&tree[2..])).unwrap();
+        std::fs::remove_file(r.join(".git/index")).unwrap();
+
+        // Status cannot succeed without the tree, and must fail without fetching.
+        assert!(GitCmd::default().output(&r, SAFETY_STATUS).is_err());
+        assert!(!marker.exists(), "repo-configured ssh command was executed");
     }
 
     #[test]

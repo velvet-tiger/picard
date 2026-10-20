@@ -5,24 +5,28 @@
 //! - it sits inside a root on this volume and is not excluded (`check_target`)
 //! - no running process is working inside it (`lsof`)
 //! - `git status --porcelain` is empty, so nothing uncommitted or untracked
+//! - any checked-out submodule is clean and holds no commit missing from its
+//!   remote branches (`GitCmd::unsafe_to_inspect`)
 //! - its commits exist elsewhere: HEAD is in the default branch, or its branch
 //!   has an upstream with nothing unpushed
 //! - and either HEAD is in the default branch and the folder has been idle for
 //!   `min_idle`, or the folder has been idle for `stale_days`
 //!
 //! Removal is `git worktree remove` without `--force`, so git refuses anything
-//! dirty or locked as a second guard. Branches are never deleted.
+//! dirty or locked as a second guard. The exception is a worktree with
+//! checked-out submodules, which git removes only with `--force`. One `--force`
+//! still refuses a locked worktree. Branches are never deleted.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use walkdir::WalkDir;
 
-use super::git::{GitCmd, WorktreeEntry, parse_worktree_list};
+use super::git::{GitCmd, SAFETY_STATUS, WorktreeEntry, parse_worktree_list};
 use super::in_use::InUse;
-use super::stale_dirs::newest_mtime;
+use super::stale_dirs::{FINDER_METADATA, is_skipped, newest_mtime};
 use super::{Candidate, CleanupTask, Ctx, Estimate, Removed, Report, check_target};
 
 /// Folders never descended into while looking for repos.
@@ -77,15 +81,7 @@ impl GitWorktrees {
             log::warn!("worktree {}: skipped: {why}", wt.path.display());
             return Ok(None);
         }
-        if !self
-            .git
-            .output(
-                &wt.path,
-                &["status", "--porcelain", "--ignore-submodules=all"],
-            )?
-            .trim()
-            .is_empty()
-        {
+        if !self.git.output(&wt.path, SAFETY_STATUS)?.trim().is_empty() {
             log::debug!("worktree {}: has uncommitted changes", wt.path.display());
             return Ok(None);
         }
@@ -224,6 +220,14 @@ impl GitWorktrees {
         if in_use.contains(&c.path) {
             return Err("now in use by a running process".to_string());
         }
+        // The submodule checks in `unsafe_to_inspect` and the status check below
+        // stand in for git's own, which refuses every worktree with submodules.
+        // Read before those checks: if submodules appear after it, plain
+        // `worktree remove` refuses, so a late change cannot earn `--force`.
+        let force = self
+            .git
+            .has_submodule_stores(&c.path)
+            .map_err(|e| format!("{e:#}"))?;
         if let Some(why) = self
             .git
             .unsafe_to_inspect(&c.path)
@@ -233,18 +237,39 @@ impl GitWorktrees {
         }
         let dirty = self
             .git
-            .output(
-                &c.path,
-                &["status", "--porcelain", "--ignore-submodules=all"],
-            )
+            .output(&c.path, SAFETY_STATUS)
             .map_err(|e| format!("{e:#}"))?;
         if !dirty.trim().is_empty() {
             return Err("now has uncommitted changes".to_string());
         }
+        // The checks above take seconds on a large repo, and `--force` skips
+        // git's own. A file written since the run started, even an ignored
+        // one that status does not list, means someone is working here. A
+        // commit in a submodule writes only to its repository, so those are
+        // walked too when they are about to be deleted.
+        let mut walked = vec![(c.path.clone(), true)];
+        if force {
+            let modules = self
+                .git
+                .submodule_store_root(&c.path)
+                .map_err(|e| format!("{e:#}"))?;
+            walked.push((modules, false));
+        }
+        if walked
+            .iter()
+            .any(|(dir, skip_build)| written_since(dir, ctx.now, *skip_build))
+        {
+            return Err("changed since the run started".to_string());
+        }
         let repo = self.repo_of(&c.path).map_err(|e| format!("{e:#}"))?;
         let path = c.path.to_string_lossy();
+        let mut args = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.push(&path);
         self.git
-            .output(&repo, &["worktree", "remove", &path])
+            .output(&repo, &args)
             .map_err(|e| format!("{e:#}"))?;
         if let Err(e) = self.git.output(&repo, &["worktree", "prune"]) {
             log::warn!("{}: worktree prune failed: {e:#}", repo.display());
@@ -350,6 +375,30 @@ fn find_repos(ctx: &Ctx) -> Vec<PathBuf> {
     repos.sort();
     repos.dedup();
     repos
+}
+
+/// True if any file under `dir` was modified after `since`, or if any part
+/// of it cannot be read. Unlike `newest_mtime`, which estimates idleness,
+/// this guards a removal: it has no depth limit and fails closed. With
+/// `skip_build`, regenerable build folders and `.git` are not walked, as in
+/// the scan. Finder's `.DS_Store` never counts as work.
+fn written_since(dir: &Path, since: SystemTime, skip_build: bool) -> bool {
+    WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !skip_build || !is_skipped(e.path(), &[]))
+        .any(|entry| match entry {
+            Err(e) => {
+                log::debug!("{}: cannot check for recent writes: {e}", dir.display());
+                true
+            }
+            Ok(e) if e.file_type().is_dir() || e.file_name() == FINDER_METADATA => false,
+            Ok(e) => e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .is_none_or(|modified| modified > since),
+        })
 }
 
 fn format_idle(idle: Duration) -> String {
@@ -741,6 +790,11 @@ mod tests {
         let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
         assert!(!marker.exists(), "submodule-configured filter was executed");
         assert!(found.is_empty(), "{found:?}");
+        assert_eq!(
+            refusal(&wt),
+            "submodule vendor/lib config defines filters that git could run: filter.evil.clean"
+        );
+        assert!(!marker.exists(), "submodule-configured filter was executed");
     }
 
     /// Claude Code's agent worktrees have a submodule in the index but never
@@ -811,6 +865,401 @@ mod tests {
 
         let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A repo whose main branch has a submodule at `vendor/lib`. The library
+    /// sits outside the roots and is the submodule's `origin`, so a fresh
+    /// checkout's commit is on a remote branch.
+    fn repo_with_submodule(fx: &Fixture) -> PathBuf {
+        let lib = fx.dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        git(&lib, &["init", "-q"]);
+        commit(&lib, "lib.txt");
+        let r = repo(fx);
+        git(
+            &r,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                lib.to_str().unwrap(),
+                "vendor/lib",
+            ],
+        );
+        git(&r, &["commit", "-qm", "add submodule"]);
+        r
+    }
+
+    /// A worktree of `repo` with its submodule checked out.
+    fn worktree_with_checkout(repo: &Path, name: &str) -> PathBuf {
+        let wt = worktree(repo, name);
+        git(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "-q",
+                "--init",
+            ],
+        );
+        wt
+    }
+
+    /// Why `unsafe_to_inspect` refuses `wt`. Asserting the reason shows a
+    /// worktree is kept by the submodule check, not by some other failure.
+    fn refusal(wt: &Path) -> String {
+        GitCmd::default()
+            .unsafe_to_inspect(wt)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{} was not refused", wt.display()))
+    }
+
+    #[test]
+    fn clean_checked_out_submodule_on_its_remote_is_removed() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let wt = worktree_with_checkout(&r, "with-lib");
+        assert!(wt.join("vendor/lib/lib.txt").exists());
+        age(&fx, &wt, 1);
+
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["with-lib"]);
+        let report = t.run(&ctx, &found);
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(!wt.exists());
+        assert!(
+            !r.join(".git/worktrees/with-lib").exists(),
+            "admin folder must go too"
+        );
+    }
+
+    #[test]
+    fn submodule_commit_on_no_remote_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let wt = worktree_with_checkout(&r, "sub-commit");
+        // The superproject's status ignores submodules, so only the submodule
+        // check can see this commit.
+        commit(&wt.join("vendor/lib"), "local-only.txt");
+        age(&fx, &wt, 30);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(refusal(&wt).ends_with("has 1 commit(s) that are on no remote branch"));
+    }
+
+    #[test]
+    fn submodule_stash_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let wt = worktree_with_checkout(&r, "sub-stash");
+        let sub = wt.join("vendor/lib");
+        std::fs::write(sub.join("lib.txt"), "stashed edit").unwrap();
+        git(&sub, &["stash", "-q"]);
+        age(&fx, &wt, 30);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(
+            refusal(&wt).contains("on no remote branch"),
+            "{}",
+            refusal(&wt)
+        );
+    }
+
+    #[test]
+    fn dirty_or_untracked_submodule_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let dirty = worktree_with_checkout(&r, "sub-dirty");
+        std::fs::write(dirty.join("vendor/lib/lib.txt"), "changed").unwrap();
+        let untracked = worktree_with_checkout(&r, "sub-untracked");
+        std::fs::write(untracked.join("vendor/lib/notes.txt"), "mine").unwrap();
+        age(&fx, &dirty, 30);
+        age(&fx, &untracked, 30);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+        for wt in [&dirty, &untracked] {
+            assert_eq!(refusal(wt), "submodule vendor/lib has uncommitted changes");
+        }
+    }
+
+    #[test]
+    fn deinitialised_submodule_repo_with_a_local_commit_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let wt = worktree_with_checkout(&r, "sub-deinit");
+        commit(&wt.join("vendor/lib"), "local-only.txt");
+        // Deinit empties the folder but keeps the submodule's repository.
+        git(&wt, &["submodule", "deinit", "-q", "-f", "vendor/lib"]);
+        assert_eq!(std::fs::read_dir(wt.join("vendor/lib")).unwrap().count(), 0);
+        age(&fx, &wt, 30);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(refusal(&wt).ends_with("has 1 commit(s) that are on no remote branch"));
+    }
+
+    #[test]
+    fn run_refuses_when_a_submodule_gains_a_commit_after_the_scan() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let wt = worktree_with_checkout(&r, "sub-late");
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(found.len(), 1);
+        commit(&wt.join("vendor/lib"), "late.txt");
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(
+            report.failed[0].1.contains("on no remote branch"),
+            "{}",
+            report.failed[0].1
+        );
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn force_still_refuses_a_worktree_locked_after_the_scan() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let wt = worktree_with_checkout(&r, "sub-locked");
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(found.len(), 1);
+        git(&r, &["worktree", "lock", wt.to_str().unwrap()]);
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(
+            report.failed[0].1.contains("locked"),
+            "{}",
+            report.failed[0].1
+        );
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn submodule_with_submodules_of_its_own_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let inner = fx.dir.path().join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        git(&inner, &["init", "-q"]);
+        commit(&inner, "inner.txt");
+        let r = repo_with_submodule(&fx);
+        let lib = fx.dir.path().join("lib");
+        git(
+            &lib,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                inner.to_str().unwrap(),
+                "inner",
+            ],
+        );
+        git(&lib, &["commit", "-qm", "add inner"]);
+        let wt = worktree_with_checkout(&r, "sub-nested");
+        let sub = wt.join("vendor/lib");
+        git(&sub, &["fetch", "-q", "origin"]);
+        git(&sub, &["checkout", "-q", "origin/main"]);
+        assert_eq!(
+            refusal(&wt),
+            "submodule vendor/lib has submodules of its own"
+        );
+    }
+
+    #[test]
+    fn submodule_repo_with_submodules_of_its_own_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let wt = worktree_with_checkout(&r, "store-nested");
+        git(&wt, &["submodule", "deinit", "-q", "vendor/lib"]);
+        let store = r.join(".git/worktrees/store-nested/modules/vendor/lib");
+        std::fs::create_dir_all(store.join("modules/inner")).unwrap();
+        assert!(
+            refusal(&wt).ends_with("has submodules of its own"),
+            "{}",
+            refusal(&wt)
+        );
+    }
+
+    #[test]
+    fn submodule_repo_without_a_remote_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let wt = worktree_with_checkout(&r, "no-remote");
+        git(&wt.join("vendor/lib"), &["remote", "remove", "origin"]);
+        age(&fx, &wt, 30);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(
+            refusal(&wt).contains("on no remote branch"),
+            "{}",
+            refusal(&wt)
+        );
+    }
+
+    #[test]
+    fn gitlink_folder_that_is_not_its_submodule_checkout_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        // Stray files where the checkout was.
+        let stray = worktree_with_checkout(&r, "stray");
+        git(&stray, &["submodule", "deinit", "-q", "vendor/lib"]);
+        std::fs::write(stray.join("vendor/lib/notes.txt"), "mine").unwrap();
+        // A repository of its own, with a .git folder rather than a .git file.
+        let own = worktree_with_checkout(&r, "own-repo");
+        git(&own, &["submodule", "deinit", "-q", "vendor/lib"]);
+        git(&own.join("vendor/lib"), &["init", "-q"]);
+        for wt in [&stray, &own] {
+            assert_eq!(
+                refusal(wt),
+                "submodule vendor/lib is not empty and is not a submodule checkout"
+            );
+        }
+    }
+
+    #[test]
+    fn gitlink_folder_borrowing_another_submodules_repo_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let lib = fx.dir.path().join("lib");
+        git(
+            &r,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                lib.to_str().unwrap(),
+                "vendor/other",
+            ],
+        );
+        git(&r, &["commit", "-qm", "second submodule"]);
+        let wt = worktree_with_checkout(&r, "borrowed");
+        // vendor/other now points at vendor/lib's repository, whose
+        // core.worktree is vendor/lib, so status there never sees mine.txt.
+        let borrowed = std::fs::read(wt.join("vendor/lib/.git")).unwrap();
+        std::fs::write(wt.join("vendor/other/.git"), borrowed).unwrap();
+        std::fs::write(wt.join("vendor/other/mine.txt"), "mine").unwrap();
+        assert_eq!(
+            refusal(&wt),
+            "submodule vendor/other is not empty and is not a submodule checkout"
+        );
+    }
+
+    #[test]
+    fn untracked_files_hidden_by_config_still_keep_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        // Written to the shared repo config, so it applies to every worktree.
+        git(&r, &["config", "status.showUntrackedFiles", "no"]);
+        let top = worktree(&r, "hidden-top");
+        std::fs::write(top.join("notes.txt"), "mine").unwrap();
+        let sub = worktree_with_checkout(&r, "hidden-sub");
+        git(
+            &sub.join("vendor/lib"),
+            &["config", "status.showUntrackedFiles", "no"],
+        );
+        std::fs::write(sub.join("vendor/lib/notes.txt"), "mine").unwrap();
+        // Same repo config, nothing untracked: this one alone is a candidate.
+        let control = worktree(&r, "hidden-control");
+        age(&fx, &top, 30);
+        age(&fx, &sub, 30);
+        age(&fx, &control, 30);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found), vec!["hidden-control"]);
+        assert_eq!(
+            refusal(&sub),
+            "submodule vendor/lib has uncommitted changes"
+        );
+    }
+
+    #[test]
+    fn submodule_commit_only_in_the_reflog_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let wt = worktree_with_checkout(&r, "sub-reflog");
+        let sub = wt.join("vendor/lib");
+        let recorded = git(&sub, &["rev-parse", "HEAD"]);
+        // Work on the detached HEAD, then return to the recorded commit as
+        // `submodule update` would. Only the reflog still reaches the work.
+        commit(&sub, "detached-work.txt");
+        git(&sub, &["checkout", "-q", recorded.trim()]);
+        age(&fx, &wt, 30);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(
+            refusal(&wt).contains("on no remote branch"),
+            "{}",
+            refusal(&wt)
+        );
+    }
+
+    #[test]
+    fn run_refuses_a_worktree_written_to_after_the_run_started() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        std::fs::write(r.join(".gitignore"), "*.log\n").unwrap();
+        git(&r, &["add", ".gitignore"]);
+        git(&r, &["commit", "-qm", "ignore logs"]);
+        let wt = worktree(&r, "late-ignored");
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(found.len(), 1);
+        // Ignored, so status stays clean. Only the mtime check sees it.
+        std::fs::write(wt.join("build.log"), "fresh").unwrap();
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(report.failed[0].1, "changed since the run started");
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn run_refuses_a_deep_write_after_the_run_started() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        std::fs::write(r.join(".gitignore"), "*.log\n").unwrap();
+        git(&r, &["add", ".gitignore"]);
+        git(&r, &["commit", "-qm", "ignore logs"]);
+        let wt = worktree(&r, "late-deep");
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(found.len(), 1);
+        // Deeper than the scan's mtime walk reaches.
+        let deep = wt.join("a/b/c/d/e/f/g/h");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("trace.log"), "fresh").unwrap();
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(report.failed[0].1, "changed since the run started");
+    }
+
+    #[test]
+    fn run_refuses_a_write_in_a_submodule_repo_after_the_run_started() {
+        let fx = Fixture::new(&[]);
+        let r = repo_with_submodule(&fx);
+        let wt = worktree_with_checkout(&r, "late-store");
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(found.len(), 1);
+        // Outside the worktree, in the repository `--force` would delete.
+        let store = r.join(".git/worktrees/late-store/modules/vendor/lib");
+        std::fs::write(store.join("description"), "touched").unwrap();
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(report.failed[0].1, "changed since the run started");
+        assert!(wt.exists());
     }
 
     #[test]

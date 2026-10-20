@@ -31,7 +31,7 @@ const MTIME_DEPTH: usize = 6;
 const SECS_PER_DAY: u64 = 86_400;
 
 /// Written by Finder when a folder is opened. Not a sign of work.
-const FINDER_METADATA: &str = ".DS_Store";
+pub(super) const FINDER_METADATA: &str = ".DS_Store";
 
 pub struct StaleDirs {
     id: &'static str,
@@ -205,7 +205,7 @@ pub(super) fn find_pairs(
 }
 
 /// True for `SKIP_DIRS` and for any folder named in `extra`.
-fn is_skipped(path: &Path, extra: &[&str]) -> bool {
+pub(super) fn is_skipped(path: &Path, extra: &[&str]) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| SKIP_DIRS.contains(&n) || extra.contains(&n))
