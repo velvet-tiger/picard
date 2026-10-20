@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::{Local, NaiveDate, NaiveDateTime};
+use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_notification::{Action, ActionType, NotificationExt};
@@ -79,38 +79,74 @@ const FALLBACK_POLL: Duration = Duration::from_secs(5 * 60);
 
 const DAILY_STAMP_FORMAT: &str = "%Y-%m-%d";
 
-/// Reads the date of the last daily scan. A missing file means it has never
-/// run. An unreadable or malformed one is logged and treated the same way,
-/// which can at worst repeat one scan; refusing to scan would be worse.
-pub(crate) fn read_daily_stamp(path: &Path) -> Option<NaiveDate> {
+/// What `daily-scan.txt` records: the local date of the last daily scan, and
+/// the `daily_scan` time in force when it was written (`None` when off). The
+/// time lets the first config load after a start tell whether the setting
+/// changed while Picard was closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DailyStamp {
+    pub(crate) date: NaiveDate,
+    pub(crate) at: Option<NaiveTime>,
+}
+
+impl DailyStamp {
+    /// One line such as `2026-10-20 03:00`, or `2026-10-20` when the scan is off.
+    fn to_line(self) -> String {
+        let date = self.date.format(DAILY_STAMP_FORMAT);
+        match self.at {
+            Some(at) => format!("{date} {}", at.format(config::DAILY_SCAN_FORMAT)),
+            None => date.to_string(),
+        }
+    }
+
+    /// Parses `to_line`'s output. `None` for anything else.
+    fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.split_whitespace();
+        let date = NaiveDate::parse_from_str(parts.next()?, DAILY_STAMP_FORMAT).ok()?;
+        let at = match parts.next() {
+            Some(t) => Some(NaiveTime::parse_from_str(t, config::DAILY_SCAN_FORMAT).ok()?),
+            None => None,
+        };
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self { date, at })
+    }
+}
+
+/// Reads the daily-scan stamp. A missing file means the scan has never run.
+///
+/// An unreadable or malformed file is logged and treated the same way. The
+/// first config load then counts the scan as being set up now, so if its time
+/// has passed, today's scan is skipped. Skipping one scan is safer than
+/// starting a full cleanup the user did not expect.
+pub(crate) fn read_daily_stamp(path: &Path) -> Option<DailyStamp> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
             log::warn!(
-                "reading {} failed, treating the daily scan as not run: {e}",
+                "reading {} failed, treating the daily scan as never run: {e}",
                 path.display()
             );
             return None;
         }
     };
-    match NaiveDate::parse_from_str(text.trim(), DAILY_STAMP_FORMAT) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            log::warn!(
-                "{} holds {text:?}, not a date; treating the daily scan as not run: {e}",
-                path.display()
-            );
-            None
-        }
+    let stamp = DailyStamp::parse(&text);
+    if stamp.is_none() {
+        log::warn!(
+            "{} holds {text:?}, not a daily-scan stamp; treating the daily scan as never run",
+            path.display()
+        );
     }
+    stamp
 }
 
-/// Records the date of the daily scan, so a restart later that day does not repeat it.
+/// Writes the daily-scan stamp, so a restart later that day does not repeat the scan.
 ///
 /// Opened with `O_NOFOLLOW` and mode 600, so a symlink planted in its place
 /// cannot redirect the write to another file.
-pub(crate) fn write_daily_stamp(path: &Path, date: NaiveDate) -> Result<()> {
+pub(crate) fn write_daily_stamp(path: &Path, stamp: DailyStamp) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -119,8 +155,7 @@ pub(crate) fn write_daily_stamp(path: &Path, date: NaiveDate) -> Result<()> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    writeln!(file, "{}", date.format(DAILY_STAMP_FORMAT))
-        .with_context(|| format!("writing {}", path.display()))
+    writeln!(file, "{}", stamp.to_line()).with_context(|| format!("writing {}", path.display()))
 }
 
 /// How one cleanup ended, as far as the poll loop cares.
@@ -261,6 +296,8 @@ pub struct Poller<R: Runtime> {
     /// Local date of the last daily scan. Read from disk at start, then kept
     /// here, so a failed stamp write cannot make the scan repeat.
     last_daily_scan: Option<NaiveDate>,
+    /// The `daily_scan` time the stamp on disk was written with.
+    recorded_daily_time: Option<NaiveTime>,
     /// Volumes whose daily clean found the run lock busy, with the scan's
     /// date. Retried at each check that same day.
     daily_retry: Option<(NaiveDate, Vec<PathBuf>)>,
@@ -276,6 +313,7 @@ impl<R: Runtime> Poller<R> {
             config_error: false,
             states: States::new(),
             last_daily_scan: None,
+            recorded_daily_time: None,
             daily_retry: None,
         }
     }
@@ -290,7 +328,9 @@ impl<R: Runtime> Poller<R> {
         }
         // Read before the first config load, which uses it to tell a first
         // ever start from a restart.
-        self.last_daily_scan = read_daily_stamp(&self.shared.paths.daily_scan);
+        let stamp = read_daily_stamp(&self.shared.paths.daily_scan);
+        self.last_daily_scan = stamp.map(|s| s.date);
+        self.recorded_daily_time = stamp.and_then(|s| s.at);
         self.reload_config();
         loop {
             self.check().await;
@@ -326,10 +366,12 @@ impl<R: Runtime> Poller<R> {
         monitor::next_wait(poll, config.daily_scan, now, self.last_daily_scan)
     }
 
-    /// Records `date` as the day of the last daily scan, in memory and on disk.
-    fn record_daily_scan(&mut self, date: NaiveDate) {
+    /// Records `date` as the day of the last daily scan, under the `daily_scan`
+    /// time `at`, in memory and on disk.
+    fn record_daily_scan(&mut self, date: NaiveDate, at: Option<NaiveTime>) {
         self.last_daily_scan = Some(date);
-        if let Err(e) = write_daily_stamp(&self.shared.paths.daily_scan, date) {
+        self.recorded_daily_time = at;
+        if let Err(e) = write_daily_stamp(&self.shared.paths.daily_scan, DailyStamp { date, at }) {
             log::error!("could not record the daily scan; a restart today may repeat it: {e:#}");
         }
     }
@@ -351,7 +393,7 @@ impl<R: Runtime> Poller<R> {
         // Recorded before the scan runs, so a scan that fails or panics waits
         // until tomorrow instead of retrying on every poll. Off mode records it
         // too; otherwise the scan would stay due and the loop would never sleep.
-        self.record_daily_scan(now.date());
+        self.record_daily_scan(now.date(), Some(at));
         self.daily_retry = None;
         log::info!("daily scan: mode {:?}", config.mode);
         if config.mode == Mode::Off {
@@ -444,25 +486,33 @@ impl<R: Runtime> Poller<R> {
                     c.roots.len()
                 );
                 let old_mode = self.config.as_ref().map(|old| old.mode);
-                // On the first load there is no previous config. A stamp on
-                // disk means the scan was set up before this start, so it is
-                // not a change; no stamp means it is being set up now.
+                // On the first load there is no previous config, so the time
+                // in the stamp stands in for it. That catches a change made
+                // while Picard was closed. No stamp counts as being set up now.
                 let old_daily = match &self.config {
                     Some(old) => old.daily_scan,
-                    None if self.last_daily_scan.is_some() => c.daily_scan,
-                    None => None,
+                    None => self.recorded_daily_time,
                 };
+                // A retry belongs to the schedule it came from. Without this, a
+                // pending retry could start a full clean right after a save.
+                if old_daily != c.daily_scan && self.daily_retry.take().is_some() {
+                    log::info!("daily scan setting changed; dropping pending retries");
+                }
                 let last = monitor::last_scan_after_change(
                     old_daily,
                     c.daily_scan,
                     Local::now().naive_local(),
                     self.last_daily_scan,
                 );
-                if let Some(date) = last
-                    && last != self.last_daily_scan
-                {
+                if last != self.last_daily_scan {
                     log::info!("daily scan set after its time today; the first one runs tomorrow");
-                    self.record_daily_scan(date);
+                }
+                // Keeps the stamp's time in step with the config, so the next
+                // start compares against the setting actually in force.
+                if let Some(date) = last
+                    && (last != self.last_daily_scan || c.daily_scan != self.recorded_daily_time)
+                {
+                    self.record_daily_scan(date, c.daily_scan);
                 }
                 self.states = monitor::states_after_reload(
                     std::mem::take(&mut self.states),
@@ -684,16 +734,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn stamp(at: Option<(u32, u32)>) -> DailyStamp {
+        DailyStamp {
+            date: NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+            at: at.map(|(h, m)| NaiveTime::from_hms_opt(h, m, 0).unwrap()),
+        }
+    }
+
     #[test]
     fn daily_stamp_round_trips_and_tolerates_junk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daily-scan.txt");
         assert_eq!(read_daily_stamp(&path), None);
-        let date = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
-        write_daily_stamp(&path, date).unwrap();
-        assert_eq!(read_daily_stamp(&path), Some(date));
-        std::fs::write(&path, "yesterday").unwrap();
-        assert_eq!(read_daily_stamp(&path), None);
+        for s in [stamp(Some((3, 0))), stamp(None)] {
+            write_daily_stamp(&path, s).unwrap();
+            assert_eq!(read_daily_stamp(&path), Some(s));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "2026-10-20\n",
+            "an off scan writes the date alone"
+        );
+        for junk in [
+            "yesterday",
+            "2026-10-20 25:00",
+            "2026-10-20 03:00 extra",
+            "",
+        ] {
+            std::fs::write(&path, junk).unwrap();
+            assert_eq!(read_daily_stamp(&path), None, "{junk:?}");
+        }
     }
 
     #[test]
@@ -703,8 +773,7 @@ mod tests {
         std::fs::write(&target, "keep me").unwrap();
         let path = dir.path().join("daily-scan.txt");
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        let date = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
-        assert!(write_daily_stamp(&path, date).is_err());
+        assert!(write_daily_stamp(&path, stamp(Some((3, 0)))).is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
     }
 

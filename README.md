@@ -45,7 +45,7 @@ Picard normally acts only when a drive drops below its threshold. Set `daily_sca
 - **Auto**: Picard runs every task in full on each drive. It does not stop early once space is free, as a low-space cleanup does. So tasks at the end of the list, including your `command` scripts, run every day. Picard tells you how much it freed, and tells you if every removal failed. If another cleanup is running at that moment, Picard tries that drive again at the next check. If a drive is low at the scan time, it gets a low-space cleanup and then the full one, so you may see two notifications.
 - **Off**: nothing happens.
 
-If your Mac is asleep or Picard is closed at that time, the scan runs at the next check that day. That can be up to `poll_minutes` after the Mac wakes. It never runs twice in one day. If you turn the daily scan on, or change its time, after that time has passed today, the first scan runs tomorrow. Picard records the date of the last scan in `daily-scan.txt`, next to the config.
+If your Mac is asleep or Picard is closed at that time, the scan runs at the next check that day. That can be up to `poll_minutes` after the Mac wakes. It never runs twice in one day. If you turn the daily scan on, or change its time, after that time has passed today, the first scan runs tomorrow. Picard records the date of the last scan, and the time it was set for, in `daily-scan.txt` next to the config. That is how it notices a change you make to `config.toml` while it is closed.
 
 ## The menu bar icon
 
