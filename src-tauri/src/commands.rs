@@ -308,7 +308,7 @@ fn preview_view(volume: &Volume, space: DiskSpace, scans: &[TaskScan]) -> Volume
                     .map(|c| PreviewItem {
                         path: c.path.display().to_string(),
                         bytes: c.bytes,
-                        size_text: disk::format_bytes(c.bytes),
+                        size_text: c.size_text(),
                         reason: c.reason.clone(),
                     })
                     .collect(),
@@ -372,7 +372,7 @@ fn run_view(name: &str, result: Result<VolumeRun, String>) -> RunResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::{Candidate, Removed};
+    use crate::tasks::{Candidate, Estimate, Removed};
 
     fn volume() -> Volume {
         Volume {
@@ -399,13 +399,24 @@ mod tests {
                         path: PathBuf::from("/w/a/node_modules"),
                         bytes: 2_000_000_000,
                         reason: "untouched for 40 days".into(),
+                        estimate: Estimate::Exact,
                     },
                     Candidate {
                         path: PathBuf::from("/w/b/node_modules"),
                         bytes: 500_000_000,
                         reason: "untouched for 31 days".into(),
+                        estimate: Estimate::Exact,
                     },
                 ]),
+            },
+            TaskScan {
+                task: "tool_caches",
+                result: Ok(vec![Candidate {
+                    path: PathBuf::from("uv cache"),
+                    bytes: 0,
+                    reason: "runs uv cache prune".into(),
+                    estimate: Estimate::UpTo(2_600_000_000),
+                }]),
             },
             TaskScan {
                 task: "git_worktrees",
@@ -417,7 +428,8 @@ mod tests {
         assert_eq!(view.total_text, "2.5 GB");
         assert_eq!(view.free_text, "20 GB free (2%)");
         assert_eq!(view.tasks[0].items[1].size_text, "500 MB");
-        assert_eq!(view.tasks[1].error.as_deref(), Some("lsof broke"));
+        assert_eq!(view.tasks[1].items[0].size_text, "up to 2.6 GB");
+        assert_eq!(view.tasks[2].error.as_deref(), Some("lsof broke"));
     }
 
     #[test]

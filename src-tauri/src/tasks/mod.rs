@@ -34,8 +34,36 @@ use crate::volume::Volume;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub path: PathBuf,
+    /// The amount counted in totals. Zero when the task cannot know it ahead.
     pub bytes: u64,
     pub reason: String,
+    pub estimate: Estimate,
+}
+
+/// How far `Candidate::bytes` can be trusted, which decides how its size reads.
+///
+/// Only `bytes` feeds totals. `UpTo` carries a ceiling for display alone,
+/// because adding it to a total would overstate what a run frees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Estimate {
+    /// `bytes` is the measured size of what will be removed.
+    Exact,
+    /// Another program decides what to remove; it frees at most this much.
+    UpTo(u64),
+    /// Nothing about the amount is known until the task runs.
+    Unknown,
+}
+
+impl Candidate {
+    /// The size as shown in preview and the CLI: "2.0 GB", "up to 2.6 GB" or
+    /// "unknown".
+    pub fn size_text(&self) -> String {
+        match self.estimate {
+            Estimate::Exact => crate::disk::format_bytes(self.bytes),
+            Estimate::UpTo(ceiling) => format!("up to {}", crate::disk::format_bytes(ceiling)),
+            Estimate::Unknown => "unknown".to_string(),
+        }
+    }
 }
 
 /// Something a task removed.
@@ -534,11 +562,13 @@ mod tests {
                 path: fx.root.join("p/node_modules"),
                 bytes: 5,
                 reason: String::new(),
+                estimate: Estimate::Exact,
             },
             Candidate {
                 path: fx.root.join("link"),
                 bytes: 5,
                 reason: String::new(),
+                estimate: Estimate::Exact,
             },
         ];
         let report = remove_dirs(&ctx, &cands);
@@ -564,6 +594,7 @@ mod tests {
                 path: fx.root.join("p/node_modules"),
                 bytes: 1,
                 reason: String::new(),
+                estimate: Estimate::Exact,
             }],
         );
         assert!(report.halted.is_some());

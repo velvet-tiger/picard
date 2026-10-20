@@ -3,15 +3,14 @@
 //!
 //! Off unless added to the config, because it runs other programs. Each tool
 //! decides what to remove, so `scan` cannot know how much a prune will free.
-//! Preview lists each step with 0 bytes, and the reason shows the cache's
-//! current size. Counting the whole cache would overstate the estimate, since
-//! a prune keeps whatever is still in use.
+//! Preview counts each step as 0 bytes and shows the cache's current size as
+//! a ceiling ("up to 2.6 GB"). Counting the whole cache would overstate the
+//! total, since a prune keeps whatever is still in use.
 
 use anyhow::Result;
 
 use super::cache_prune::CachePrune;
-use super::{Candidate, CleanupTask, Ctx, Report};
-use crate::disk::format_bytes;
+use super::{Candidate, CleanupTask, Ctx, Estimate, Report};
 
 pub struct ToolCaches {
     prune: CachePrune,
@@ -38,11 +37,8 @@ impl CleanupTask for ToolCaches {
             .map(|((step, _), size)| Candidate {
                 path: step.label.clone().into(),
                 bytes: 0,
-                reason: format!(
-                    "runs {}; its folder uses {} now",
-                    step.command_text(),
-                    format_bytes(size)
-                ),
+                reason: format!("runs {}", step.command_text()),
+                estimate: Estimate::UpTo(size),
             })
             .collect())
     }
@@ -91,14 +87,13 @@ mod tests {
             vec![PathBuf::from("uv cache"), PathBuf::from("Homebrew cache")]
         );
         assert!(found.iter().all(|c| c.bytes == 0));
-        assert_eq!(
-            found[0].reason,
-            "runs uv cache prune; its folder uses 0 MB now"
-        );
-        assert_eq!(
-            found[1].reason,
-            "runs brew cleanup --prune=all; its folder uses 0 MB now"
-        );
+        assert_eq!(found[0].reason, "runs uv cache prune");
+        assert_eq!(found[1].reason, "runs brew cleanup --prune=all");
+        match found[0].estimate {
+            Estimate::UpTo(ceiling) => assert!(ceiling >= 40_000, "{ceiling}"),
+            other => panic!("uv cache should be a ceiling, got {other:?}"),
+        }
+        assert_eq!(found[1].estimate, Estimate::UpTo(0));
         assert!(!log.exists(), "scan must not run a prune");
     }
 

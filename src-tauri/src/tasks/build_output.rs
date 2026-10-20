@@ -16,7 +16,7 @@ use walkdir::WalkDir;
 
 use super::git::GitCmd;
 use super::stale_dirs::{find_pairs, idle_days};
-use super::{Candidate, CleanupTask, Ctx, Report, check_target, remove_dirs};
+use super::{Candidate, CleanupTask, Ctx, Estimate, Report, check_target, remove_dirs};
 
 /// How deep to search under each root for projects.
 const SEARCH_DEPTH: usize = 8;
@@ -118,6 +118,7 @@ impl CleanupTask for BuildOutput {
                 path,
                 bytes,
                 reason,
+                estimate: Estimate::Exact,
             })
             .collect())
     }

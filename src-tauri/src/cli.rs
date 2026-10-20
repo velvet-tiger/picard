@@ -177,7 +177,7 @@ fn format_scan(name: &str, space: DiskSpace, scans: &[TaskScan]) -> String {
                     out.push_str(&format!(
                         "  {:<13} {:>9}  {}  ({})\n",
                         s.task,
-                        disk::format_bytes(cand.bytes),
+                        cand.size_text(),
                         cand.path.display(),
                         cand.reason
                     ));
@@ -219,7 +219,7 @@ fn format_run(name: &str, run: &VolumeRun) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::{Candidate, Removed};
+    use crate::tasks::{Candidate, Estimate, Removed};
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
@@ -261,6 +261,16 @@ mod tests {
                     path: PathBuf::from("/w/a/node_modules"),
                     bytes: 2_000_000_000,
                     reason: "untouched for 40 days".into(),
+                    estimate: Estimate::Exact,
+                }]),
+            },
+            TaskScan {
+                task: "command",
+                result: Ok(vec![Candidate {
+                    path: PathBuf::from("command: docker"),
+                    bytes: 0,
+                    reason: "will run".into(),
+                    estimate: Estimate::Unknown,
                 }]),
             },
             TaskScan {
@@ -278,7 +288,7 @@ mod tests {
         );
         assert_eq!(
             text,
-            "Startup disk: 12 GB free (1%)\n  node_modules     2.0 GB  /w/a/node_modules  (untouched for 40 days)\n  cargo_clean: nothing to remove\n  total: 2.0 GB\n"
+            "Startup disk: 12 GB free (1%)\n  node_modules     2.0 GB  /w/a/node_modules  (untouched for 40 days)\n  command         unknown  command: docker  (will run)\n  cargo_clean: nothing to remove\n  total: 2.0 GB\n"
         );
     }
 

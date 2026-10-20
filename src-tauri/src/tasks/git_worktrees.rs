@@ -23,7 +23,7 @@ use walkdir::WalkDir;
 use super::git::{GitCmd, WorktreeEntry, parse_worktree_list};
 use super::in_use::InUse;
 use super::stale_dirs::newest_mtime;
-use super::{Candidate, CleanupTask, Ctx, Removed, Report, check_target};
+use super::{Candidate, CleanupTask, Ctx, Estimate, Removed, Report, check_target};
 
 /// Folders never descended into while looking for repos.
 const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git"];
@@ -284,6 +284,7 @@ impl CleanupTask for GitWorktrees {
                 path,
                 bytes,
                 reason,
+                estimate: Estimate::Exact,
             })
             .collect())
     }

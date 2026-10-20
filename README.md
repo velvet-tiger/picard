@@ -110,7 +110,7 @@ Every task also accepts `enabled = false`.
 
 `dirs` entries must be plain folder names. Picard refuses paths, `.git`, and names with glob characters such as `*`.
 
-Preview lists each `tool_caches` step with its cache's current size, but counts it as 0 bytes. Each tool keeps what is still in use, so Picard cannot know in advance how much a prune frees. Picard measures the space freed after the run. Docker is not part of `tool_caches`. Use a `command` task for it, as in the example above.
+Preview shows each `tool_caches` step as "up to" its cache's current size, and leaves it out of the total. Each tool keeps what is still in use, so Picard cannot know in advance how much a prune frees. Picard measures the space freed after the run. A `command` task shows "unknown" for the same reason. Docker is not part of `tool_caches`. Use a `command` task for it, as in the example above.
 
 ### Drives
 

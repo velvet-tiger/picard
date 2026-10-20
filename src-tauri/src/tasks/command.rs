@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use super::{Candidate, CleanupTask, Ctx, Removed, Report};
+use super::{Candidate, CleanupTask, Ctx, Estimate, Removed, Report};
 use crate::disk;
 use crate::proc;
 
@@ -81,6 +81,7 @@ impl CleanupTask for CommandTask {
             path: self.label(),
             bytes: 0,
             reason: "will run; space freed is known only after it runs".to_string(),
+            estimate: Estimate::Unknown,
         }])
     }
 

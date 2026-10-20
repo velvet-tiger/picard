@@ -13,7 +13,7 @@ use anyhow::Result;
 use walkdir::WalkDir;
 
 use super::cache_prune::CachePrune;
-use super::{Candidate, CleanupTask, Ctx, Report, check_target, remove_dirs};
+use super::{Candidate, CleanupTask, Ctx, Estimate, Report, check_target, remove_dirs};
 
 /// Folders never descended into while searching for projects or reading mtimes.
 /// They are build output or too large to walk usefully. `.next` is Next.js
@@ -139,6 +139,7 @@ impl CleanupTask for StaleDirs {
                 path,
                 bytes,
                 reason,
+                estimate: Estimate::Exact,
             })
             .collect())
     }
