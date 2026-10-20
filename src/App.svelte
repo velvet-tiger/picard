@@ -1,6 +1,7 @@
 <script lang="ts">
   // One window holds both views as tabs. The URL hash (#/clean or #/settings),
-  // set by src-tauri/src/windows.rs, picks the first tab. When the window is
+  // set by src-tauri/src/windows.rs, picks the first tab and then tracks the
+  // active one. When the window is
   // already open, the menu bar sends a `show-tab` event instead.
   import Preview from './lib/Preview.svelte'
   import SettingsView from './lib/Settings.svelte'
@@ -25,9 +26,12 @@
   })
   let settingsView = $state<SettingsView | undefined>()
 
+  // The hash follows the active tab so a page reload (for example the dev
+  // server's) reopens the tab the user was on, not the one the window opened on.
   function show(id: TabId) {
     active = id
     opened[id] = true
+    history.replaceState(null, '', `#/${id}`)
   }
 
   $effect(() => {
