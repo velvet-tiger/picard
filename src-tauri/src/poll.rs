@@ -79,20 +79,27 @@ const FALLBACK_POLL: Duration = Duration::from_secs(5 * 60);
 
 const DAILY_STAMP_FORMAT: &str = "%Y-%m-%d";
 
-/// What `daily-scan.txt` records: the local date of the last daily scan, and
-/// the `daily_scan` time in force when it was written (`None` when off). The
-/// time lets the first config load after a start tell whether the setting
-/// changed while Picard was closed.
+/// What `daily-scan.txt` records: the local date of the last daily scan
+/// (`None` before the first one), and the `daily_scan` time in force when it
+/// was written (`None` when off). The time lets the first config load after a
+/// start tell whether the setting changed while Picard was closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DailyStamp {
-    pub(crate) date: NaiveDate,
+    pub(crate) date: Option<NaiveDate>,
     pub(crate) at: Option<NaiveTime>,
 }
 
+/// Stands in for the date in the stamp before the first daily scan has run.
+const NO_DATE: &str = "-";
+
 impl DailyStamp {
-    /// One line such as `2026-10-20 03:00`, or `2026-10-20` when the scan is off.
+    /// One line such as `2026-10-20 03:00`, `- 03:00` before the first scan,
+    /// or `2026-10-20` when the scan is off.
     fn to_line(self) -> String {
-        let date = self.date.format(DAILY_STAMP_FORMAT);
+        let date = self.date.map_or_else(
+            || NO_DATE.to_string(),
+            |d| d.format(DAILY_STAMP_FORMAT).to_string(),
+        );
         match self.at {
             Some(at) => format!("{date} {}", at.format(config::DAILY_SCAN_FORMAT)),
             None => date.to_string(),
@@ -102,7 +109,10 @@ impl DailyStamp {
     /// Parses `to_line`'s output. `None` for anything else.
     fn parse(text: &str) -> Option<Self> {
         let mut parts = text.split_whitespace();
-        let date = NaiveDate::parse_from_str(parts.next()?, DAILY_STAMP_FORMAT).ok()?;
+        let date = match parts.next()? {
+            NO_DATE => None,
+            d => Some(NaiveDate::parse_from_str(d, DAILY_STAMP_FORMAT).ok()?),
+        };
         let at = match parts.next() {
             Some(t) => Some(NaiveTime::parse_from_str(t, config::DAILY_SCAN_FORMAT).ok()?),
             None => None,
@@ -329,7 +339,7 @@ impl<R: Runtime> Poller<R> {
         // Read before the first config load, which uses it to tell a first
         // ever start from a restart.
         let stamp = read_daily_stamp(&self.shared.paths.daily_scan);
-        self.last_daily_scan = stamp.map(|s| s.date);
+        self.last_daily_scan = stamp.and_then(|s| s.date);
         self.recorded_daily_time = stamp.and_then(|s| s.at);
         self.reload_config();
         loop {
@@ -366,10 +376,10 @@ impl<R: Runtime> Poller<R> {
         monitor::next_wait(poll, config.daily_scan, now, self.last_daily_scan)
     }
 
-    /// Records `date` as the day of the last daily scan, under the `daily_scan`
-    /// time `at`, in memory and on disk.
-    fn record_daily_scan(&mut self, date: NaiveDate, at: Option<NaiveTime>) {
-        self.last_daily_scan = Some(date);
+    /// Records `date` as the day of the last daily scan (`None` if none has
+    /// run yet), under the `daily_scan` time `at`, in memory and on disk.
+    fn record_daily_scan(&mut self, date: Option<NaiveDate>, at: Option<NaiveTime>) {
+        self.last_daily_scan = date;
         self.recorded_daily_time = at;
         if let Err(e) = write_daily_stamp(&self.shared.paths.daily_scan, DailyStamp { date, at }) {
             log::error!("could not record the daily scan; a restart today may repeat it: {e:#}");
@@ -393,7 +403,7 @@ impl<R: Runtime> Poller<R> {
         // Recorded before the scan runs, so a scan that fails or panics waits
         // until tomorrow instead of retrying on every poll. Off mode records it
         // too; otherwise the scan would stay due and the loop would never sleep.
-        self.record_daily_scan(now.date(), Some(at));
+        self.record_daily_scan(Some(now.date()), Some(at));
         self.daily_retry = None;
         log::info!("daily scan: mode {:?}", config.mode);
         if config.mode == Mode::Off {
@@ -507,12 +517,11 @@ impl<R: Runtime> Poller<R> {
                 if last != self.last_daily_scan {
                     log::info!("daily scan set after its time today; the first one runs tomorrow");
                 }
-                // Keeps the stamp's time in step with the config, so the next
-                // start compares against the setting actually in force.
-                if let Some(date) = last
-                    && (last != self.last_daily_scan || c.daily_scan != self.recorded_daily_time)
-                {
-                    self.record_daily_scan(date, c.daily_scan);
+                // Keeps the stamp's time in step with the config, even before
+                // the first scan, so the next start compares against the
+                // setting actually in force.
+                if last != self.last_daily_scan || c.daily_scan != self.recorded_daily_time {
+                    self.record_daily_scan(last, c.daily_scan);
                 }
                 self.states = monitor::states_after_reload(
                     std::mem::take(&mut self.states),
@@ -736,7 +745,7 @@ mod tests {
 
     fn stamp(at: Option<(u32, u32)>) -> DailyStamp {
         DailyStamp {
-            date: NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+            date: NaiveDate::from_ymd_opt(2026, 10, 20),
             at: at.map(|(h, m)| NaiveTime::from_hms_opt(h, m, 0).unwrap()),
         }
     }
@@ -746,20 +755,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daily-scan.txt");
         assert_eq!(read_daily_stamp(&path), None);
-        for s in [stamp(Some((3, 0))), stamp(None)] {
+        let before_first_scan = DailyStamp {
+            date: None,
+            ..stamp(Some((22, 0)))
+        };
+        for s in [stamp(Some((3, 0))), stamp(None), before_first_scan] {
             write_daily_stamp(&path, s).unwrap();
             assert_eq!(read_daily_stamp(&path), Some(s));
         }
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "2026-10-20\n",
-            "an off scan writes the date alone"
+            "- 22:00\n",
+            "the last write, a scan not yet run, has no date"
         );
         for junk in [
             "yesterday",
             "2026-10-20 25:00",
             "2026-10-20 03:00 extra",
             "",
+            "- 9pm",
         ] {
             std::fs::write(&path, junk).unwrap();
             assert_eq!(read_daily_stamp(&path), None, "{junk:?}");
