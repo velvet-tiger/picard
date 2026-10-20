@@ -380,6 +380,9 @@ mod tests {
                 "-c",
                 "init.defaultBranch=main",
             ])
+            // A commit otherwise starts a detached `git maintenance` that can
+            // add and remove files in .git while Fixture::age walks the repo.
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
