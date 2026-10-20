@@ -33,8 +33,8 @@ concurrency:
 jobs:
   # Lint and tests run third-party dev packages. They get a job of their own,
   # with no signing secrets and a read-only token, so nothing they do can
-  # reach the job that signs. It saves no caches for the same reason: the
-  # release job would restore them.
+  # reach the job that signs. Neither job uses the Actions cache: code in this
+  # job could write an entry that the release job would then restore.
   check:
     runs-on: macos-latest
     permissions:
@@ -95,15 +95,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-          cache: pnpm
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: "src-tauri -> target"
 
       - run: pnpm install --frozen-lockfile
 
