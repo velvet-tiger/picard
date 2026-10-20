@@ -47,6 +47,8 @@ pub fn run() {
             commands::get_launch_at_login,
             commands::set_launch_at_login,
             commands::pick_folder,
+            commands::get_ignored,
+            commands::set_ignored,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

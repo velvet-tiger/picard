@@ -5,6 +5,10 @@
     getLaunchAtLogin,
     setLaunchAtLogin,
     pickFolder,
+    getIgnored,
+    setIgnored,
+    notifyIgnoreChanged,
+    onIgnoreChanged,
     closeWindow,
     errorText,
     newTask,
@@ -26,6 +30,37 @@
   // WebKit sets a cleared or half-typed time field to ''. Saving that would only
   // fail with a parse error, so Save waits until a time is picked.
   const dailyTimeMissing = $derived(settings?.daily_scan === '')
+  // Edited one entry at a time and saved at once, not with Save: the Clean tab
+  // changes this list too, and Save must not write back an older copy.
+  let ignoredFolders = $state<string[]>([])
+  let ignoreError = $state<string | null>(null)
+  let removingIgnored = $state<string | null>(null)
+
+  async function loadIgnored() {
+    try {
+      ignoredFolders = await getIgnored()
+      ignoreError = null
+    } catch (e) {
+      ignoreError = errorText(e)
+    }
+  }
+
+  async function unignore(folder: string) {
+    removingIgnored = folder
+    ignoreError = null
+    try {
+      await setIgnored(folder, false)
+      // Reloads this list too, through the listener below.
+      notifyIgnoreChanged()
+    } catch (e) {
+      ignoreError = errorText(e)
+    } finally {
+      removingIgnored = null
+    }
+  }
+
+  $effect(() => onIgnoreChanged(loadIgnored))
+
   // The time to restore when the daily scan is ticked again after unticking it.
   let lastDailyTime = '03:00'
 
@@ -139,6 +174,7 @@
   }
 
   load()
+  loadIgnored()
 </script>
 
 <main>
@@ -244,6 +280,25 @@
         </div>
       {/each}
       <button onclick={() => settings!.exclude.push('')}>Add pattern</button>
+
+      <h2 class="sub">Ignored folders</h2>
+      <p class="muted">
+        Shown on the Clean tab but never cleaned. Add one with Ignore on the Clean tab. Removing
+        one here takes effect at once.
+      </p>
+      {#if ignoreError}
+        <p class="error">{ignoreError}</p>
+      {/if}
+      {#each ignoredFolders as folder (folder)}
+        <div class="row">
+          <span class="wide path">{folder}</span>
+          <button onclick={() => unignore(folder)} disabled={removingIgnored !== null}
+            >Remove</button
+          >
+        </div>
+      {:else}
+        <p class="muted">No folders are ignored.</p>
+      {/each}
     </section>
 
     <section class="panel">

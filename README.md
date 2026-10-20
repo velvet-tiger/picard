@@ -24,6 +24,7 @@ These rules always hold:
 - Git branches are never deleted. Worktrees are removed with `git worktree remove`, never with `--force`.
 - A worktree with uncommitted or untracked changes is never removed.
 - Every item is checked again just before it is removed.
+- A folder you ignore is never removed, in any mode.
 - Every removal is logged to `history.jsonl`.
 - Only one cleanup runs at a time.
 
@@ -36,6 +37,14 @@ One thing to know: removing a worktree also deletes files git ignores inside it,
 - **Off**: Picard only shows free space.
 
 Picard never switches modes by itself.
+
+### Ignoring a folder
+
+Each folder in the **Clean…** list has an **Ignore** button. An ignored folder stays in the list, greyed out and unticked, so you can find it again. No cleanup removes it, in any mode, and it is left out of the totals. Press **Unignore** to undo it.
+
+Ignored folders are saved to `ignore` in the config. **Settings…** lists them, with a **Remove** button on each. Use that list when a folder has dropped out of the **Clean…** list, for example because you worked on that project again. Ignoring matches one exact folder. Ignoring a project folder does not protect the `node_modules` inside it. To protect everything below a folder, use `exclude`, which hides matching folders from the list completely.
+
+Tool caches and custom commands have no **Ignore** button. Switch them off in **Settings…** instead.
 
 ### Daily scan
 
@@ -76,7 +85,8 @@ cooldown_minutes = 60     # wait before alerting again while still low
 mode = "ask"              # auto | ask | off
 daily_scan = "03:00"      # also scan once a day at this local time; leave out to turn off
 roots = ["~/working"]     # Picard only removes things inside these folders
-exclude = ["**/keep-*/**"] # glob patterns Picard never touches
+exclude = ["**/keep-*/**"] # glob patterns Picard never touches or lists
+ignore = ["~/working/site/node_modules"] # folders listed but never cleaned; set with Ignore
 
 [[task]]                  # tasks run in this order
 type = "git_worktrees"

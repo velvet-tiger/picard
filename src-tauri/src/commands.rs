@@ -48,6 +48,8 @@ pub struct PreviewItem {
     pub bytes: u64,
     pub size_text: String,
     pub reason: String,
+    /// In the config's `ignore` list: shown, but never removed.
+    pub ignored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -147,6 +149,47 @@ pub async fn save_settings(state: SharedState<'_>, settings: Settings) -> Result
             settings::apply(&text, &settings, &shared.home).map_err(|e| format!("{e:#}"))?;
         settings::write_private(&shared.config_path, &updated).map_err(|e| format!("{e:#}"))?;
         log::info!("settings saved to {}", shared.config_path.display());
+        Ok(())
+    })
+    .await
+}
+
+/// The `ignore` list as written in the config, for the Settings tab.
+#[tauri::command]
+pub async fn get_ignored(state: SharedState<'_>) -> Result<Vec<String>, String> {
+    let shared = Arc::clone(&state);
+    blocking(move || {
+        let text = read_config_text(&shared)?;
+        settings::ignored(&text, &shared.home).map_err(|e| format!("{e:#}"))
+    })
+    .await
+}
+
+/// Adds `path` to the `ignore` list, or takes it off. Ignoring only ever stops
+/// removals, so any absolute path is accepted, not only current candidates.
+#[tauri::command]
+pub async fn set_ignored(
+    state: SharedState<'_>,
+    path: String,
+    ignored: bool,
+) -> Result<(), String> {
+    let shared = Arc::clone(&state);
+    blocking(move || {
+        let text = read_config_text(&shared)?;
+        let updated = settings::set_ignored(&text, &path, ignored, &shared.home)
+            .map_err(|e| format!("{e:#}"))?;
+        if updated == text {
+            return Ok(());
+        }
+        settings::write_private(&shared.config_path, &updated).map_err(|e| format!("{e:#}"))?;
+        log::info!(
+            "{} {path}",
+            if ignored {
+                "ignored"
+            } else {
+                "stopped ignoring"
+            }
+        );
         Ok(())
     })
     .await
@@ -310,6 +353,7 @@ fn preview_view(volume: &Volume, space: DiskSpace, scans: &[TaskScan]) -> Volume
                         bytes: c.bytes,
                         size_text: c.size_text(),
                         reason: c.reason.clone(),
+                        ignored: s.ignored.contains(&c.path),
                     })
                     .collect(),
                 error: None,
@@ -321,7 +365,7 @@ fn preview_view(volume: &Volume, space: DiskSpace, scans: &[TaskScan]) -> Volume
             },
         })
         .collect();
-    let total_bytes = tasks.iter().flat_map(|t| &t.items).map(|i| i.bytes).sum();
+    let total_bytes = scans.iter().map(TaskScan::cleanable_bytes).sum();
     VolumePreview {
         name: volume.name.clone(),
         mount: volume.mount.display().to_string(),
@@ -390,7 +434,7 @@ mod tests {
     };
 
     #[test]
-    fn preview_groups_by_task_with_total_and_errors() {
+    fn preview_groups_by_task_with_total_and_errors_leaving_out_ignored_items() {
         let scans = vec![
             TaskScan {
                 task: "node_modules",
@@ -407,7 +451,14 @@ mod tests {
                         reason: "untouched for 31 days".into(),
                         estimate: Estimate::Exact,
                     },
+                    Candidate {
+                        path: PathBuf::from("/w/c/node_modules"),
+                        bytes: 9_000_000_000,
+                        reason: "untouched for 90 days".into(),
+                        estimate: Estimate::Exact,
+                    },
                 ]),
+                ignored: [PathBuf::from("/w/c/node_modules")].into_iter().collect(),
             },
             TaskScan {
                 task: "tool_caches",
@@ -417,10 +468,12 @@ mod tests {
                     reason: "runs uv cache prune".into(),
                     estimate: Estimate::UpTo(2_600_000_000),
                 }]),
+                ignored: Default::default(),
             },
             TaskScan {
                 task: "git_worktrees",
                 result: Err("lsof broke".into()),
+                ignored: Default::default(),
             },
         ];
         let view = preview_view(&volume(), SPACE, &scans);
@@ -428,6 +481,8 @@ mod tests {
         assert_eq!(view.total_text, "2.5 GB");
         assert_eq!(view.free_text, "20 GB free (2%)");
         assert_eq!(view.tasks[0].items[1].size_text, "500 MB");
+        assert!(!view.tasks[0].items[1].ignored);
+        assert!(view.tasks[0].items[2].ignored, "ignored items stay listed");
         assert_eq!(view.tasks[1].items[0].size_text, "up to 2.6 GB");
         assert_eq!(view.tasks[2].error.as_deref(), Some("lsof broke"));
     }

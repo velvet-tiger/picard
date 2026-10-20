@@ -24,7 +24,7 @@ use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::env::ToolEnv;
 use crate::monitor::{self, DailyAction, States};
-use crate::runner::{self, CleanRequest, LockBusy, VolumeRun};
+use crate::runner::{self, CleanRequest, LockBusy, TaskScan, VolumeRun};
 use crate::state::Shared;
 use crate::tray::{MenuView, Tray};
 use crate::volume::{self, UnavailableRoot, UuidCache, Volume};
@@ -619,14 +619,7 @@ impl<R: Runtime> Poller<R> {
         })
         .await;
         match scanned {
-            Ok(Ok(scans)) => Some(
-                scans
-                    .iter()
-                    .filter_map(|s| s.result.as_ref().ok())
-                    .flatten()
-                    .map(|c| c.bytes)
-                    .sum(),
-            ),
+            Ok(Ok(scans)) => Some(scans.iter().map(TaskScan::cleanable_bytes).sum()),
             Ok(Err(e)) => {
                 log::warn!("cleanup estimate for {name} failed: {e:#}");
                 None

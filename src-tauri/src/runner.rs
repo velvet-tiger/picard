@@ -86,20 +86,87 @@ impl RunLock {
     }
 }
 
+/// Folders the user asked Picard to leave alone (`ignore` in the config).
+///
+/// Matching is exact, never by prefix: ignoring a folder does not protect
+/// another folder inside it. A path matches when it, or the path it resolves
+/// to, equals an entry or the path that entry resolves to. So `~/w/x` still
+/// matches after macOS reports it through a symlinked parent such as `/var`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IgnoreList {
+    paths: HashSet<PathBuf>,
+}
+
+impl IgnoreList {
+    /// Builds the list from config entries. An entry that cannot be resolved,
+    /// for example because the folder is gone, still matches by its own path.
+    pub fn new(entries: &[PathBuf]) -> Self {
+        let mut paths = HashSet::new();
+        for entry in entries {
+            paths.insert(entry.clone());
+            if let Ok(canon) = entry.canonicalize() {
+                paths.insert(canon);
+            }
+        }
+        Self { paths }
+    }
+
+    pub fn contains(&self, path: &Path) -> bool {
+        if self.paths.is_empty() {
+            return false;
+        }
+        self.paths.contains(path)
+            || path
+                .canonicalize()
+                .is_ok_and(|canon| self.paths.contains(&canon))
+    }
+}
+
 /// One task's scan result, for preview.
 #[derive(Debug)]
 pub struct TaskScan {
     pub task: &'static str,
+    /// Every candidate, ignored ones included, so preview can show them.
     pub result: Result<Vec<Candidate>, String>,
+    /// The candidate paths in `result` that the user ignored. No run removes them.
+    pub ignored: HashSet<PathBuf>,
 }
 
-/// Lists what every task would remove. Changes nothing.
-pub fn preview(tasks: &[Box<dyn CleanupTask>], ctx: &Ctx) -> Vec<TaskScan> {
+impl TaskScan {
+    /// Bytes a run could free: every candidate that is not ignored.
+    pub fn cleanable_bytes(&self) -> u64 {
+        self.result.as_ref().map_or(0, |cands| {
+            cands
+                .iter()
+                .filter(|c| !self.ignored.contains(&c.path))
+                .map(|c| c.bytes)
+                .sum()
+        })
+    }
+}
+
+/// Lists what every task would remove, marking the candidates in `ignore`.
+/// Changes nothing.
+pub fn preview(tasks: &[Box<dyn CleanupTask>], ctx: &Ctx, ignore: &IgnoreList) -> Vec<TaskScan> {
     tasks
         .iter()
-        .map(|t| TaskScan {
-            task: t.id(),
-            result: t.scan(ctx).map_err(|e| format!("{e:#}")),
+        .map(|t| {
+            let result = t.scan(ctx).map_err(|e| format!("{e:#}"));
+            let ignored = result.as_ref().map_or_else(
+                |_| HashSet::new(),
+                |cands| {
+                    cands
+                        .iter()
+                        .filter(|c| ignore.contains(&c.path))
+                        .map(|c| c.path.clone())
+                        .collect()
+                },
+            );
+            TaskScan {
+                task: t.id(),
+                result,
+                ignored,
+            }
         })
         .collect()
 }
@@ -121,13 +188,15 @@ impl VolumeRun {
 
 /// Runs tasks in order until free space reaches `target_free`.
 ///
-/// `read_free` and `record` are passed in so the ordering and early-stop rules
-/// can be tested without a real disk or history file. `record` is called after
-/// each task with what it removed.
+/// Candidates in `ignore` are never removed, whatever the scope. `read_free`
+/// and `record` are passed in so the ordering and early-stop rules can be
+/// tested without a real disk or history file. `record` is called after each
+/// task with what it removed.
 pub fn run_tasks(
     tasks: &[Box<dyn CleanupTask>],
     ctx: &Ctx,
     scope: &Scope,
+    ignore: &IgnoreList,
     read_free: &dyn Fn() -> io::Result<u64>,
     record: &mut dyn FnMut(&'static str, &[Removed]),
 ) -> VolumeRun {
@@ -155,7 +224,14 @@ pub fn run_tasks(
                 continue;
             }
         };
-        let candidates = scope.filter(scanned);
+        let mut candidates = scope.filter(scanned);
+        candidates.retain(|c| {
+            let ignored = ignore.contains(&c.path);
+            if ignored {
+                log::info!("{}: skipping ignored {}", task.id(), c.path.display());
+            }
+            !ignored
+        });
         if candidates.is_empty() {
             continue;
         }
@@ -286,7 +362,7 @@ pub fn preview_volume(
     let ctx = Ctx::for_volume(volume, &exclude, SystemTime::now(), sizes)
         .with_search_roots(&config.roots);
     let tasks = tasks::from_config(&config.tasks, env, &config.tools);
-    Ok(preview(&tasks, &ctx))
+    Ok(preview(&tasks, &ctx, &IgnoreList::new(&config.ignore)))
 }
 
 /// Cleans one volume for real: takes the lock, runs the tasks and writes history.
@@ -329,7 +405,15 @@ pub fn clean_volume(
             log::error!("could not write history: {e:#}");
         }
     };
-    Ok(run_tasks(&tasks, &ctx, &scope, &read_free, &mut record))
+    let ignore = IgnoreList::new(&config.ignore);
+    Ok(run_tasks(
+        &tasks,
+        &ctx,
+        &scope,
+        &ignore,
+        &read_free,
+        &mut record,
+    ))
 }
 
 #[cfg(test)]
@@ -365,6 +449,7 @@ mod tests {
             &two_tasks(),
             &ctx,
             &Scope::UntilFree(100),
+            &IgnoreList::default(),
             &|| Ok(0),
             &mut |t, r| recorded.push((t, r.len())),
         );
@@ -388,6 +473,7 @@ mod tests {
             &two_tasks(),
             &ctx,
             &Scope::UntilFree(100),
+            &IgnoreList::default(),
             &read_free,
             &mut |_, _| {},
         );
@@ -407,6 +493,7 @@ mod tests {
             &two_tasks(),
             &fx.ctx(),
             &Scope::All,
+            &IgnoreList::default(),
             &|| Ok(u64::MAX),
             &mut |_, _| {},
         );
@@ -422,6 +509,7 @@ mod tests {
             &two_tasks(),
             &fx.ctx(),
             &Scope::UntilFree(100),
+            &IgnoreList::default(),
             &|| Err(io::Error::other("gone")),
             &mut |_, _| {},
         );
@@ -443,6 +531,7 @@ mod tests {
             &two_tasks(),
             &ctx,
             &Scope::Selected(chosen),
+            &IgnoreList::default(),
             &|| Ok(u64::MAX),
             &mut |_, _| {},
         );
@@ -458,11 +547,91 @@ mod tests {
     #[test]
     fn preview_changes_nothing() {
         let fx = fixture();
-        let scans = preview(&two_tasks(), &fx.ctx());
+        let scans = preview(&two_tasks(), &fx.ctx(), &IgnoreList::default());
         assert_eq!(scans.len(), 2);
         assert_eq!(scans[0].result.as_ref().unwrap().len(), 1);
         assert!(fx.root.join("web/node_modules").exists());
         assert!(fx.root.join("rs/target").exists());
+    }
+
+    #[test]
+    fn ignored_paths_survive_every_scope() {
+        let selected = || {
+            let fx = fixture();
+            let all: HashSet<PathBuf> = ["web/node_modules", "rs/target"]
+                .iter()
+                .map(|p| fx.root.join(p).canonicalize().unwrap())
+                .collect();
+            (fx, Scope::Selected(all))
+        };
+        let scopes: Vec<Box<dyn Fn() -> (Fixture, Scope)>> = vec![
+            Box::new(|| (fixture(), Scope::UntilFree(100))),
+            Box::new(|| (fixture(), Scope::All)),
+            Box::new(selected),
+        ];
+        for make in scopes {
+            let (fx, scope) = make();
+            // Written through the un-resolved path, as a `~/…` entry would be.
+            let ignore = IgnoreList::new(&[fx.root.join("web/node_modules")]);
+            let run = run_tasks(
+                &two_tasks(),
+                &fx.ctx(),
+                &scope,
+                &ignore,
+                &|| Ok(0),
+                &mut |_, _| {},
+            );
+            assert!(
+                fx.root.join("web/node_modules").exists(),
+                "{scope:?}: ignored folder was removed"
+            );
+            assert_eq!(run.removed.len(), 1, "{scope:?}: {run:?}");
+            assert_eq!(run.removed[0].0, "cargo_clean");
+            assert!(run.failed.is_empty(), "{scope:?}: {run:?}");
+        }
+    }
+
+    #[test]
+    fn ignoring_a_folder_does_not_protect_folders_inside_it() {
+        let fx = fixture();
+        let ignore = IgnoreList::new(&[fx.root.join("web")]);
+        let run = run_tasks(
+            &two_tasks(),
+            &fx.ctx(),
+            &Scope::All,
+            &ignore,
+            &|| Ok(0),
+            &mut |_, _| {},
+        );
+        assert_eq!(run.removed.len(), 2, "{run:?}");
+    }
+
+    #[test]
+    fn ignore_list_matches_through_symlinked_parents_and_missing_entries() {
+        let fx = fixture();
+        let real = fx.root.join("web/node_modules");
+        let link = fx.dir.path().join("link");
+        std::os::unix::fs::symlink(&fx.root, &link).unwrap();
+        let ignore = IgnoreList::new(&[link.join("web/node_modules")]);
+        assert!(ignore.contains(&real));
+        assert!(ignore.contains(&real.canonicalize().unwrap()));
+        assert!(!ignore.contains(&fx.root.join("rs/target")));
+        let gone = IgnoreList::new(&[PathBuf::from("/nowhere/at/all")]);
+        assert!(gone.contains(Path::new("/nowhere/at/all")));
+        assert!(!IgnoreList::default().contains(&real));
+    }
+
+    #[test]
+    fn preview_marks_ignored_candidates_and_leaves_them_out_of_cleanable_bytes() {
+        let fx = fixture();
+        let ignore = IgnoreList::new(&[fx.root.join("web/node_modules")]);
+        let scans = preview(&two_tasks(), &fx.ctx(), &ignore);
+        let node = &scans[0];
+        assert_eq!(node.result.as_ref().unwrap().len(), 1, "still listed");
+        assert_eq!(node.ignored.len(), 1);
+        assert_eq!(node.cleanable_bytes(), 0);
+        assert!(scans[1].ignored.is_empty());
+        assert!(scans[1].cleanable_bytes() >= 1000);
     }
 
     const LOCK_TEST: &str = "runner::tests::lock_blocks_a_second_holder_until_released";

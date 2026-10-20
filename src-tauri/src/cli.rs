@@ -180,13 +180,17 @@ fn format_scan(name: &str, space: DiskSpace, scans: &[TaskScan]) -> String {
             Ok(c) if c.is_empty() => out.push_str(&format!("  {}: nothing to remove\n", s.task)),
             Ok(c) => {
                 for cand in c {
-                    total += cand.bytes;
+                    let ignored = s.ignored.contains(&cand.path);
+                    if !ignored {
+                        total += cand.bytes;
+                    }
                     out.push_str(&format!(
-                        "  {:<13} {:>9}  {}  ({})\n",
+                        "  {:<13} {:>9}  {}  ({}){}\n",
                         s.task,
                         cand.size_text(),
                         cand.path.display(),
-                        cand.reason
+                        cand.reason,
+                        if ignored { "  [ignored]" } else { "" }
                     ));
                 }
             }
@@ -260,16 +264,25 @@ mod tests {
     }
 
     #[test]
-    fn formats_scan_with_total() {
+    fn formats_scan_with_total_leaving_out_ignored_items() {
         let scans = vec![
             TaskScan {
                 task: "node_modules",
-                result: Ok(vec![Candidate {
-                    path: PathBuf::from("/w/a/node_modules"),
-                    bytes: 2_000_000_000,
-                    reason: "untouched for 40 days".into(),
-                    estimate: Estimate::Exact,
-                }]),
+                result: Ok(vec![
+                    Candidate {
+                        path: PathBuf::from("/w/a/node_modules"),
+                        bytes: 2_000_000_000,
+                        reason: "untouched for 40 days".into(),
+                        estimate: Estimate::Exact,
+                    },
+                    Candidate {
+                        path: PathBuf::from("/w/b/node_modules"),
+                        bytes: 7_000_000_000,
+                        reason: "untouched for 50 days".into(),
+                        estimate: Estimate::Exact,
+                    },
+                ]),
+                ignored: [PathBuf::from("/w/b/node_modules")].into_iter().collect(),
             },
             TaskScan {
                 task: "command",
@@ -279,10 +292,12 @@ mod tests {
                     reason: "will run".into(),
                     estimate: Estimate::Unknown,
                 }]),
+                ignored: Default::default(),
             },
             TaskScan {
                 task: "cargo_clean",
                 result: Ok(vec![]),
+                ignored: Default::default(),
             },
         ];
         let text = format_scan(
@@ -295,7 +310,7 @@ mod tests {
         );
         assert_eq!(
             text,
-            "Startup disk: 12 GB free (1%)\n  node_modules     2.0 GB  /w/a/node_modules  (untouched for 40 days)\n  command         unknown  command: docker  (will run)\n  cargo_clean: nothing to remove\n  total: 2.0 GB\n"
+            "Startup disk: 12 GB free (1%)\n  node_modules     2.0 GB  /w/a/node_modules  (untouched for 40 days)\n  node_modules     7.0 GB  /w/b/node_modules  (untouched for 50 days)  [ignored]\n  command         unknown  command: docker  (will run)\n  cargo_clean: nothing to remove\n  total: 2.0 GB\n"
         );
     }
 

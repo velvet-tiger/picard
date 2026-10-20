@@ -116,6 +116,62 @@ pub fn apply(text: &str, settings: &Settings, home: &Path) -> Result<String> {
     Ok(out)
 }
 
+/// The `ignore` entries as written in the file, so `~/…` stays `~/…`.
+///
+/// Kept out of `Settings` on purpose: the Clean tab changes this list while
+/// the Settings tab may hold an older copy, and saving that copy must not
+/// undo those changes. Both tabs edit it one entry at a time instead.
+pub fn ignored(text: &str, home: &Path) -> Result<Vec<String>> {
+    config::parse(text, home)?;
+    let doc: DocumentMut = text.parse().context("config.toml is not valid TOML")?;
+    Ok(string_array(&doc, "ignore"))
+}
+
+/// Adds `folder` to the `ignore` list, or removes every entry naming it, and
+/// returns the new text. Running it twice with the same arguments gives the
+/// same text as running it once.
+///
+/// `folder` may be absolute or start with `~/`. An entry names it when both
+/// expand to the same path or resolve to the same folder. Fails, changing
+/// nothing, if the result would not be a valid config.
+pub fn set_ignored(text: &str, folder: &str, ignore: bool, home: &Path) -> Result<String> {
+    let target = config::expand_path(folder.trim(), home)
+        .with_context(|| format!("cannot ignore {folder:?}"))?;
+    let mut doc: DocumentMut = text.parse().context("config.toml is not valid TOML")?;
+    let current = string_array(&doc, "ignore");
+    let names_target = |entry: &str| {
+        config::expand_path(entry, home).is_ok_and(|path| same_folder(&path, &target))
+    };
+    let updated: Vec<String> = if ignore {
+        if current.iter().any(|e| names_target(e)) {
+            return Ok(text.to_string());
+        }
+        let mut list = current;
+        list.push(display_root(&target, home));
+        list
+    } else {
+        let kept: Vec<String> = current
+            .iter()
+            .filter(|e| !names_target(e))
+            .cloned()
+            .collect();
+        if kept.len() == current.len() {
+            return Ok(text.to_string());
+        }
+        kept
+    };
+    set(&mut doc, "ignore", Value::Array(strings(&updated)));
+    let out = doc.to_string();
+    config::parse(&out, home).context("the ignore list is not valid")?;
+    Ok(out)
+}
+
+/// Whether two absolute paths name the same folder, directly or once
+/// symlinks are resolved. A folder that no longer exists matches only by path.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+}
+
 /// Replaces `path` with `text` atomically: write a private temporary file next
 /// to it, flush it to disk, then rename it over the original.
 pub fn write_private(path: &Path, text: &str) -> Result<()> {
@@ -212,6 +268,7 @@ mod tests {
     use super::*;
     use crate::config::{CargoMode, DEFAULT_TOML};
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     fn home() -> &'static Path {
         Path::new("/Users/test")
@@ -308,6 +365,77 @@ mod tests {
         s.roots = vec!["~/working".into()];
         s.threshold = ThresholdSetting::Pct(150.0);
         assert!(apply(DEFAULT_TOML, &s, home()).is_err());
+    }
+
+    #[test]
+    fn set_ignored_adds_and_removes_one_entry_keeping_the_rest() {
+        let added =
+            set_ignored(DEFAULT_TOML, "/Users/test/w/a/node_modules", true, home()).unwrap();
+        assert_eq!(ignored(&added, home()).unwrap(), vec!["~/w/a/node_modules"]);
+        assert!(added.contains("# Picard config."), "{added}");
+        assert_eq!(
+            config::parse(&added, home()).unwrap().ignore,
+            vec![PathBuf::from("/Users/test/w/a/node_modules")]
+        );
+        // A top-level key added to a file with [[task]] tables must stay top level.
+        assert_eq!(config::parse(&added, home()).unwrap().tasks.len(), 5);
+
+        let two = set_ignored(&added, "/Volumes/P/x/target", true, home()).unwrap();
+        assert_eq!(
+            ignored(&two, home()).unwrap(),
+            vec!["~/w/a/node_modules", "/Volumes/P/x/target"]
+        );
+        // The `~/` form names the same folder as the absolute one.
+        let one = set_ignored(&two, "~/w/a/node_modules", false, home()).unwrap();
+        assert_eq!(ignored(&one, home()).unwrap(), vec!["/Volumes/P/x/target"]);
+    }
+
+    #[test]
+    fn set_ignored_is_idempotent() {
+        let once = set_ignored(DEFAULT_TOML, "~/w/a", true, home()).unwrap();
+        assert_eq!(
+            set_ignored(&once, "/Users/test/w/a", true, home()).unwrap(),
+            once
+        );
+        assert_eq!(
+            set_ignored(DEFAULT_TOML, "~/w/a", false, home()).unwrap(),
+            DEFAULT_TOML,
+            "removing an entry that is not there changes nothing"
+        );
+    }
+
+    #[test]
+    fn set_ignored_matches_entries_through_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("nm")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let via_link = link.join("nm").display().to_string();
+        let via_real = real.join("nm").display().to_string();
+        let text = set_ignored(DEFAULT_TOML, &via_link, true, home()).unwrap();
+        assert_eq!(set_ignored(&text, &via_real, true, home()).unwrap(), text);
+        let removed = set_ignored(&text, &via_real, false, home()).unwrap();
+        assert!(ignored(&removed, home()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_ignored_refuses_relative_paths() {
+        let err = format!(
+            "{:#}",
+            set_ignored(DEFAULT_TOML, "w/a", true, home()).unwrap_err()
+        );
+        assert!(err.contains("w/a"), "{err}");
+        assert!(set_ignored(DEFAULT_TOML, "", true, home()).is_err());
+    }
+
+    #[test]
+    fn saving_settings_leaves_the_ignore_list_alone() {
+        let text = set_ignored(DEFAULT_TOML, "~/w/a", true, home()).unwrap();
+        let mut s = read(DEFAULT_TOML, home()).unwrap();
+        s.mode = Mode::Auto;
+        let out = apply(&text, &s, home()).unwrap();
+        assert_eq!(ignored(&out, home()).unwrap(), vec!["~/w/a"]);
     }
 
     #[test]

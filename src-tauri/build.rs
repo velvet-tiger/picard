@@ -11,6 +11,8 @@ const COMMANDS: &[&str] = &[
     "get_launch_at_login",
     "set_launch_at_login",
     "pick_folder",
+    "get_ignored",
+    "set_ignored",
 ];
 
 fn main() {

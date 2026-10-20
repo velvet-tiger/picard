@@ -3,14 +3,18 @@
     preview,
     runSelected,
     getHistory,
+    setIgnored,
+    notifyIgnoreChanged,
     errorText,
     formatBytes,
     itemTitle,
     shortPath,
     tildePath,
     TASK_LABELS,
+    IGNORABLE_TASKS,
     type VolumePreview,
     type PreviewTask,
+    type PreviewItem,
     type RunResult,
     type HistoryEntry,
   } from './api'
@@ -37,6 +41,16 @@
 
   const key = (mount: string, path: string) => `${mount}\u0000${path}`
 
+  // Paths whose Ignore or Unignore request is still in flight, keyed like `checked`.
+  let toggling = $state<Record<string, boolean>>({})
+
+  /** Items that can be ticked: everything except ignored ones. */
+  const selectable = (task: PreviewTask) => task.items.filter((i) => !i.ignored)
+
+  /** What a volume could free now. Recomputed here so it follows Ignore clicks. */
+  const volumeTotal = (v: VolumePreview) =>
+    v.tasks.flatMap(selectable).reduce((sum, i) => sum + i.bytes, 0)
+
   const selectedBytes = $derived(
     volumes
       .flatMap((v) =>
@@ -52,10 +66,10 @@
     try {
       const found = await preview()
       volumes = found
-      // Everything starts ticked; one click on "Clean selected" removes it all.
+      // Everything not ignored starts ticked; one click on "Clean selected" removes it all.
       checked = Object.fromEntries(
         found.flatMap((v) =>
-          v.tasks.flatMap((t) => t.items.map((i) => [key(v.mount, i.path), true])),
+          v.tasks.flatMap((t) => t.items.map((i) => [key(v.mount, i.path), !i.ignored])),
         ),
       )
     } catch (e) {
@@ -83,7 +97,9 @@
       .map((v) => ({
         mount: v.mount,
         paths: v.tasks.flatMap((t) =>
-          t.items.filter((i) => checked[key(v.mount, i.path)]).map((i) => i.path),
+          selectable(t)
+            .filter((i) => checked[key(v.mount, i.path)])
+            .map((i) => i.path),
         ),
       }))
       .filter((s) => s.paths.length > 0)
@@ -98,17 +114,41 @@
   }
 
   function setAll(value: boolean) {
-    checked = Object.fromEntries(Object.keys(checked).map((k) => [k, value]))
+    for (const v of volumes) for (const t of v.tasks) setTask(v.mount, t, value)
   }
 
   /** How many of one task's items on one volume are ticked. */
   function taskTickedCount(mount: string, task: PreviewTask): number {
-    return task.items.filter((i) => checked[key(mount, i.path)]).length
+    return selectable(task).filter((i) => checked[key(mount, i.path)]).length
   }
 
-  /** Ticks or unticks every item of one task on one volume, leaving other tasks alone. */
+  /**
+   * Ticks or unticks every item of one task on one volume, leaving other tasks
+   * alone. Ignored items stay unticked.
+   */
   function setTask(mount: string, task: PreviewTask, value: boolean) {
-    for (const i of task.items) checked[key(mount, i.path)] = value
+    for (const i of selectable(task)) checked[key(mount, i.path)] = value
+  }
+
+  /**
+   * Ignores an item, or stops ignoring it. An ignored item is unticked; one
+   * that stops being ignored stays unticked until you tick it.
+   */
+  async function toggleIgnore(mount: string, item: PreviewItem) {
+    const k = key(mount, item.path)
+    const ignore = !item.ignored
+    toggling[k] = true
+    error = null
+    try {
+      await setIgnored(item.path, ignore)
+      item.ignored = ignore
+      checked[k] = false
+      notifyIgnoreChanged()
+    } catch (e) {
+      error = errorText(e)
+    } finally {
+      toggling[k] = false
+    }
   }
 
   scan()
@@ -173,17 +213,18 @@
           <h2>{v.name}</h2>
           <span class="muted">{v.free_text}</span>
           <span class="spacer"></span>
-          <span class="muted">up to {v.total_text}</span>
+          <span class="muted">up to {formatBytes(volumeTotal(v))}</span>
         </div>
         {#each v.tasks as t}
-          {#if !t.error && t.items.length > 0}
+          {#if !t.error && selectable(t).length > 0}
             {@const ticked = taskTickedCount(v.mount, t)}
+            {@const total = selectable(t).length}
             <h3>
               <label class="group">
                 <input
                   type="checkbox"
-                  checked={ticked === t.items.length}
-                  indeterminate={ticked > 0 && ticked < t.items.length}
+                  checked={ticked === total}
+                  indeterminate={ticked > 0 && ticked < total}
                   onchange={(e) => setTask(v.mount, t, e.currentTarget.checked)}
                 />
                 {TASK_LABELS[t.task] ?? t.task}
@@ -199,22 +240,38 @@
           {:else}
             <ul>
               {#each t.items as i}
-                <li>
+                {@const k = key(v.mount, i.path)}
+                <li class="candidate" class:ignored={i.ignored}>
                   <!-- The row already shows the path; a tooltip only helps when shortPath has elided part of it. -->
                   <label
                     class="item"
                     title={shortPath(i.path) !== tildePath(i.path) ? tildePath(i.path) : undefined}
                   >
-                    <input type="checkbox" bind:checked={checked[key(v.mount, i.path)]} />
+                    <input
+                      type="checkbox"
+                      bind:checked={checked[k]}
+                      disabled={i.ignored || cleaning}
+                    />
                     <span class="text">
                       <span class="title"
                         >{itemTitle(t.task, i.path)}
-                        <span class="muted reason">{i.reason}</span></span
+                        <span class="muted reason"
+                          >{i.ignored ? 'ignored, never cleaned' : i.reason}</span
+                        ></span
                       >
                       <span class="path muted">{shortPath(i.path)}</span>
                     </span>
                     <span class="size">{i.size_text}</span>
                   </label>
+                  {#if IGNORABLE_TASKS.includes(t.task)}
+                    <button
+                      class="ignore"
+                      onclick={() => toggleIgnore(v.mount, i)}
+                      disabled={toggling[k] || cleaning}
+                      aria-label="{i.ignored ? 'Stop ignoring' : 'Ignore'} {tildePath(i.path)}"
+                      >{i.ignored ? 'Unignore' : 'Ignore'}</button
+                    >
+                  {/if}
                 </li>
               {/each}
             </ul>
@@ -278,6 +335,25 @@
   }
   li:last-child {
     border-bottom: none;
+  }
+  /* item | Ignore button */
+  .candidate {
+    display: flex;
+    align-items: start;
+    gap: 10px;
+  }
+  .candidate .item {
+    flex: 1;
+    min-width: 0;
+  }
+  .candidate.ignored .item {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .ignore {
+    font-size: 11px;
+    padding: 1px 8px;
+    white-space: nowrap;
   }
   /* checkbox | name, reason and path | size */
   .item {

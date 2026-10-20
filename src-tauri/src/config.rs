@@ -383,6 +383,10 @@ pub struct Config {
     /// unmounted drive must still be listed so the menu can show it greyed out.
     pub roots: Vec<PathBuf>,
     pub exclude: Vec<String>,
+    /// Folders the user ignored from the Clean window, as absolute paths with
+    /// `~` expanded. Unlike `exclude`, they still show in preview, marked as
+    /// ignored, but no cleanup removes them.
+    pub ignore: Vec<PathBuf>,
     pub volumes: Vec<VolumeOverride>,
     pub tasks: Vec<TaskConfig>,
     pub tools: ToolOverrides,
@@ -418,6 +422,8 @@ struct RawConfig {
     roots: Option<Vec<String>>,
     #[serde(default)]
     exclude: Vec<String>,
+    #[serde(default)]
+    ignore: Vec<String>,
     #[serde(default)]
     volume: Vec<RawVolume>,
     #[serde(default)]
@@ -482,6 +488,12 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
             .with_context(|| format!("exclude pattern {pattern:?} is not a valid glob"))?;
     }
 
+    let ignore = raw
+        .ignore
+        .iter()
+        .map(|p| expand_path(p, home).with_context(|| format!("ignore entry {p:?}")))
+        .collect::<Result<Vec<_>>>()?;
+
     for task in &raw.task {
         validate_task(task)?;
     }
@@ -505,6 +517,7 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
             .transpose()?,
         roots,
         exclude: raw.exclude,
+        ignore,
         volumes,
         tasks: raw.task,
         tools: parse_tools(&raw.tools, home)?,
@@ -606,7 +619,8 @@ fn parse_uuid(raw: &str) -> Result<String> {
 }
 
 /// Expands a leading `~` and requires the result to be absolute.
-fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
+/// Expands a leading `~` and refuses relative paths.
+pub fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
     let path = if raw == "~" {
         home.to_path_buf()
     } else if let Some(rest) = raw.strip_prefix("~/") {
@@ -766,6 +780,31 @@ mod tests {
     fn rejects_invalid_exclude_glob() {
         let e = parse_err("min_free_gb = 1\nroots = [\"/a\"]\nexclude = [\"**/[oops\"]");
         assert!(e.contains("[oops"), "{e}");
+    }
+
+    #[test]
+    fn ignore_expands_tilde_and_defaults_to_empty() {
+        assert!(
+            parse_ok("min_free_gb = 1\nroots = [\"/a\"]")
+                .ignore
+                .is_empty()
+        );
+        let c = parse_ok(
+            "min_free_gb = 1\nroots = [\"/a\"]\nignore = [\"~/w/x/node_modules\", \"/V/y\"]",
+        );
+        assert_eq!(
+            c.ignore,
+            vec![
+                PathBuf::from("/Users/test/w/x/node_modules"),
+                PathBuf::from("/V/y")
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_relative_ignore_entries() {
+        let e = parse_err("min_free_gb = 1\nroots = [\"/a\"]\nignore = [\"w/x\"]");
+        assert!(e.contains("ignore"), "{e}");
     }
 
     #[test]

@@ -45,6 +45,8 @@ export interface PreviewItem {
   bytes: number
   size_text: string
   reason: string
+  /** In the config's `ignore` list: shown, but never removed. */
+  ignored: boolean
 }
 
 export interface PreviewTask {
@@ -90,6 +92,27 @@ export const preview = () => invoke<VolumePreview[]>('preview')
 export const runSelected = (selections: Selection[]) =>
   invoke<RunResult[]>('run_selected', { selections })
 export const getHistory = (limit: number) => invoke<HistoryEntry[]>('get_history', { limit })
+/** The config's `ignore` list as written, so `~/…` stays `~/…`. */
+export const getIgnored = () => invoke<string[]>('get_ignored')
+/** Adds a folder to the `ignore` list, or takes it off. Safe to repeat. */
+export const setIgnored = (path: string, ignored: boolean) =>
+  invoke<void>('set_ignored', { path, ignored })
+
+// The Clean and Settings tabs share one window and both edit the ignore list,
+// so each tells the other when it changes. A DOM event is enough: they run in
+// the same page.
+const IGNORE_CHANGED = 'picard:ignore-changed'
+
+export function notifyIgnoreChanged(): void {
+  window.dispatchEvent(new Event(IGNORE_CHANGED))
+}
+
+/** Calls `handler` when either tab changes the ignore list. Returns an unlisten function. */
+export function onIgnoreChanged(handler: () => void): () => void {
+  window.addEventListener(IGNORE_CHANGED, handler)
+  return () => window.removeEventListener(IGNORE_CHANGED, handler)
+}
+
 /** Opens the folder picker; resolves to `~/…` or an absolute path, or null if cancelled. */
 export const pickFolder = () => invoke<string | null>('pick_folder')
 export const getLaunchAtLogin = () => invoke<boolean>('get_launch_at_login')
@@ -182,6 +205,15 @@ export function shortPath(path: string): string {
   if (parts.length <= 7) return parts.join('/')
   return [...parts.slice(0, 2), '…', ...parts.slice(-4)].join('/')
 }
+
+/** Task types whose items are folders, and so can be ignored. */
+export const IGNORABLE_TASKS: readonly TaskType[] = [
+  'git_worktrees',
+  'node_modules',
+  'cargo_clean',
+  'python_venv',
+  'build_output',
+]
 
 /** The most telling name for a candidate: its project, or the worktree itself. */
 export function itemTitle(task: TaskType, path: string): string {

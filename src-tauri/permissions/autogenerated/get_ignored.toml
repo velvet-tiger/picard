@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-ignored"
+description = "Enables the get_ignored command without any pre-configured scope."
+commands.allow = ["get_ignored"]
+
+[[permission]]
+identifier = "deny-get-ignored"
+description = "Denies the get_ignored command without any pre-configured scope."
+commands.deny = ["get_ignored"]
