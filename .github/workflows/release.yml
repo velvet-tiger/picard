@@ -39,6 +39,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.TAG }}
+          # The release step gets its token from GH_TOKEN. Not storing it in
+          # .git/config keeps it from every other step.
+          persist-credentials: false
 
       - name: Check the tag matches the app version
         run: |
@@ -73,6 +76,11 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # Lint and tests run third-party dev packages, so they get a step of
+      # their own with no signing secrets in its environment.
+      - name: Check
+        run: make check
+
       # The secrets are passed to this step and the build step only, so later
       # steps and the actions' post steps never see them.
       - name: Choose signing mode
@@ -103,7 +111,7 @@ jobs:
       # Secrets that are not set arrive as empty strings. They are unset for
       # an ad-hoc build, because the Makefile's `?=` default for
       # APPLE_SIGNING_IDENTITY does not apply to a variable that is set but empty.
-      - name: Check and build
+      - name: Build
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -115,7 +123,7 @@ jobs:
           if [[ "$SIGNED" != "true" ]]; then
             unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
           fi
-          make dmg
+          make bundle
 
       - name: Verify the build
         run: make verify

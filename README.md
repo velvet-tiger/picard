@@ -218,6 +218,7 @@ You need Rust, Node.js, pnpm and the Xcode command-line tools.
 | `make test-all` | The tests plus one that attaches a 200 MB disk image |
 | `make scan` | Show what Picard would remove with your config |
 | `make dmg` | Run the checks, then build the release `.app` and `.dmg` |
+| `make bundle` | Build the release `.app` and `.dmg` without the checks |
 | `make verify` | Check the signature and the `.dmg` contents |
 
 Builds are ad-hoc signed, which is enough to run them on the Mac that built them. To sign with a Developer ID instead:
