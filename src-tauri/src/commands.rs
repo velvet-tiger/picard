@@ -341,8 +341,8 @@ pub async fn check_for_update<R: Runtime>(app: AppHandle<R>) -> Result<UpdateChe
 
 /// Opens one of the About tab's fixed pages in the default browser.
 #[tauri::command]
-pub fn open_link(link: Link) -> Result<(), String> {
-    about::open(link)
+pub async fn open_link(link: Link) -> Result<(), String> {
+    blocking(move || about::open(link)).await
 }
 
 /// Shows the macOS folder picker as a sheet on the calling window. Returns the

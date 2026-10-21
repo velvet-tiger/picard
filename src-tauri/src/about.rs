@@ -39,14 +39,20 @@ impl Link {
     }
 }
 
-/// Opens `link` in the user's default browser.
+/// Opens `link` in the user's default browser. `open` hands the URL to
+/// Launch Services and exits at once. Waiting for it reaps the process and
+/// reports a failure, so call it off the main thread.
 pub fn open(link: Link) -> Result<(), String> {
     let url = link.url();
-    Command::new("/usr/bin/open")
+    let status = Command::new("/usr/bin/open")
         .arg(url)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("could not open {url}: {e}"))
+        .status()
+        .map_err(|e| format!("could not open {url}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("could not open {url}: open exited with {status}"))
+    }
 }
 
 /// The running version beside the latest published release.
@@ -67,10 +73,34 @@ struct Release {
 /// Blocks for up to `CURL_TIMEOUT`, so call it off the async runtime.
 pub fn check(current: &Version) -> Result<UpdateCheck, String> {
     let mut cmd = Command::new("/usr/bin/curl");
-    cmd.args([
+    cmd.args(curl_args(current));
+    let out = crate::proc::run(cmd, CURL_TIMEOUT, RESPONSE_CAP)
+        .map_err(|e| format!("could not run curl: {e}"))?;
+    if !out.success() {
+        log::warn!("update check failed: {}", out.failure_summary(CURL_TIMEOUT));
+        return Err(curl_failure(&out.stderr, out.timed_out));
+    }
+    if out.truncated {
+        return Err("curl's output was too large to read".to_string());
+    }
+    let (status, body) = split_status(&out.stdout)?;
+    interpret(status, body, current)
+}
+
+fn curl_args(current: &Version) -> Vec<String> {
+    [
+        // Must come first: it stops curl reading ~/.curlrc, whose options
+        // could weaken TLS or change the output `split_status` parses.
+        "--disable",
         "--silent",
         "--show-error",
         "--location",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--max-redirs",
+        "3",
         "--max-time",
         CURL_MAX_TIME_SECS,
         "--header",
@@ -80,18 +110,9 @@ pub fn check(current: &Version) -> Result<UpdateCheck, String> {
         "--write-out",
         &format!("{STATUS_MARKER}%{{http_code}}"),
         LATEST_RELEASE_API,
-    ]);
-    let out = crate::proc::run(cmd, CURL_TIMEOUT, RESPONSE_CAP)
-        .map_err(|e| format!("could not run curl: {e}"))?;
-    if !out.success() {
-        log::warn!("update check failed: {}", out.failure_summary(CURL_TIMEOUT));
-        return Err(curl_failure(&out.stderr, out.timed_out));
-    }
-    if out.truncated {
-        return Err("GitHub's reply was too large to read".to_string());
-    }
-    let (status, body) = split_status(&out.stdout)?;
-    interpret(status, body, current)
+    ]
+    .map(String::from)
+    .to_vec()
 }
 
 fn curl_failure(stderr: &str, timed_out: bool) -> String {
@@ -122,8 +143,15 @@ fn split_status(stdout: &str) -> Result<(u16, &str), String> {
 fn interpret(status: u16, body: &str, current: &Version) -> Result<UpdateCheck, String> {
     match status {
         200 => {}
-        // GitHub answers 403 or 429 once an address uses up its hourly limit.
-        403 | 429 => return Err("GitHub's rate limit was reached. Try again later.".into()),
+        // 429 is always the rate limit. GitHub also uses 403 for it, but for
+        // blocked requests too, so that message does not claim to know.
+        429 => return Err("GitHub's rate limit was reached. Try again later.".into()),
+        403 => {
+            return Err(
+                "GitHub refused the request (HTTP 403). This is usually its hourly rate limit, so try again later."
+                    .into(),
+            );
+        }
         404 => return Err("GitHub has no published release of Picard".into()),
         other => return Err(format!("GitHub answered with HTTP {other}")),
     }
@@ -199,7 +227,7 @@ mod tests {
         assert!(
             interpret(403, "{}", &current)
                 .unwrap_err()
-                .contains("rate limit")
+                .starts_with("GitHub refused the request (HTTP 403)")
         );
         assert!(
             interpret(429, "{}", &current)
@@ -229,6 +257,27 @@ mod tests {
         assert_eq!(split_status(&out).unwrap(), (200, reply("v0.1.0").as_str()));
         assert!(split_status("no marker").is_err());
         assert!(split_status(&format!("{{}}{STATUS_MARKER}abc")).is_err());
+    }
+
+    #[test]
+    fn curl_ignores_curlrc_and_stays_on_https() {
+        let args = curl_args(&v("0.1.0"));
+        assert_eq!(
+            args[0], "--disable",
+            "--disable only works as the first argument"
+        );
+        let pair = |flag: &str| {
+            let i = args.iter().position(|a| a == flag).unwrap();
+            args[i + 1].clone()
+        };
+        assert_eq!(pair("--proto"), "=https");
+        assert_eq!(pair("--proto-redir"), "=https");
+        assert_eq!(pair("--user-agent"), "Picard/0.1.0");
+        assert_eq!(
+            pair("--write-out"),
+            format!("{STATUS_MARKER}%{{http_code}}")
+        );
+        assert_eq!(args.last().unwrap(), LATEST_RELEASE_API);
     }
 
     #[test]

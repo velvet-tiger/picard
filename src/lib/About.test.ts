@@ -22,6 +22,36 @@ describe('About', () => {
     expect(await screen.findByText('Version 0.1.0')).toBeInTheDocument()
   })
 
+  it('shows why the version could not be read', async () => {
+    backend({
+      'plugin:app|version': () => {
+        throw 'no package info'
+      },
+    })
+    render(About)
+    expect(
+      await screen.findByText('Could not read the version: no package info'),
+    ).toBeInTheDocument()
+  })
+
+  it('clears an earlier result while checking again', async () => {
+    const second = deferred<UpdateCheck>()
+    let calls = 0
+    backend({
+      check_for_update: () => {
+        calls += 1
+        return calls === 1 ? { current: '0.1.0', latest: '0.2.0', newer: true } : second.promise
+      },
+    })
+    render(About)
+    expect(await screen.findByText('Version 0.2.0 is available.')).toBeInTheDocument()
+    await fireEvent.click(screen.getByRole('button', { name: 'Check again' }))
+    expect(await screen.findByText(/Checking GitHub/)).toBeInTheDocument()
+    expect(screen.queryByText('Version 0.2.0 is available.')).not.toBeInTheDocument()
+    second.resolve(upToDate)
+    expect(await screen.findByText("You're on the latest version.")).toBeInTheDocument()
+  })
+
   it('says so while the check runs, then when the version is the latest', async () => {
     const reply = deferred<UpdateCheck>()
     backend({ check_for_update: () => reply.promise })

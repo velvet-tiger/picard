@@ -60,9 +60,16 @@ pub fn open_log<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     if !log.is_file() {
         return Err(format!("no log file yet at {}", log.display()));
     }
-    std::process::Command::new("/usr/bin/open")
+    let mut child = std::process::Command::new("/usr/bin/open")
         .arg(&log)
         .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("could not open {}: {e}", log.display()))
+        .map_err(|e| format!("could not open {}: {e}", log.display()))?;
+    // This runs on the tray's event thread, so the wait that reaps `open`
+    // happens elsewhere. Without it each click leaves a zombie process.
+    std::thread::spawn(move || {
+        if let Err(e) = child.wait() {
+            log::warn!("waiting for open to exit: {e}");
+        }
+    });
+    Ok(())
 }
