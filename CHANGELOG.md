@@ -4,6 +4,12 @@ All notable changes to Picard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- About tab with the running version, links to the Velvet Tiger website and GitHub issues, and a check for a newer release on GitHub.
+
 ## [0.1.0] - 2026-10-20
 
 The first release of Picard, a macOS menu bar app that watches free disk space

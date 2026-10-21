@@ -72,6 +72,12 @@ If your Mac is asleep or Picard is closed at that time, the scan runs at the nex
 
 The menu lists each drive with its free space, then **Clean…**, **Settings…** and **Open Log**.
 
+## About and updates
+
+The **About** tab in Picard's window shows the version you are running. It also links to the Velvet Tiger website and to [GitHub issues](https://github.com/velvet-tiger/picard/issues).
+
+When you open the tab, or click **Check again**, Picard asks GitHub for the latest release and says whether a newer version is out. Picard itself contacts GitHub at no other time. The request carries only Picard's version, and nothing about you or your drives. The cleanup tools Picard runs, such as Homebrew, may use the network on their own. Picard does not install updates itself.
+
 ## Install
 
 1. Build it with `make dmg`, as described under [Building](#building).

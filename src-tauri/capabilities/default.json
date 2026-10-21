@@ -18,6 +18,8 @@
     "allow-get-ignored",
     "allow-set-ignored",
     "allow-get-protection",
-    "allow-get-not-activity"
+    "allow-get-not-activity",
+    "allow-check-for-update",
+    "allow-open-link"
   ]
 }
