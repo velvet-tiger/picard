@@ -17,6 +17,9 @@ const CURL_TIMEOUT: Duration = Duration::from_secs(20);
 const CURL_MAX_TIME_SECS: &str = "15";
 /// A release body with a few assets is a few KB; anything near this is wrong.
 const RESPONSE_CAP: usize = 1024 * 1024;
+const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+/// `open` prints nothing on success and a line or two on failure.
+const OPEN_OUTPUT_CAP: usize = 4 * 1024;
 /// Separates the body from the status code that `--write-out` appends.
 const STATUS_MARKER: &str = "\nPICARD-HTTP-STATUS:";
 
@@ -41,17 +44,21 @@ impl Link {
 
 /// Opens `link` in the user's default browser. `open` hands the URL to
 /// Launch Services and exits at once. Waiting for it reaps the process and
-/// reports a failure, so call it off the main thread.
+/// reports a failure, so call it off the main thread. The time limit covers
+/// a stalled Launch Services.
 pub fn open(link: Link) -> Result<(), String> {
     let url = link.url();
-    let status = Command::new("/usr/bin/open")
-        .arg(url)
-        .status()
+    let mut cmd = Command::new("/usr/bin/open");
+    cmd.arg(url);
+    let out = crate::proc::run(cmd, OPEN_TIMEOUT, OPEN_OUTPUT_CAP)
         .map_err(|e| format!("could not open {url}: {e}"))?;
-    if status.success() {
+    if out.success() {
         Ok(())
     } else {
-        Err(format!("could not open {url}: open exited with {status}"))
+        Err(format!(
+            "could not open {url}: {}",
+            out.failure_summary(OPEN_TIMEOUT)
+        ))
     }
 }
 
