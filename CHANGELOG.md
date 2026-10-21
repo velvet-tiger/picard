@@ -9,6 +9,7 @@ All notable changes to Picard are recorded here. The format follows
 ### Added
 
 - About tab with the running version, links to the Velvet Tiger website and GitHub issues, and a check for a newer release on GitHub.
+- Appearance setting to make the window light or dark, or follow macOS (`appearance` in the config).
 
 ## [0.1.0] - 2026-10-20
 

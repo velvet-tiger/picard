@@ -23,6 +23,7 @@ min_free_gb = 30          # default threshold; or use min_free_pct = 10 instead
 recover_margin_gb = 10
 cooldown_minutes = 60
 mode = "ask"              # auto | ask | off
+# appearance = "dark"     # system (the default) | light | dark
 # daily_scan = "03:00"    # also scan once a day at this local time (24-hour)
 roots = ["~/working"]
 exclude = []
@@ -170,6 +171,17 @@ pub enum Mode {
     Ask,
     /// Monitor only.
     Off,
+}
+
+/// Whether Picard's window is light, dark, or follows macOS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    /// Follow the macOS appearance setting. The default.
+    #[default]
+    System,
+    Light,
+    Dark,
 }
 
 /// A low-space threshold, either absolute or relative to the volume size.
@@ -383,6 +395,7 @@ pub struct Config {
     /// Local time of day for the daily scan, which runs whether or not a
     /// volume is low. `None` turns it off.
     pub daily_scan: Option<NaiveTime>,
+    pub appearance: Appearance,
     /// Absolute paths, with `~` expanded. Not canonicalised: a root on an
     /// unmounted drive must still be listed so the menu can show it greyed out.
     pub roots: Vec<PathBuf>,
@@ -427,6 +440,7 @@ struct RawConfig {
     cooldown_minutes: Option<u64>,
     mode: Option<Mode>,
     daily_scan: Option<String>,
+    appearance: Option<Appearance>,
     roots: Option<Vec<String>>,
     #[serde(default)]
     exclude: Vec<String>,
@@ -534,6 +548,7 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
             .as_deref()
             .map(parse_daily_time)
             .transpose()?,
+        appearance: raw.appearance.unwrap_or_default(),
         roots,
         exclude: raw.exclude,
         ignore,
@@ -795,6 +810,34 @@ mod tests {
                 "daily_scan = {bad:?}\nmin_free_gb = 1\nroots = [\"/a\"]"
             ));
             assert!(e.contains("daily_scan"), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn appearance_follows_macos_unless_set() {
+        assert_eq!(parse_ok(DEFAULT_TOML).appearance, Appearance::System);
+        for (raw, want) in [
+            ("system", Appearance::System),
+            ("light", Appearance::Light),
+            ("dark", Appearance::Dark),
+        ] {
+            let c = parse_ok(&format!(
+                "appearance = {raw:?}\nmin_free_gb = 1\nroots = [\"/a\"]"
+            ));
+            assert_eq!(c.appearance, want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_appearance() {
+        for bad in ["Dark", "auto", ""] {
+            let e = parse_err(&format!(
+                "appearance = {bad:?}\nmin_free_gb = 1\nroots = [\"/a\"]"
+            ));
+            assert!(
+                e.contains("appearance") && e.contains("unknown variant"),
+                "{bad:?}: {e}"
+            );
         }
     }
 

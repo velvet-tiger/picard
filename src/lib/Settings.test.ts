@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import { mockWindows } from '@tauri-apps/api/mocks'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import SettingsView from './Settings.svelte'
 import { BUILT_IN_TASKS, TASK_LABELS, type Settings } from './api'
 import { fakeBackend, type Handler } from './fake-backend'
@@ -13,6 +13,7 @@ function config(): Settings {
     cooldown_minutes: 60,
     mode: 'ask',
     daily_scan: '05:30',
+    appearance: 'system',
     roots: ['~/working'],
     exclude: [],
     // The backend fills in the defaults when the file has no list.
@@ -51,6 +52,10 @@ const dailyBox = () => screen.getByRole('checkbox', { name: /Also scan once a da
 const timeInput = () => document.querySelector<HTMLInputElement>('input[type="time"]')
 
 describe('Settings', () => {
+  afterEach(() => {
+    delete document.documentElement.dataset.theme
+  })
+
   it('shows the load error', async () => {
     backend({
       get_settings: () => {
@@ -333,6 +338,38 @@ describe('Settings', () => {
         },
       ]),
     )
+  })
+
+  it('saves the chosen appearance and applies it only once saved', async () => {
+    const { sent } = backend()
+    await renderLoaded()
+    const root = document.documentElement
+
+    await fireEvent.click(screen.getByRole('radio', { name: /Dark/ }))
+    expect(root.hasAttribute('data-theme')).toBe(false)
+    await fireEvent.click(saveButton())
+
+    await screen.findByText('Saved. Picard has reloaded the settings.')
+    expect(sent('save_settings')).toEqual([
+      { settings: expect.objectContaining({ appearance: 'dark' }) },
+    ])
+    expect(root.dataset.theme).toBe('dark')
+  })
+
+  it('keeps the old appearance when the save fails', async () => {
+    backend({
+      save_settings: () => {
+        throw 'disk full'
+      },
+    })
+    await renderLoaded()
+    document.documentElement.dataset.theme = 'dark'
+
+    await fireEvent.click(screen.getByRole('radio', { name: /Light/ }))
+    await fireEvent.click(saveButton())
+
+    expect(await screen.findByText('disk full')).toBeInTheDocument()
+    expect(document.documentElement.dataset.theme).toBe('dark')
   })
 
   it('turns on Open at login', async () => {

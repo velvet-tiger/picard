@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Value};
 
-use crate::config::{self, Mode, TaskConfig, Threshold};
+use crate::config::{self, Appearance, Mode, TaskConfig, Threshold};
 
 const BYTES_PER_GB: f64 = 1_000_000_000.0;
 
@@ -28,6 +28,7 @@ pub struct Settings {
     pub mode: Mode,
     /// Daily scan time as `HH:MM`, or `None` when the daily scan is off.
     pub daily_scan: Option<String>,
+    pub appearance: Appearance,
     /// As written in the file, so `~/working` stays `~/working`.
     pub roots: Vec<String>,
     pub exclude: Vec<String>,
@@ -61,6 +62,7 @@ pub fn read(text: &str, home: &Path) -> Result<Settings> {
         daily_scan: cfg
             .daily_scan
             .map(|t| t.format(config::DAILY_SCAN_FORMAT).to_string()),
+        appearance: cfg.appearance,
         roots,
         exclude: cfg.exclude,
         activity_ignore: cfg.activity_ignore,
@@ -105,6 +107,13 @@ pub fn apply(text: &str, settings: &Settings, home: &Path) -> Result<String> {
         Some(at) => set(&mut doc, "daily_scan", Value::from(at.as_str())),
         None => {
             doc.remove("daily_scan");
+        }
+    }
+    // System is the default, so it is written by leaving the key out.
+    match appearance_name(settings.appearance) {
+        Some(name) => set(&mut doc, "appearance", Value::from(name)),
+        None => {
+            doc.remove("appearance");
         }
     }
     set(&mut doc, "roots", Value::Array(strings(&settings.roots)));
@@ -275,6 +284,15 @@ fn mode_name(mode: Mode) -> &'static str {
     }
 }
 
+/// The value written for `appearance`, or `None` for the default.
+fn appearance_name(appearance: Appearance) -> Option<&'static str> {
+    match appearance {
+        Appearance::System => None,
+        Appearance::Light => Some("light"),
+        Appearance::Dark => Some("dark"),
+    }
+}
+
 fn to_i64(n: u64) -> Result<i64> {
     i64::try_from(n).with_context(|| format!("{n} is too large"))
 }
@@ -370,6 +388,31 @@ mod tests {
         s.daily_scan = Some("".into());
         let err = format!("{:#}", apply(DEFAULT_TOML, &s, home()).unwrap_err());
         assert!(err.contains("daily_scan"), "{err}");
+    }
+
+    #[test]
+    fn appearance_is_written_and_removed_for_system() {
+        let key = |text: &str| text.lines().any(|l| l.starts_with("appearance"));
+        let mut s = read(DEFAULT_TOML, home()).unwrap();
+        assert_eq!(s.appearance, Appearance::System);
+        assert!(!key(&apply(DEFAULT_TOML, &s, home()).unwrap()));
+
+        s.appearance = Appearance::Dark;
+        let dark = apply(DEFAULT_TOML, &s, home()).unwrap();
+        assert!(dark.contains("\nappearance = \"dark\""), "{dark}");
+        assert_eq!(read(&dark, home()).unwrap().appearance, Appearance::Dark);
+
+        s.appearance = Appearance::Light;
+        let light = apply(&dark, &s, home()).unwrap();
+        assert_eq!(read(&light, home()).unwrap().appearance, Appearance::Light);
+
+        s.appearance = Appearance::System;
+        let system = apply(&light, &s, home()).unwrap();
+        assert!(!key(&system), "{system}");
+        assert_eq!(
+            read(&system, home()).unwrap().appearance,
+            Appearance::System
+        );
     }
 
     #[test]

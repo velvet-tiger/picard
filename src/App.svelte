@@ -6,7 +6,7 @@
   import Preview from './lib/Preview.svelte'
   import SettingsView from './lib/Settings.svelte'
   import About from './lib/About.svelte'
-  import { closeWindow, onShowTab } from './lib/api'
+  import { applyAppearance, closeWindow, getAppearance, onShowTab } from './lib/api'
 
   const TABS = [
     { id: 'clean', label: 'Clean' },
@@ -36,6 +36,12 @@
     opened[id] = true
     history.replaceState(null, '', `#/${id}`)
   }
+
+  // Until this answers, the page follows macOS, which is also the fallback when
+  // the config cannot be read. The Settings tab applies later changes on Save.
+  getAppearance()
+    .then(applyAppearance)
+    .catch((err) => console.error('get appearance', err))
 
   $effect(() => {
     const unlisten = onShowTab((id) => {

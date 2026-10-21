@@ -96,6 +96,7 @@ recover_margin_gb = 10    # stop cleaning once threshold + margin is free
 cooldown_minutes = 60     # wait before alerting again while still low
 mode = "ask"              # auto | ask | off
 daily_scan = "03:00"      # also scan once a day at this local time; leave out to turn off
+appearance = "dark"       # system | light | dark; leave out to follow macOS
 roots = ["~/working"]     # Picard only removes things inside these folders
 exclude = ["**/keep-*/**"] # glob patterns Picard never touches or lists
 ignore = ["~/working/site/node_modules"] # folders listed but never cleaned; set with Ignore
@@ -143,6 +144,8 @@ enabled = false
 Every task also accepts `enabled = false`.
 
 `dirs` entries must be plain folder names. Picard refuses paths, `.git`, and names with glob characters such as `*`.
+
+`appearance` sets the Picard window to light or dark. Left out, the window follows the macOS setting. Saving **System** in Settings takes the key out of the config. A change from Settings applies when you press **Save**. A change made by editing the file applies the next time the window opens.
 
 Preview shows each `tool_caches` step as "up to" its cache's current size, and leaves it out of the total. Each tool keeps what is still in use, so Picard cannot know in advance how much a prune frees. Picard measures the space freed after the run. A `command` task shows "unknown" for the same reason. Docker is not part of `tool_caches`. Use a `command` task for it, as in the example above.
 

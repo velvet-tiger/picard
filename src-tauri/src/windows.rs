@@ -4,7 +4,12 @@
 //! holds no webview while it sits in the menu bar. The URL hash picks the first
 //! tab; an open window is told to switch tabs with the `show-tab` event.
 
-use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
+use std::sync::Arc;
+
+use tauri::{AppHandle, Emitter, Manager, Runtime, Theme, WebviewUrl, WebviewWindowBuilder};
+
+use crate::config::{self, Appearance};
+use crate::state::Shared;
 
 /// Must match the window label granted in capabilities/default.json.
 const WINDOW_LABEL: &str = "main";
@@ -43,9 +48,56 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, tab: Tab) -> tauri::Result<()> {
         .min_inner_size(480.0, 400.0)
         .center()
         .build()?;
+    // The config read can block (a stalled network mount, say), and this runs
+    // on the event thread, so the title bar catches up once the read is done.
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let appearance = configured_appearance(&handle);
+        if appearance != Appearance::System
+            && let Err(e) = set_appearance(&handle, appearance)
+        {
+            log::warn!("could not apply the appearance to the title bar: {e}");
+        }
+    });
     // A menu bar app is never the active app, so the new window would open
     // behind whatever the user is working in without an explicit focus.
     window.set_focus()
+}
+
+/// The native theme for `appearance`. `None` lets macOS decide.
+pub fn theme(appearance: Appearance) -> Option<Theme> {
+    match appearance {
+        Appearance::System => None,
+        Appearance::Light => Some(Theme::Light),
+        Appearance::Dark => Some(Theme::Dark),
+    }
+}
+
+/// Applies `appearance` to the title bar of the open window, if there is one.
+pub fn set_appearance<R: Runtime>(app: &AppHandle<R>, appearance: Appearance) -> tauri::Result<()> {
+    match app.get_webview_window(WINDOW_LABEL) {
+        Some(window) => window.set_theme(theme(appearance)),
+        None => Ok(()),
+    }
+}
+
+/// The appearance the config asks for.
+///
+/// The window must still work when the config cannot be read, because the
+/// window is where the user fixes it. So a bad config gives the macOS
+/// appearance, and the reason goes to the log.
+fn configured_appearance<R: Runtime>(app: &AppHandle<R>) -> Appearance {
+    let Some(shared) = app.try_state::<Arc<Shared>>() else {
+        log::warn!("window opens with the macOS appearance: Picard is still starting");
+        return Appearance::System;
+    };
+    match config::load(&shared.config_path, &shared.home) {
+        Ok(cfg) => cfg.appearance,
+        Err(e) => {
+            log::warn!("window opens with the macOS appearance: {e:#}");
+            Appearance::System
+        }
+    }
 }
 
 /// Opens Picard's log file in the user's default viewer for `.log` files.
@@ -72,4 +124,16 @@ pub fn open_log<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_forces_light_or_dark_and_leaves_system_to_macos() {
+        assert_eq!(theme(Appearance::System), None);
+        assert_eq!(theme(Appearance::Light), Some(Theme::Light));
+        assert_eq!(theme(Appearance::Dark), Some(Theme::Dark));
+    }
 }
