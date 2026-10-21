@@ -70,6 +70,20 @@ const box = (title: string) =>
  */
 const settle = () => new Promise((r) => setTimeout(r, 0))
 
+/** The totals line, matched on its whole text; `start` is everything before the date. */
+function findTotal(start: string) {
+  const since = new Date('2026-09-03T08:30:00Z').toLocaleDateString(undefined, {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  })
+  return screen.findByText(
+    (_, el) =>
+      el?.tagName === 'P' &&
+      el.textContent?.replace(/\s+/g, ' ').trim() === `${start} since ${since}.`,
+  )
+}
+
 async function renderScanned() {
   render(Preview)
   await screen.findByText('Macintosh HD')
@@ -128,19 +142,7 @@ describe('Preview', () => {
     })
     await renderScanned()
 
-    const since = new Date('2026-09-03T08:30:00Z').toLocaleDateString(undefined, {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-    })
-    expect(
-      await screen.findByText(
-        (_, el) =>
-          el?.tagName === 'P' &&
-          el.textContent?.replace(/\s+/g, ' ').trim() ===
-            `Picard has freed 42 GB in total, 318 items since ${since}.`,
-      ),
-    ).toBeInTheDocument()
+    expect(await findTotal('Picard has freed 42 GB across 318 items')).toBeInTheDocument()
   })
 
   it('hides the total until something has been removed', async () => {
@@ -176,13 +178,11 @@ describe('Preview', () => {
       },
     })
     await renderScanned()
-    expect(await screen.findByText('1.0 GB')).toBeInTheDocument()
-    expect(screen.getByText(/1\s+item\s+since/)).toBeInTheDocument()
+    expect(await findTotal('Picard has freed 1.0 GB across 1 item')).toBeInTheDocument()
 
     await fireEvent.click(screen.getByRole('button', { name: 'Clean selected' }))
 
-    expect(await screen.findByText('4.5 GB')).toBeInTheDocument()
-    expect(screen.getByText(/4\s+items\s+since/)).toBeInTheDocument()
+    expect(await findTotal('Picard has freed 4.5 GB across 4 items')).toBeInTheDocument()
   })
 
   it('unticks only one task when its group box is unticked', async () => {

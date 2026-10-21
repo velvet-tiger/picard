@@ -40,7 +40,7 @@ One thing to know: removing a worktree also deletes files git ignores inside it,
 
 Picard never switches modes by itself.
 
-The **Clean…** page shows how much Picard has freed in total, across every drive and mode, and since when. It adds up `history.jsonl`, so deleting that file starts the total again from zero.
+The **Clean…** page shows how much Picard has freed, and how many items, across every drive and mode since the first removal. It adds up `history.jsonl`, so deleting that file starts the total again from zero.
 
 ### Ignoring a folder
 

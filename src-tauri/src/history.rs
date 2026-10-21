@@ -5,7 +5,7 @@
 //! what was already removed.
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -62,16 +62,26 @@ pub fn read_recent(log_path: &Path, limit: usize) -> Result<Vec<Entry>> {
 
 /// Adds up the whole log. It is the only record of what was removed, so the
 /// total always agrees with it, and starts again from zero if it is deleted.
-/// Missing and unreadable lines are treated as in `read_recent`.
+/// Missing and unreadable lines are treated as in `read_recent`. The log is
+/// never rotated, so it is read a line at a time to keep memory flat.
 pub fn read_totals(log_path: &Path) -> Result<Totals> {
-    let text = read_log(log_path)?;
-    Ok(
-        parse_lines(text.lines()).fold(Totals::default(), |t, e| Totals {
-            bytes: t.bytes.saturating_add(e.bytes),
-            items: t.items + 1,
-            since: Some(t.since.map_or(e.time, |s| s.min(e.time))),
-        }),
-    )
+    let file = match std::fs::File::open(log_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Totals::default()),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", log_path.display())),
+    };
+    let mut totals = Totals::default();
+    for line in BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("reading {}", log_path.display()))?;
+        for e in parse_lines(std::iter::once(line.as_str())) {
+            totals = Totals {
+                bytes: totals.bytes.saturating_add(e.bytes),
+                items: totals.items.saturating_add(1),
+                since: Some(totals.since.map_or(e.time, |s| s.min(e.time))),
+            };
+        }
+    }
+    Ok(totals)
 }
 
 /// The log's text, or an empty string if nothing has been removed yet.

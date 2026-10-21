@@ -237,7 +237,7 @@
 
   {#if totals && totals.items > 0 && totals.since}
     <p class="totals">
-      Picard has freed <strong>{formatBytes(totals.bytes)}</strong> in total, {totals.items}
+      Picard has freed <strong>{formatBytes(totals.bytes)}</strong> across {totals.items}
       {totals.items === 1 ? 'item' : 'items'} since {sinceText(totals.since)}.
     </p>
   {/if}
