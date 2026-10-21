@@ -14,6 +14,7 @@ function config(): Settings {
     mode: 'ask',
     daily_scan: '05:30',
     appearance: 'system',
+    auto_update: true,
     roots: ['~/working'],
     exclude: [],
     // The backend fills in the defaults when the file has no list.
@@ -354,6 +355,21 @@ describe('Settings', () => {
       { settings: expect.objectContaining({ appearance: 'dark' }) },
     ])
     expect(root.dataset.theme).toBe('dark')
+  })
+
+  it('saves the automatic updates choice', async () => {
+    const { sent } = backend()
+    await renderLoaded()
+    const box = screen.getByRole('checkbox', { name: 'Check for updates daily and install them' })
+    expect(box).toBeChecked()
+
+    await fireEvent.click(box)
+    await fireEvent.click(saveButton())
+
+    await screen.findByText('Saved. Picard has reloaded the settings.')
+    expect(sent('save_settings')).toEqual([
+      { settings: expect.objectContaining({ auto_update: false }) },
+    ])
   })
 
   it('keeps the old appearance when the save fails', async () => {

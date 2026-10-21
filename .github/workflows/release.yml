@@ -1,6 +1,6 @@
-# Builds Picard for Apple Silicon, attaches the .dmg to a GitHub release and
-# publishes it with the version's CHANGELOG.md section as its notes. Push a
-# tag such as v0.1.0, or run it by hand from the Actions tab.
+# Builds Picard for Apple Silicon, attaches the .dmg and the update files to
+# a GitHub release and publishes it with the version's CHANGELOG.md section as
+# its notes. Push a tag such as v0.1.0, or run it by hand from the Actions tab.
 #
 # Signing is optional. With all of these repository secrets set, the app is
 # signed with a Developer ID and notarised by the Tauri CLI:
@@ -12,6 +12,15 @@
 #   APPLE_TEAM_ID               ten-character team ID
 # Without them the build is ad-hoc signed, and the release notes explain how
 # to open it.
+#
+# Installed copies of Picard update themselves from this release. That needs
+# a second key, which is never optional because it is the only thing that
+# lets an installed copy trust an update:
+#   TAURI_SIGNING_PRIVATE_KEY           contents of the key made by `pnpm tauri signer generate`
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password (leave unset if it has none)
+# The matching public key is in src-tauri/tauri.conf.json. The release gets
+# the update archive and a latest.json that points at it. Only the sign job
+# sees the key.
 
 name: Release
 
@@ -75,9 +84,27 @@ jobs:
 
       - run: make check
 
+  # Fails early, before the long build, if the update key is missing. It is a
+  # job of its own with no checkout and no packages, so nothing but this step
+  # runs next to the key before the sign job.
+  preflight:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check the update signing key is set
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "::error::The TAURI_SIGNING_PRIVATE_KEY secret is not set. Installed copies could not update to this release."
+            exit 1
+          fi
+
   macos:
-    needs: check
+    needs: [check, preflight]
     runs-on: macos-latest
+    permissions:
+      contents: read
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
@@ -86,8 +113,7 @@ jobs:
           ref: refs/tags/${{ env.TAG }}
           # Full history, so the next step can see whether main holds the tag.
           fetch-depth: 0
-          # The release step gets its token from GH_TOKEN. Not storing it in
-          # .git/config keeps it from every other step.
+          # Not storing the token in .git/config keeps it from every step.
           persist-credentials: false
 
       # This catches a tag pushed on the wrong commit by mistake. It cannot
@@ -189,6 +215,7 @@ jobs:
             echo "::error::CHANGELOG.md has no \"## [$VERSION]\" section, or the section is empty. Fill it in before tagging."
             exit 1
           fi
+          printf '%s\n' "$changes" > "$RUNNER_TEMP/changes.md"
           {
             echo "Open the .dmg and drag Picard to Applications."
             if [[ "$SIGNED" != "true" ]]; then
@@ -230,22 +257,182 @@ jobs:
             xcrun stapler validate src-tauri/target/release/bundle/macos/Picard.app
           fi
 
-      # The release stays a draft until the .dmg is uploaded, so nobody sees it
-      # without its file. A failed run can be re-run while it is still a draft.
+      # The update archive is made here, but signed in a job of its own. Build
+      # scripts in npm and Cargo packages run in this job, and anything they
+      # write to the environment or to node_modules would run in a later step
+      # of the same job, next to the key. COPYFILE_DISABLE and --no-xattrs keep
+      # tar from adding AppleDouble files. The extraction proves the archive
+      # holds a runnable app before anything is signed.
+      - name: Make the update archive
+        run: |
+          out="$RUNNER_TEMP/release"
+          mkdir -p "$out"
+          archive="$out/Picard_${VERSION}_aarch64.app.tar.gz"
+          COPYFILE_DISABLE=1 tar --no-xattrs --no-acls -czf "$archive" \
+            -C src-tauri/target/release/bundle/macos Picard.app
+          check="$RUNNER_TEMP/extracted"
+          mkdir -p "$check"
+          tar -xzf "$archive" -C "$check"
+          test -x "$check/Picard.app/Contents/MacOS/picard"
+          cp "src-tauri/target/release/bundle/dmg/Picard_${VERSION}_aarch64.dmg" "$out/"
+          cp "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/changes.md" "$out/"
+          ls -l "$out"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job that holds the update key. It runs the signer and nothing
+  # else from the build: a fresh checkout, packages installed without their
+  # scripts, and the archive from the job above.
+  sign:
+    needs: macos
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: ${{ runner.temp }}/release
+
+      # The signature names the version, which the app requires.
+      - name: Sign the update archive
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          VERSION="${TAG#v}"
+          pnpm tauri signer sign --app-version "$VERSION" \
+            "$RUNNER_TEMP/release/Picard_${VERSION}_aarch64.app.tar.gz"
+
+      # A key that does not match the public key in the app would publish a
+      # release that every installed copy rejects, and the next release could
+      # not fix that for them. This compares the key IDs, not the signature
+      # itself, which is enough to catch a wrong key. It also checks that the
+      # signature names exactly this version.
+      - name: Check the update signature matches the app
+        run: |
+          VERSION="${TAG#v}"
+          keyid() { base64 -d <<<"$1" | sed -n 2p | base64 -d | head -c 10 | tail -c 8 | xxd -p; }
+          pub=$(node -p 'require("./src-tauri/tauri.conf.json").plugins.updater.pubkey')
+          sig=$(cat "$RUNNER_TEMP/release/Picard_${VERSION}_aarch64.app.tar.gz.sig")
+          pub_id=$(keyid "$pub")
+          sig_id=$(keyid "$sig")
+          # An empty or short ID would make two failed decodes look equal.
+          if [[ ! "$pub_id" =~ ^[0-9a-f]{16}$ || ! "$sig_id" =~ ^[0-9a-f]{16}$ ]]; then
+            echo "::error::Could not read the key IDs (public key: '$pub_id', signature: '$sig_id')."
+            exit 1
+          fi
+          if [[ "$pub_id" != "$sig_id" ]]; then
+            echo "::error::The update archive was signed with a different key than the public key in tauri.conf.json."
+            exit 1
+          fi
+          if ! base64 -d <<<"$sig" | sed -n 3p | tr '\t' '\n' | grep -Fxq "version:$VERSION"; then
+            echo "::error::The update signature is not bound to version $VERSION."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: update-signature
+          path: ${{ runner.temp }}/release/*.sig
+          if-no-files-found: error
+          retention-days: 7
+
+  # Holds no signing keys. It writes the manifest from the signature and
+  # publishes the release.
+  publish:
+    needs: [macos, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: ${{ runner.temp }}/release
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: update-signature
+          path: ${{ runner.temp }}/release
+
+      # Checked again here because the build took a while since the first check.
+      - name: Refuse to replace a published release
+        run: |
+          if is_draft=$(gh release view "$TAG" --json isDraft -q .isDraft 2>&1); then
+            if [[ "$is_draft" != "true" ]]; then
+              echo "::error::Release $TAG is already published. Delete it on GitHub first to build it again."
+              exit 1
+            fi
+          elif [[ "$is_draft" != *"release not found"* ]]; then
+            echo "::error::Could not look up release $TAG: $is_draft"
+            exit 1
+          fi
+
+      # Installed copies read this file, from the release marked latest, to
+      # learn the newest version. They check the archive against the public key
+      # in the app, so this file holds no secret.
+      - name: Write the update manifest
+        run: |
+          VERSION="${TAG#v}"
+          dir="$RUNNER_TEMP/release"
+          archive="Picard_${VERSION}_aarch64.app.tar.gz"
+          jq -n \
+            --arg version "$VERSION" \
+            --rawfile notes "$dir/changes.md" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --rawfile signature "$dir/$archive.sig" \
+            --arg url "https://github.com/$GH_REPO/releases/download/$TAG/$archive" \
+            '{version: $version, notes: $notes, pub_date: $date,
+              platforms: {"darwin-aarch64": {signature: ($signature | rtrimstr("\n")), url: $url}}}' \
+            > "$dir/latest.json"
+          jq . "$dir/latest.json"
+
+      # The release stays a draft until every file is uploaded, so nobody sees
+      # it without them. A failed run can be re-run while it is still a draft.
       # A pre-release, or a release older than the latest, does not become
       # the latest release.
-      - name: Upload the .dmg and publish the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - name: Upload the files and publish the release
         run: |
-          dmg="src-tauri/target/release/bundle/dmg/Picard_${VERSION}_aarch64.dmg"
-          test -f "$dmg"
+          VERSION="${TAG#v}"
+          dir="$RUNNER_TEMP/release"
+          files=(
+            "$dir/Picard_${VERSION}_aarch64.dmg"
+            "$dir/Picard_${VERSION}_aarch64.app.tar.gz"
+            "$dir/latest.json"
+          )
+          for f in "${files[@]}"; do test -f "$f"; done
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$dmg" --clobber
+            gh release upload "$TAG" "${files[@]}" --clobber
           else
-            gh release create "$TAG" "$dmg" --draft --verify-tag \
-              --title "Picard $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+            gh release create "$TAG" "${files[@]}" --draft --verify-tag \
+              --title "Picard $VERSION" --notes-file "$dir/notes.md"
           fi
           if [[ "$VERSION" == *-* ]]; then
             flags=(--prerelease --latest=false)
@@ -260,4 +447,4 @@ jobs:
             fi
           fi
           gh release edit "$TAG" --title "Picard $VERSION" \
-            --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}" --draft=false
+            --notes-file "$dir/notes.md" "${flags[@]}" --draft=false

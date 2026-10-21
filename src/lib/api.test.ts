@@ -231,6 +231,7 @@ describe('backend commands', () => {
       mode: 'ask',
       daily_scan: null,
       appearance: 'system',
+      auto_update: true,
       roots: ['~/working'],
       exclude: [],
       activity_ignore: [],

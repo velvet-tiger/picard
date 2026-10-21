@@ -29,6 +29,7 @@ pub struct Settings {
     /// Daily scan time as `HH:MM`, or `None` when the daily scan is off.
     pub daily_scan: Option<String>,
     pub appearance: Appearance,
+    pub auto_update: bool,
     /// As written in the file, so `~/working` stays `~/working`.
     pub roots: Vec<String>,
     pub exclude: Vec<String>,
@@ -63,6 +64,7 @@ pub fn read(text: &str, home: &Path) -> Result<Settings> {
             .daily_scan
             .map(|t| t.format(config::DAILY_SCAN_FORMAT).to_string()),
         appearance: cfg.appearance,
+        auto_update: cfg.auto_update,
         roots,
         exclude: cfg.exclude,
         activity_ignore: cfg.activity_ignore,
@@ -115,6 +117,12 @@ pub fn apply(text: &str, settings: &Settings, home: &Path) -> Result<String> {
         None => {
             doc.remove("appearance");
         }
+    }
+    // On is the default, so it is written by leaving the key out.
+    if settings.auto_update {
+        doc.remove("auto_update");
+    } else {
+        set(&mut doc, "auto_update", Value::from(false));
     }
     set(&mut doc, "roots", Value::Array(strings(&settings.roots)));
     set(
@@ -388,6 +396,24 @@ mod tests {
         s.daily_scan = Some("".into());
         let err = format!("{:#}", apply(DEFAULT_TOML, &s, home()).unwrap_err());
         assert!(err.contains("daily_scan"), "{err}");
+    }
+
+    #[test]
+    fn auto_update_is_written_only_when_turned_off() {
+        let key = |text: &str| text.lines().any(|l| l.starts_with("auto_update"));
+        let mut s = read(DEFAULT_TOML, home()).unwrap();
+        assert!(s.auto_update);
+        assert!(!key(&apply(DEFAULT_TOML, &s, home()).unwrap()));
+
+        s.auto_update = false;
+        let off = apply(DEFAULT_TOML, &s, home()).unwrap();
+        assert!(off.contains("\nauto_update = false"), "{off}");
+        assert!(!read(&off, home()).unwrap().auto_update);
+
+        s.auto_update = true;
+        let on = apply(&off, &s, home()).unwrap();
+        assert!(!key(&on), "{on}");
+        assert!(read(&on, home()).unwrap().auto_update);
     }
 
     #[test]

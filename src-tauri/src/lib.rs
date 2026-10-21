@@ -13,6 +13,7 @@ mod settings;
 mod state;
 mod tasks;
 mod tray;
+mod updater;
 mod volume;
 mod windows;
 
@@ -31,6 +32,9 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
+        // Used only from Rust (updater.rs); its JS commands are not granted.
+        // The endpoint and public key come from tauri.conf.json.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Used only from Rust (commands::pick_folder); its JS commands are not granted.
         .plugin(tauri_plugin_dialog::init())
         // Off until the user turns it on in Settings.
@@ -55,6 +59,8 @@ pub fn run() {
             commands::get_protection,
             commands::get_not_activity,
             commands::check_for_update,
+            commands::install_update,
+            commands::restart_to_update,
             commands::open_link,
         ])
         .setup(|app| {
@@ -84,6 +90,8 @@ pub fn run() {
                     log::warn!("could not tell the window that history changed: {e}");
                 }
             };
+            let updates = Arc::new(updater::Updates::new(tx.downgrade()));
+            app.manage(Arc::clone(&updates));
             match poll::start_watchers(&config_path, tx, on_history) {
                 // Managed state keeps the watcher alive for the life of the app.
                 Ok(watcher) => {
@@ -96,8 +104,13 @@ pub fn run() {
 
             let shared = Arc::new(state::Shared::new(home, config_path));
             app.manage(Arc::clone(&shared));
-            let poller = poll::Poller::new(app.handle().clone(), tray, shared);
+            let poller = poll::Poller::new(app.handle().clone(), tray, Arc::clone(&shared));
             tauri::async_runtime::spawn(poller.run(rx));
+            tauri::async_runtime::spawn(updater::run_in_background(
+                app.handle().clone(),
+                shared,
+                updates,
+            ));
             Ok(())
         })
         .build(tauri::generate_context!())

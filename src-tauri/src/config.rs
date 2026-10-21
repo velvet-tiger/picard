@@ -24,6 +24,7 @@ recover_margin_gb = 10
 cooldown_minutes = 60
 mode = "ask"              # auto | ask | off
 # appearance = "dark"     # system (the default) | light | dark
+# auto_update = false     # true (the default) checks for updates daily and installs them
 # daily_scan = "03:00"    # also scan once a day at this local time (24-hour)
 roots = ["~/working"]
 exclude = []
@@ -396,6 +397,8 @@ pub struct Config {
     /// volume is low. `None` turns it off.
     pub daily_scan: Option<NaiveTime>,
     pub appearance: Appearance,
+    /// Whether Picard checks for a newer release by itself and installs it.
+    pub auto_update: bool,
     /// Absolute paths, with `~` expanded. Not canonicalised: a root on an
     /// unmounted drive must still be listed so the menu can show it greyed out.
     pub roots: Vec<PathBuf>,
@@ -441,6 +444,7 @@ struct RawConfig {
     mode: Option<Mode>,
     daily_scan: Option<String>,
     appearance: Option<Appearance>,
+    auto_update: Option<bool>,
     roots: Option<Vec<String>>,
     #[serde(default)]
     exclude: Vec<String>,
@@ -549,6 +553,7 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
             .map(parse_daily_time)
             .transpose()?,
         appearance: raw.appearance.unwrap_or_default(),
+        auto_update: raw.auto_update.unwrap_or(true),
         roots,
         exclude: raw.exclude,
         ignore,
@@ -825,6 +830,27 @@ mod tests {
                 "appearance = {raw:?}\nmin_free_gb = 1\nroots = [\"/a\"]"
             ));
             assert_eq!(c.appearance, want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn updates_install_automatically_unless_turned_off() {
+        assert!(parse_ok(DEFAULT_TOML).auto_update);
+        for (raw, want) in [("true", true), ("false", false)] {
+            let c = parse_ok(&format!(
+                "auto_update = {raw}\nmin_free_gb = 1\nroots = [\"/a\"]"
+            ));
+            assert_eq!(c.auto_update, want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rejects_an_auto_update_that_is_not_a_boolean() {
+        for bad in ["\"yes\"", "1", "\"false\""] {
+            let e = parse_err(&format!(
+                "auto_update = {bad}\nmin_free_gb = 1\nroots = [\"/a\"]"
+            ));
+            assert!(e.contains("auto_update"), "{bad}: {e}");
         }
     }
 

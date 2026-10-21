@@ -529,6 +529,18 @@
     </section>
 
     <section class="panel">
+      <h2>Updates</h2>
+      <label class="row">
+        <input type="checkbox" bind:checked={settings.auto_update} />
+        Check for updates daily and install them
+      </label>
+      <p class="muted">
+        Picard installs a new version in the background and asks you to restart. It never restarts
+        by itself. The About tab can still check by hand.
+      </p>
+    </section>
+
+    <section class="panel">
       <label class="row">
         <input
           type="checkbox"

@@ -5,17 +5,29 @@
     appVersion,
     checkForUpdate,
     errorText,
+    installUpdate,
+    onUpdateStatus,
     openLink,
+    restartToUpdate,
     type Link,
-    type UpdateCheck,
+    type UpdateStatus,
   } from './api'
 
   let version = $state<string | null>(null)
   let versionError = $state<string | null>(null)
-  let checking = $state(true)
-  let update = $state<UpdateCheck | null>(null)
-  let updateError = $state<string | null>(null)
+  let status = $state<UpdateStatus | null>(null)
+  let asking = $state(true)
+  let actionError = $state<string | null>(null)
   let linkError = $state<string | null>(null)
+  // Counts the status events received. A reply that is still in progress
+  // (checking or downloading) is only used if no event arrived while it was on
+  // its way, because the event is newer. A finished reply is always used, so a
+  // lost event cannot leave the tab on "Checking".
+  let eventCount = 0
+
+  const working = $derived(
+    asking || status?.state === 'checking' || status?.state === 'downloading',
+  )
 
   async function loadVersion() {
     try {
@@ -25,16 +37,32 @@
     }
   }
 
-  async function check() {
-    checking = true
-    update = null
-    updateError = null
+  async function ask(request: () => Promise<UpdateStatus>) {
+    asking = true
+    actionError = null
+    const before = eventCount
     try {
-      update = await checkForUpdate()
+      const reply = await request()
+      const finished = reply.state !== 'checking' && reply.state !== 'downloading'
+      if (finished || eventCount === before) status = reply
     } catch (e) {
-      updateError = errorText(e)
+      actionError = errorText(e)
     } finally {
-      checking = false
+      asking = false
+    }
+  }
+
+  function check() {
+    status = null
+    return ask(checkForUpdate)
+  }
+
+  async function restart() {
+    actionError = null
+    try {
+      await restartToUpdate()
+    } catch (e) {
+      actionError = errorText(e)
     }
   }
 
@@ -47,7 +75,18 @@
     }
   }
 
-  // The tab mounts the first time it is shown, so GitHub is only asked then.
+  // The background check can finish while this tab is open.
+  $effect(() => {
+    const unlisten = onUpdateStatus((next) => {
+      eventCount += 1
+      status = next
+    })
+    return () => {
+      unlisten.then((stop) => stop())
+    }
+  })
+
+  // The tab mounts the first time it is shown, so the server is only asked then.
   loadVersion()
   check()
 </script>
@@ -63,19 +102,32 @@
   <section class="panel">
     <h2>Updates</h2>
     <div class="row status">
-      {#if checking}
-        <span class="muted">Checking GitHub for a newer version…</span>
-      {:else if update?.newer}
-        <span>Version {update.latest} is available.</span>
-        <button class="link" onclick={() => open('latest_release')}>Download it</button>
-      {:else if update}
+      {#if status?.state === 'downloading'}
+        <span class="muted">Downloading version {status.version}…</span>
+      {:else if status?.state === 'ready'}
+        <span>Version {status.version} is installed.</span>
+        <button class="link" onclick={restart}>Restart to finish updating</button>
+      {:else if status?.state === 'available'}
+        <span>Version {status.version} is available.</span>
+        <button class="link" onclick={() => ask(installUpdate)} disabled={working}>Install it</button
+        >
+      {:else if status?.state === 'failed'}
+        <span class="error"
+          >{status.stage === 'check' ? 'Could not check for updates' : 'Could not install the update'}:
+          {status.message}</span
+        >
+        {#if status.stage === 'install'}
+          <button class="link" onclick={() => open('latest_release')}>Download it instead</button>
+        {/if}
+      {:else if working}
+        <span class="muted">Checking for a newer version…</span>
+      {:else if status?.state === 'up_to_date'}
         <span class="ok">You're on the latest version.</span>
-      {:else if updateError}
-        <span class="error">Could not check: {updateError}</span>
       {/if}
       <span class="spacer"></span>
-      <button onclick={check} disabled={checking}>Check again</button>
+      <button onclick={check} disabled={working}>Check again</button>
     </div>
+    {#if actionError}<p class="error">{actionError}</p>{/if}
   </section>
 
   <section class="panel">

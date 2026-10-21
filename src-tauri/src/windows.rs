@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime, Theme, WebviewUrl, WebviewWindowBuilder};
 
 use crate::config::{self, Appearance};
@@ -19,6 +20,9 @@ const SHOW_TAB_EVENT: &str = "show-tab";
 
 /// Must match the event name `onHistoryChanged` in api.ts listens for.
 const HISTORY_CHANGED_EVENT: &str = "history-changed";
+
+/// Must match the event name `onUpdateStatus` in api.ts listens for.
+const UPDATE_STATUS_EVENT: &str = "update-status";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -92,6 +96,18 @@ pub fn history_changed<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         return Ok(());
     }
     app.emit_to(WINDOW_LABEL, HISTORY_CHANGED_EVENT, ())
+}
+
+/// Tells the open window how the update is going, so the About tab can follow
+/// a background download. Does nothing when no window is open.
+pub fn update_status_changed<R: Runtime, S: Serialize + Clone>(
+    app: &AppHandle<R>,
+    status: &S,
+) -> tauri::Result<()> {
+    if app.get_webview_window(WINDOW_LABEL).is_none() {
+        return Ok(());
+    }
+    app.emit_to(WINDOW_LABEL, UPDATE_STATUS_EVENT, status.clone())
 }
 
 /// The appearance the config asks for.

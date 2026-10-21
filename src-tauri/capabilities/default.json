@@ -22,6 +22,8 @@
     "allow-get-protection",
     "allow-get-not-activity",
     "allow-check-for-update",
+    "allow-install-update",
+    "allow-restart-to-update",
     "allow-open-link"
   ]
 }

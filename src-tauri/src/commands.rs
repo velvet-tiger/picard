@@ -13,7 +13,7 @@ use tauri::{AppHandle, Runtime, State, WebviewWindow};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 
-use crate::about::{self, Link, UpdateCheck};
+use crate::about::{self, Link};
 use crate::config::{self, Appearance, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::history::{self, Entry, Totals};
@@ -22,6 +22,7 @@ use crate::runner::{self, CleanRequest, TaskScan, VolumeRun};
 use crate::settings::{self, Settings};
 use crate::state::Shared;
 use crate::tasks::{IgnoreList, Protected};
+use crate::updater::{self, UpdateStatus, Updates};
 use crate::volume::Volume;
 use crate::windows;
 
@@ -358,11 +359,36 @@ pub fn set_launch_at_login<R: Runtime>(app: AppHandle<R>, enabled: bool) -> Resu
     Ok(())
 }
 
-/// Compares the running version with the latest release on GitHub.
+/// Asks for a newer version. With automatic updates on, installs it too.
+/// A failure comes back as `UpdateStatus::Failed`, not as an error, so the
+/// About tab and the background task show it the same way.
 #[tauri::command]
-pub async fn check_for_update<R: Runtime>(app: AppHandle<R>) -> Result<UpdateCheck, String> {
-    let current = app.package_info().version.clone();
-    blocking(move || about::check(&current)).await
+pub async fn check_for_update<R: Runtime>(
+    app: AppHandle<R>,
+    updates: State<'_, Arc<Updates>>,
+    state: SharedState<'_>,
+) -> Result<UpdateStatus, String> {
+    let auto_install = updater::auto_install_enabled(&state).await;
+    Ok(updates.check(&app, auto_install).await)
+}
+
+/// Installs the update that `check_for_update` offered.
+#[tauri::command]
+pub async fn install_update<R: Runtime>(
+    app: AppHandle<R>,
+    updates: State<'_, Arc<Updates>>,
+) -> Result<UpdateStatus, String> {
+    Ok(updates.install_offered(&app).await)
+}
+
+/// Restarts Picard into the version that was installed.
+#[tauri::command]
+pub fn restart_to_update<R: Runtime>(
+    app: AppHandle<R>,
+    updates: State<'_, Arc<Updates>>,
+    state: SharedState<'_>,
+) -> Result<(), String> {
+    updates.restart(&app, &state)
 }
 
 /// Opens one of the About tab's fixed pages in the default browser.

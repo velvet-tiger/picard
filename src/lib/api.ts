@@ -38,6 +38,8 @@ export interface Settings {
   /** Daily scan time as `HH:MM`, or null when the daily scan is off. */
   daily_scan: string | null
   appearance: Appearance
+  /** Check for updates daily and install them without asking. */
+  auto_update: boolean
   roots: string[]
   exclude: string[]
   /** Names whose changes do not count as work: the defaults unless the file sets its own. */
@@ -211,21 +213,33 @@ export function withEveryBuiltIn(tasks: Task[]): Task[] {
   return [...tasks, ...missing]
 }
 
-/** The running version beside the latest GitHub release. Mirrors `UpdateCheck` in about.rs. */
-export interface UpdateCheck {
-  current: string
-  latest: string
-  /** True when `latest` is newer than `current`. */
-  newer: boolean
-}
+/**
+ * Where the updater is. Mirrors `UpdateStatus` in updater.rs.
+ * `ready` means the new version is on disk and the running copy is still the old one.
+ */
+export type UpdateStatus =
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'up_to_date' }
+  | { state: 'available'; version: string }
+  | { state: 'downloading'; version: string }
+  | { state: 'ready'; version: string }
+  | { state: 'failed'; message: string; stage: 'check' | 'install' }
 
 /** The pages the About tab may open. The URLs live in about.rs, not here. */
 export type Link = 'website' | 'issues' | 'latest_release'
 
 /** The version Picard was built as, from tauri.conf.json. */
 export const appVersion = () => getVersion()
-/** Asks GitHub for the latest release. Rejects with a readable reason when it cannot. */
-export const checkForUpdate = () => invoke<UpdateCheck>('check_for_update')
+/**
+ * Asks for a newer version, and installs it when automatic updates are on.
+ * Resolves to the status afterwards. A failure is a `failed` status, not a rejection.
+ */
+export const checkForUpdate = () => invoke<UpdateStatus>('check_for_update')
+/** Installs the version a check left as `available`. */
+export const installUpdate = () => invoke<UpdateStatus>('install_update')
+/** Restarts Picard into the installed version. Rejects while a cleanup is running. */
+export const restartToUpdate = () => invoke<void>('restart_to_update')
 export const openLink = (link: Link) => invoke<void>('open_link', { link })
 
 /**
@@ -247,6 +261,14 @@ export const closeWindow = () => getCurrentWindow().close()
  */
 export const onShowTab = (handler: (tab: string) => void) =>
   getCurrentWebviewWindow().listen<string>('show-tab', (e) => handler(e.payload))
+
+/**
+ * Calls `handler` each time the update status changes, including changes made
+ * by the background check (see src-tauri/src/updater.rs). Resolves to an
+ * unlisten function.
+ */
+export const onUpdateStatus = (handler: (status: UpdateStatus) => void) =>
+  getCurrentWebviewWindow().listen<UpdateStatus>('update-status', (e) => handler(e.payload))
 
 /**
  * Calls `handler` when `history.jsonl` changes: a clean from this window, auto

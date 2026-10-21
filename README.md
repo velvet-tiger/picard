@@ -80,7 +80,13 @@ The menu lists each drive with its free space, then **Clean…**, **Settings…*
 
 The **About** tab in Picard's window shows the version you are running. It also links to the Velvet Tiger website and to [GitHub issues](https://github.com/velvet-tiger/picard/issues).
 
-When you open the tab, or click **Check again**, Picard asks GitHub for the latest release and says whether a newer version is out. Picard itself contacts GitHub at no other time. The request carries only Picard's version, and nothing about you or your drives. The cleanup tools Picard runs, such as Homebrew, may use the network on their own. Picard does not install updates itself.
+Picard updates itself. About 30 seconds after it starts, and then once a day, it asks GitHub whether a newer release exists. If one does, Picard downloads it from a GitHub release, checks it against the public key built into the app, and replaces `Picard.app`. It never restarts by itself. The About tab and the menu then show **Restart to finish updating**. Until you restart, the old version keeps running, so an update never interrupts a cleanup. Picard refuses to restart while a cleanup is running.
+
+The check is a plain download of one small file, `latest.json`. The request names the updater library and nothing about you, your Mac or your drives. GitHub sees your IP address, as it does for any request. A failed check is tried again after an hour, then two, then four, up to once a day. Picard contacts GitHub only for this check, for the download, and when you open the About tab or click **Check again**. The cleanup tools Picard runs, such as Homebrew, may use the network on their own.
+
+To turn it off, clear **Check for updates daily and install them** in **Settings…**, or set `auto_update = false` in the config. The About tab then still checks when you open it. If it finds a newer version, it offers **Install it** instead of installing. Picard also does not install by itself while the config file has an error, or when it cannot write to the folder that holds `Picard.app`. Installing there would make macOS ask for an administrator password. Picard updates itself only when it runs from an installed `Picard.app`, so `make dev` never touches your build folder.
+
+If an update fails, the About tab says why and links to the release page, where you can download the `.dmg`. Versions up to 0.3.0 do not update themselves, so install the first release that has automatic updates by hand.
 
 ## Install
 
@@ -101,6 +107,7 @@ cooldown_minutes = 60     # wait before alerting again while still low
 mode = "ask"              # auto | ask | off
 daily_scan = "03:00"      # also scan once a day at this local time; leave out to turn off
 appearance = "dark"       # system | light | dark; leave out to follow macOS
+auto_update = false       # leave out to check daily and install updates
 roots = ["~/working"]     # Picard only removes things inside these folders
 exclude = ["**/keep-*/**"] # glob patterns Picard never touches or lists
 ignore = ["~/working/site/node_modules"] # folders listed but never cleaned; set with Ignore
@@ -238,6 +245,19 @@ You need Rust, Node.js, pnpm and the Xcode command-line tools.
 | `make verify` | Check the signature and the `.dmg` contents |
 
 The menu bar icons are drawn by `src-tauri/icons/make_tray_icons.py`. The app icon comes from `src-tauri/icons/app-icon.svg` through `pnpm tauri icon`.
+
+## Update signing key
+
+Installed copies of Picard accept an update only if it is signed with the update key. The public half is `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`. The private half and its password are the repository secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Make a key with `pnpm tauri signer generate -w ~/.tauri/picard.key`.
+
+Keep a backup of the private key and its password somewhere other than GitHub. If you lose them, no installed copy can accept another update, and everyone has to install a new `.dmg` by hand.
+
+To change the key, ship the new public key first:
+
+1. Make a new key and put its public half in `tauri.conf.json`.
+2. Release a version signed with the old key. The release workflow refuses this, because it checks that the signing key matches the public key in the app. Skip the "Check the update signature matches the app" step for this one release.
+3. Replace the secrets with the new key.
+4. Later releases are signed with the new key. Copies that skipped step 2's release cannot update and need a new `.dmg`.
 
 ## Licence
 

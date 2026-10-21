@@ -6,6 +6,18 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Picard updates itself. It checks GitHub for a newer release shortly after it starts and then once a day, downloads it, verifies it against a public key built into the app, and replaces `Picard.app`. The menu and the About tab then offer **Restart to finish updating**. Picard never restarts by itself and refuses to restart during a cleanup. Turn it off with **Check for updates daily and install them** in Settings, or `auto_update = false` in the config. With it off, the About tab offers **Install it** when you check by hand.
+- Updates are installed only from a GitHub release download, only when Picard runs from an installed `Picard.app`, and without an administrator password prompt. Otherwise the About tab offers **Install it**. A failed install is retried after 1, 2, 4 hours and so on, up to a day.
+- The release workflow builds a signed update archive and a `latest.json` and attaches both to the release. It signs in a job of its own, so build scripts never see the key. It needs the `TAURI_SIGNING_PRIVATE_KEY` repository secret, and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if the key has a password. See "Update signing key" in the README.
+
+### Changed
+
+- The About tab shows the update progress: checking, downloading, installed, or failed with the reason. It follows a background download live.
+- The update check uses the Tauri updater plugin instead of `curl`, which adds an HTTP and TLS client to the app. The README no longer says that Picard does not install updates.
+- Versions before this one cannot update themselves. Install this release by hand once.
+
 ## [0.3.0] - 2026-10-21
 
 ### Added

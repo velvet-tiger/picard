@@ -18,6 +18,8 @@ const COMMANDS: &[&str] = &[
     "get_protection",
     "get_not_activity",
     "check_for_update",
+    "install_update",
+    "restart_to_update",
     "open_link",
 ];
 

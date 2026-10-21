@@ -28,6 +28,7 @@ use crate::monitor::{self, DailyAction, States};
 use crate::runner::{self, CleanRequest, LockBusy, TaskScan, VolumeRun};
 use crate::state::Shared;
 use crate::tray::{MenuView, Tray};
+use crate::updater;
 use crate::volume::{self, UnavailableRoot, UuidCache, Volume};
 
 /// The notification action type registered in `register_clean_action`.
@@ -66,6 +67,8 @@ pub fn register_clean_action<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
 pub enum Wake {
     ConfigChanged,
     VolumesChanged,
+    /// An update was installed. The menu offers the restart.
+    UpdateReady,
 }
 
 const VOLUMES_DIR: &str = "/Volumes";
@@ -355,6 +358,9 @@ pub struct Poller<R: Runtime> {
     /// Volumes whose daily clean found the run lock busy, with the scan's
     /// date. Retried at each check that same day.
     daily_retry: Option<(NaiveDate, Vec<PathBuf>)>,
+    /// What the menu last showed, so an installed update can be added to it
+    /// without scanning the drives again.
+    last_view: Option<MenuView>,
 }
 
 impl<R: Runtime> Poller<R> {
@@ -369,6 +375,7 @@ impl<R: Runtime> Poller<R> {
             last_daily_scan: None,
             recorded_daily_time: None,
             daily_retry: None,
+            last_view: None,
         }
     }
 
@@ -386,9 +393,15 @@ impl<R: Runtime> Poller<R> {
         self.last_daily_scan = stamp.and_then(|s| s.date);
         self.recorded_daily_time = stamp.and_then(|s| s.at);
         self.reload_config();
+        let mut redraw_only = false;
         loop {
-            self.check().await;
-            self.daily_scan_if_due(Local::now().naive_local()).await;
+            if redraw_only {
+                self.show_update_in_menu();
+                redraw_only = false;
+            } else {
+                self.check().await;
+                self.daily_scan_if_due(Local::now().naive_local()).await;
+            }
             let wait = self.next_wait(Local::now().naive_local());
             match tokio::time::timeout(wait, rx.recv()).await {
                 Err(_elapsed) => {}
@@ -399,10 +412,17 @@ impl<R: Runtime> Poller<R> {
                 Ok(Some(first)) => {
                     tokio::time::sleep(DEBOUNCE).await;
                     let mut config_changed = first == Wake::ConfigChanged;
+                    let mut other_than_update = first != Wake::UpdateReady;
                     while let Ok(next) = rx.try_recv() {
                         config_changed |= next == Wake::ConfigChanged;
+                        other_than_update |= next != Wake::UpdateReady;
                     }
-                    log::info!("woken early: config changed = {config_changed}");
+                    // An installed update only adds a menu item. It is no
+                    // reason to scan the drives, which can alert or clean.
+                    redraw_only = !other_than_update;
+                    log::info!(
+                        "woken early: config changed = {config_changed}, menu redraw only = {redraw_only}"
+                    );
                     if config_changed {
                         self.reload_config();
                     }
@@ -574,6 +594,7 @@ impl<R: Runtime> Poller<R> {
                 );
                 self.config = Some(c);
                 self.config_error = false;
+                updater::config_reloaded(&self.app);
             }
             Err(e) => {
                 let keeping = if self.config.is_some() {
@@ -592,6 +613,7 @@ impl<R: Runtime> Poller<R> {
         let Some(config) = self.config.clone() else {
             self.show(MenuView {
                 config_error: true,
+                update_ready: updater::ready_version(&self.app),
                 ..MenuView::default()
             });
             return;
@@ -633,6 +655,7 @@ impl<R: Runtime> Poller<R> {
             readings: found.readings,
             unavailable: found.unavailable,
             config_error: self.config_error,
+            update_ready: updater::ready_version(&self.app),
         });
     }
 
@@ -757,10 +780,19 @@ impl<R: Runtime> Poller<R> {
         }
     }
 
-    fn show(&self, view: MenuView) {
+    fn show(&mut self, view: MenuView) {
         log::info!("status: {}", crate::tray::status_lines(&view).join("; "));
         if let Err(e) = self.tray.show(&view) {
             log::error!("could not update tray menu: {e}");
+        }
+        self.last_view = Some(view);
+    }
+
+    /// Redraws the last menu with the installed update's restart item.
+    fn show_update_in_menu(&mut self) {
+        if let Some(mut view) = self.last_view.clone() {
+            view.update_ready = updater::ready_version(&self.app);
+            self.show(view);
         }
     }
 }

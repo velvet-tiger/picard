@@ -16,6 +16,15 @@
       "devCsp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost ws://localhost:1420; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI5MjY2MzI1M0YwODVFNjgKUldSb1hnZy9KV01tS1hEcnAzbmFTVWZBTjkzU0dmTTc0bnFkOTZuZ2lRNDdpcml5SXlPdUxrQkQK",
+      "endpoints": [
+        "https://github.com/velvet-tiger/picard/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
