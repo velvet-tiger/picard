@@ -95,6 +95,14 @@ export interface HistoryEntry {
   bytes: number
 }
 
+/** Everything Picard has removed, summed from history.jsonl. */
+export interface Totals {
+  bytes: number
+  items: number
+  /** The oldest removal, or null when nothing has been removed. */
+  since: string | null
+}
+
 export const getSettings = () => invoke<Settings>('get_settings')
 /** The config's `appearance`, read without loading the whole form. */
 export const getAppearance = () => invoke<Appearance>('get_appearance')
@@ -103,6 +111,7 @@ export const preview = () => invoke<VolumePreview[]>('preview')
 export const runSelected = (selections: Selection[]) =>
   invoke<RunResult[]>('run_selected', { selections })
 export const getHistory = (limit: number) => invoke<HistoryEntry[]>('get_history', { limit })
+export const getTotals = () => invoke<Totals>('get_totals')
 /** The default `activity_ignore` names, for Restore defaults. */
 export const getNotActivity = () => invoke<string[]>('get_not_activity')
 /** The config's `ignore` list as written, so `~/…` stays `~/…`. */

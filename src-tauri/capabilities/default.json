@@ -13,6 +13,7 @@
     "allow-preview",
     "allow-run-selected",
     "allow-get-history",
+    "allow-get-totals",
     "allow-get-launch-at-login",
     "allow-set-launch-at-login",
     "allow-pick-folder",

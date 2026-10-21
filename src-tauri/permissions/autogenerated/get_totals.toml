@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-totals"
+description = "Enables the get_totals command without any pre-configured scope."
+commands.allow = ["get_totals"]
+
+[[permission]]
+identifier = "deny-get-totals"
+description = "Denies the get_totals command without any pre-configured scope."
+commands.deny = ["get_totals"]

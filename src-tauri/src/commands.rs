@@ -16,7 +16,7 @@ use tauri_plugin_dialog::DialogExt;
 use crate::about::{self, Link, UpdateCheck};
 use crate::config::{self, Appearance, Config, Mode};
 use crate::disk::{self, DiskSpace};
-use crate::history::{self, Entry};
+use crate::history::{self, Entry, Totals};
 use crate::poll;
 use crate::runner::{self, CleanRequest, TaskScan, VolumeRun};
 use crate::settings::{self, Settings};
@@ -330,6 +330,13 @@ pub async fn run_selected<R: Runtime>(
 pub async fn get_history(state: SharedState<'_>, limit: usize) -> Result<Vec<Entry>, String> {
     let shared = Arc::clone(&state);
     blocking(move || history::read_recent(&shared.paths.history, limit.min(500)).map_err(err)).await
+}
+
+/// Everything Picard has removed so far, summed from the history log.
+#[tauri::command]
+pub async fn get_totals(state: SharedState<'_>) -> Result<Totals, String> {
+    let shared = Arc::clone(&state);
+    blocking(move || history::read_totals(&shared.paths.history).map_err(err)).await
 }
 
 /// Whether Picard opens at login (a LaunchAgent written by the autostart plugin).

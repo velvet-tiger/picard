@@ -4,6 +4,12 @@ All notable changes to Picard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- The Clean page shows how much Picard has freed in total, and since when. The total is summed from `history.jsonl` (`get_totals` command).
+
 ## [0.2.0] - 2026-10-21
 
 ### Added
