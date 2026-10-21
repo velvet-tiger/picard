@@ -7,6 +7,7 @@ import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 
 export type Mode = 'auto' | 'ask' | 'off'
 export type CargoMode = 'stale' | 'all'
+export type Appearance = 'system' | 'light' | 'dark'
 
 export type Threshold = { unit: 'gb'; value: number } | { unit: 'pct'; value: number }
 
@@ -36,6 +37,7 @@ export interface Settings {
   mode: Mode
   /** Daily scan time as `HH:MM`, or null when the daily scan is off. */
   daily_scan: string | null
+  appearance: Appearance
   roots: string[]
   exclude: string[]
   /** Names whose changes do not count as work: the defaults unless the file sets its own. */
@@ -94,6 +96,8 @@ export interface HistoryEntry {
 }
 
 export const getSettings = () => invoke<Settings>('get_settings')
+/** The config's `appearance`, read without loading the whole form. */
+export const getAppearance = () => invoke<Appearance>('get_appearance')
 export const saveSettings = (settings: Settings) => invoke<void>('save_settings', { settings })
 export const preview = () => invoke<VolumePreview[]>('preview')
 export const runSelected = (selections: Selection[]) =>
@@ -214,6 +218,16 @@ export const appVersion = () => getVersion()
 /** Asks GitHub for the latest release. Rejects with a readable reason when it cannot. */
 export const checkForUpdate = () => invoke<UpdateCheck>('check_for_update')
 export const openLink = (link: Link) => invoke<void>('open_link', { link })
+
+/**
+ * Makes the page light, dark, or follow macOS. app.css keys its palettes on
+ * `data-theme`. The Rust side sets the title bar to match.
+ */
+export function applyAppearance(appearance: Appearance): void {
+  const root = document.documentElement
+  if (appearance === 'system') delete root.dataset.theme
+  else root.dataset.theme = appearance
+}
 
 /** Closes the window this page is in. */
 export const closeWindow = () => getCurrentWindow().close()

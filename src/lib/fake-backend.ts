@@ -9,6 +9,7 @@ export type Handler = (args: Args) => unknown
  * Answers `invoke` calls with `handlers`, keyed by command name, and records
  * every call. A command with no handler throws, so a test notices a call it
  * did not expect. `sent(cmd)` lists the arguments of each call to `cmd`.
+ * Event listening (`listen`, `emit`) is answered by the Tauri mock itself.
  */
 export function fakeBackend(handlers: Record<string, Handler>) {
   const calls: { cmd: string; args: Args }[] = []
@@ -18,7 +19,7 @@ export function fakeBackend(handlers: Record<string, Handler>) {
     const handler = handlers[cmd]
     if (!handler) throw new Error(`fake backend has no handler for ${cmd}`)
     return handler(args)
-  })
+  }, { shouldMockEvents: true })
   return { sent: (cmd: string) => calls.filter((c) => c.cmd === cmd).map((c) => c.args) }
 }
 

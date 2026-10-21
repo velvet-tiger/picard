@@ -41,6 +41,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
             commands::get_settings,
+            commands::get_appearance,
             commands::save_settings,
             commands::preview,
             commands::run_selected,

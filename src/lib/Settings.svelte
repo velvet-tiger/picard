@@ -2,6 +2,7 @@
   import {
     getSettings,
     saveSettings,
+    applyAppearance,
     getLaunchAtLogin,
     setLaunchAtLogin,
     pickFolder,
@@ -98,6 +99,12 @@
     { value: 'off', label: 'Off', help: 'Only show free space.' },
   ] as const
 
+  const APPEARANCES = [
+    { value: 'system', label: 'System', help: 'Match the macOS setting.' },
+    { value: 'light', label: 'Light', help: 'Always light.' },
+    { value: 'dark', label: 'Dark', help: 'Always dark.' },
+  ] as const
+
   async function load() {
     try {
       const loaded = await getSettings()
@@ -134,6 +141,7 @@
     clean.activity_ignore = clean.activity_ignore.map((n) => n.trim()).filter(Boolean)
     try {
       await saveSettings(clean)
+      applyAppearance(clean.appearance)
       settings.roots = clean.roots
       settings.exclude = clean.exclude
       settings.activity_ignore = clean.activity_ignore
@@ -508,6 +516,16 @@
       <div class="row">
         <button onclick={() => settings!.tasks.push(newTask('command'))}>Add custom command</button>
       </div>
+    </section>
+
+    <section class="panel">
+      <h2>Appearance</h2>
+      {#each APPEARANCES as a}
+        <label class="choice">
+          <input type="radio" name="appearance" value={a.value} bind:group={settings.appearance} />
+          <strong>{a.label}</strong> <span class="muted">{a.help}</span>
+        </label>
+      {/each}
     </section>
 
     <section class="panel">

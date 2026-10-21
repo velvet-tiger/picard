@@ -16,5 +16,7 @@ export default defineConfig({
     environment: 'jsdom',
     include: ['src/**/*.test.ts'],
     setupFiles: ['src/test-setup.ts'],
+    // Vitest empties CSS imports, even `?raw`. App.test.ts reads app.css.
+    css: { include: [/\/src\/app\.css/] },
   },
 })

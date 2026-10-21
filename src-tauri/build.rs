@@ -4,6 +4,7 @@
 const COMMANDS: &[&str] = &[
     "get_status",
     "get_settings",
+    "get_appearance",
     "save_settings",
     "preview",
     "run_selected",

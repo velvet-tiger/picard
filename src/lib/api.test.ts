@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  applyAppearance,
   BUILT_IN_TASKS,
   errorText,
   formatBytes,
+  getAppearance,
   getNotActivity,
   getProtection,
   itemTitle,
@@ -73,6 +75,18 @@ describe('itemTitle', () => {
   it('strips the command prefix and keeps tool caches as written', () => {
     expect(itemTitle('command', 'command: Docker prune')).toBe('Docker prune')
     expect(itemTitle('tool_caches', 'Homebrew')).toBe('Homebrew')
+  })
+})
+
+describe('applyAppearance', () => {
+  it('forces light or dark, and System removes the override', () => {
+    const root = document.documentElement
+    applyAppearance('dark')
+    expect(root.dataset.theme).toBe('dark')
+    applyAppearance('light')
+    expect(root.dataset.theme).toBe('light')
+    applyAppearance('system')
+    expect(root.hasAttribute('data-theme')).toBe(false)
   })
 })
 
@@ -183,6 +197,12 @@ describe('ignore-change events', () => {
 
 // The Rust side reads these argument names, so a rename here breaks the call.
 describe('backend commands', () => {
+  it('reads the appearance with get_appearance', async () => {
+    const { sent } = fakeBackend({ get_appearance: () => 'dark' })
+    await expect(getAppearance()).resolves.toBe('dark')
+    expect(sent('get_appearance')).toEqual([{}])
+  })
+
   it('sends set_ignored with path and ignored', async () => {
     const { sent } = fakeBackend({ set_ignored: () => null })
     await setIgnored('~/keep', true)
@@ -210,6 +230,7 @@ describe('backend commands', () => {
       cooldown_minutes: 60,
       mode: 'ask',
       daily_scan: null,
+      appearance: 'system',
       roots: ['~/working'],
       exclude: [],
       activity_ignore: [],

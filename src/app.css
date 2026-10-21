@@ -13,8 +13,27 @@
   line-height: 1.4;
 }
 
+/* The Appearance setting sets data-theme on <html> to force light or dark. With
+   no attribute the window follows macOS. The dark palette appears twice, once
+   per route to dark. App.test.ts fails if the two blocks differ. */
+:root[data-theme='light'] {
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #1e1e1e;
+  --panel: #2a2a2c;
+  --text: #f5f5f7;
+  --muted: #98989d;
+  --line: #3a3a3c;
+  --accent: #4c9bff;
+  --danger: #ff6b6b;
+  --ok: #66bb6a;
+}
+
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme]) {
     --bg: #1e1e1e;
     --panel: #2a2a2c;
     --text: #f5f5f7;

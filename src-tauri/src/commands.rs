@@ -14,7 +14,7 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::about::{self, Link, UpdateCheck};
-use crate::config::{self, Config, Mode};
+use crate::config::{self, Appearance, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::history::{self, Entry};
 use crate::poll;
@@ -23,6 +23,7 @@ use crate::settings::{self, Settings};
 use crate::state::Shared;
 use crate::tasks::{IgnoreList, Protected};
 use crate::volume::Volume;
+use crate::windows;
 
 type SharedState<'a> = State<'a, Arc<Shared>>;
 
@@ -147,9 +148,21 @@ pub async fn get_settings(state: SharedState<'_>) -> Result<Settings, String> {
     .await
 }
 
+/// The appearance the config asks for, so the window can match it on load.
 #[tauri::command]
-pub async fn save_settings(state: SharedState<'_>, settings: Settings) -> Result<(), String> {
+pub async fn get_appearance(state: SharedState<'_>) -> Result<Appearance, String> {
     let shared = Arc::clone(&state);
+    blocking(move || load_config(&shared).map(|cfg| cfg.appearance)).await
+}
+
+#[tauri::command]
+pub async fn save_settings<R: Runtime>(
+    app: AppHandle<R>,
+    state: SharedState<'_>,
+    settings: Settings,
+) -> Result<(), String> {
+    let shared = Arc::clone(&state);
+    let appearance = settings.appearance;
     blocking(move || {
         let _writing = shared.lock_config();
         let text = read_config_text(&shared)?;
@@ -159,7 +172,13 @@ pub async fn save_settings(state: SharedState<'_>, settings: Settings) -> Result
         log::info!("settings saved to {}", shared.config_path.display());
         Ok(())
     })
-    .await
+    .await?;
+    // The settings are saved by now, so a failure here only leaves the title
+    // bar in the old appearance until the window next opens.
+    if let Err(e) = windows::set_appearance(&app, appearance) {
+        log::warn!("could not apply the appearance to the title bar: {e}");
+    }
+    Ok(())
 }
 
 /// The default `activity_ignore` names, for the Settings tab's Restore
