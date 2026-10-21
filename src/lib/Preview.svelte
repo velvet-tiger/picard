@@ -196,6 +196,21 @@
     afterBusy()
   }
 
+  /**
+   * Shows what the store holds now. The banner's copy can be out of date if a
+   * background clean dropped a volume after the banner appeared.
+   */
+  async function showLatest() {
+    let found: VolumePreview[]
+    try {
+      found = await getLastPreview()
+    } catch (e) {
+      error = errorText(e)
+      return
+    }
+    await showStored(found)
+  }
+
   /** Reads the store again if it changed while the page was busy. */
   function afterBusy() {
     if (storedPending && !busy()) loadStored()
@@ -414,7 +429,7 @@
     {@const found = stale.found}
     <p class="panel stale" role="status">
       <span>A newer scan from {scannedText(new Date(newest(found)).toISOString())} is ready.</span>
-      <button onclick={() => showStored(found)} disabled={busy()}>Show it</button>
+      <button onclick={showLatest} disabled={busy()}>Show it</button>
     </p>
   {:else if stale?.kind === 'cleaned'}
     <p class="panel stale" role="status">

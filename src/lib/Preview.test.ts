@@ -287,8 +287,14 @@ describe('Preview', () => {
     expect(box('shop/web')).not.toBeChecked()
     expect(screen.queryByRole('checkbox', { name: /docs/ })).not.toBeInTheDocument()
 
+    // The store moves on before the click; the page shows what it holds then.
+    const latest = volumes()
+    latest[0].scanned_at = '2026-10-22T11:00:00Z'
+    latest[0].tasks[0].items.push(item('/Users/a/w/wiki/node_modules', 1e9))
+    stored = latest
     await fireEvent.click(showIt)
-    expect(await screen.findByRole('checkbox', { name: /docs/ })).toBeChecked()
+    expect(await screen.findByRole('checkbox', { name: /wiki/ })).toBeChecked()
+    expect(screen.queryByRole('checkbox', { name: /docs/ })).not.toBeInTheDocument()
     expect(box('shop/web')).toBeChecked()
     expect(screen.queryByRole('button', { name: 'Show it' })).not.toBeInTheDocument()
     expect(sent('preview')).toHaveLength(1)
