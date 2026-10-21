@@ -106,22 +106,28 @@ describe('Preview', () => {
   })
 
   it('waits for Scan before scanning, but loads the total straight away', async () => {
+    const scan = deferred<VolumePreview[]>()
     const { sent } = backend({
+      preview: () => scan.promise,
       get_totals: () => ({ bytes: 42.3e9, items: 318, since: '2026-09-03T08:30:00Z' }),
     })
+    const prompt = 'Press Scan to find build folders, caches and stale worktrees.'
     render(Preview)
 
     expect(await findTotal('Picard has freed 42 GB across 318 items')).toBeInTheDocument()
-    expect(
-      screen.getByText('Press Scan to find build folders, caches and stale worktrees.'),
-    ).toBeInTheDocument()
+    expect(screen.getByText(prompt)).toBeInTheDocument()
     expect(sent('get_history')).toHaveLength(1)
     await settle()
     expect(sent('preview')).toHaveLength(0)
 
     await fireEvent.click(screen.getByRole('button', { name: 'Scan' }))
+    expect(await screen.findByText('Scanning your folders…')).toBeInTheDocument()
+    expect(screen.queryByText(prompt)).not.toBeInTheDocument()
+
+    scan.resolve(volumes())
     await screen.findByText('Macintosh HD')
     expect(sent('preview')).toHaveLength(1)
+    expect(screen.queryByText(prompt)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Rescan' })).toBeInTheDocument()
   })
 
@@ -147,6 +153,10 @@ describe('Preview', () => {
     render(Preview)
     await fireEvent.click(screen.getByRole('button', { name: 'Scan' }))
     expect(await screen.findByText('Could not read config.toml')).toBeInTheDocument()
+    // Nothing was found because nothing was read, so neither empty-state line is true.
+    expect(screen.queryByText(/No mounted volumes/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Press Scan/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Scan' })).toBeInTheDocument()
   })
 
   it('cleans only the ticked items, then scans again', async () => {

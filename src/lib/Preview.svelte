@@ -85,11 +85,11 @@
           v.tasks.flatMap((t) => t.items.map((i) => [key(v.mount, i.path), !isProtected(i)])),
         ),
       )
+      scanned = true
     } catch (e) {
       error = errorText(e)
     } finally {
       scanning = false
-      scanned = true
     }
     reloadRecords()
   }
@@ -327,7 +327,10 @@
       {/each}
     </div>
   {:else if !scanned}
-    <p class="muted">Press Scan to find build folders, caches and stale worktrees.</p>
+    <!-- After a failed first scan the error says what happened; the prompt would hide it. -->
+    {#if !error}
+      <p class="muted">Press Scan to find build folders, caches and stale worktrees.</p>
+    {/if}
   {:else if volumes.length === 0}
     <p class="muted">No mounted volumes hold a configured root.</p>
   {:else}
