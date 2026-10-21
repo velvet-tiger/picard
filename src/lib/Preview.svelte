@@ -97,8 +97,22 @@
   )
   const selectedCount = $derived(Object.values(checked).filter(Boolean).length)
 
+  /**
+   * A store change the page has not shown: a newer scan, or a background clean
+   * of a volume on the page. The page keeps its list, and the ticks you
+   * changed, until you choose to update it.
+   */
+  type Stale = { kind: 'newer'; found: VolumePreview[] } | { kind: 'cleaned' }
+  let stale = $state<Stale | null>(null)
+  // True while a stored scan is re-checked against the ignore list. Its rows
+  // were ticked from the ignore list at scan time, so Clean waits.
+  let checkingStored = $state(false)
+  // The store changed while the page was busy; it is read again once idle.
+  let storedPending = false
+
   /** Puts a scan's results on the page, with its ticks and open categories reset. */
   function show(found: VolumePreview[]) {
+    stale = null
     volumes = found
     // Everything not ignored starts ticked; one click on "Clean selected" removes it all.
     checked = Object.fromEntries(
@@ -125,23 +139,27 @@
       scanning = false
     }
     reloadRecords()
+    afterBusy()
   }
 
-  /** The newest scan time in `list`, in ms since the epoch; 0 for an empty list. */
+  /** The newest scan time in `list`, in ms since the epoch; 0 for an empty list or a bad time. */
   const newest = (list: VolumePreview[]) =>
-    Math.max(0, ...list.map((v) => Date.parse(v.scanned_at)))
+    Math.max(0, ...list.map((v) => Date.parse(v.scanned_at) || 0))
 
-  // A scan, a clean or an Ignore click owns the list while it runs.
-  const busy = () => scanning || cleaning || busyToggling
+  // A scan, a clean, an Ignore click or a stored scan's ignore check owns the list while it runs.
+  const busy = () => scanning || cleaning || busyToggling || checkingStored
 
   /**
-   * Shows the latest stored scan if it is newer than the list on the page.
-   * The stored scan can come from a notification, so the page lists what the
-   * notification counted. The ignore list may have changed since that scan,
-   * so the rows are re-checked against it.
+   * Compares the stored scans with the page. With nothing on the page yet,
+   * the stored scan is shown, so a notification opens on the list it counted.
+   * Otherwise a newer scan or a background clean is offered, not applied.
    */
   async function loadStored() {
-    if (busy()) return
+    if (busy()) {
+      storedPending = true
+      return
+    }
+    storedPending = false
     let found: VolumePreview[]
     try {
       found = await getLastPreview()
@@ -150,10 +168,37 @@
       console.error('last preview', e)
       return
     }
-    if (busy() || newest(found) <= newest(volumes)) return
+    if (busy()) {
+      storedPending = true
+      return
+    }
+    if (!scanned) {
+      if (found.length > 0) await showStored(found)
+    } else if (newest(found) > newest(volumes)) {
+      stale = { kind: 'newer', found }
+    } else if (volumes.some((v) => !found.some((f) => f.mount === v.mount))) {
+      // Every list the page shows was stored, so a missing volume was cleaned.
+      stale = { kind: 'cleaned' }
+    }
+  }
+
+  /** Shows a stored scan, then re-checks it against the ignore list, which may have changed since. */
+  async function showStored(found: VolumePreview[]) {
     show(found)
-    // Same handling as an Ignore change from Settings.
-    refreshProtection().catch((e) => (error = errorText(e)))
+    checkingStored = true
+    try {
+      await refreshProtection()
+    } catch (e) {
+      error = errorText(e)
+    } finally {
+      checkingStored = false
+    }
+    afterBusy()
+  }
+
+  /** Reads the store again if it changed while the page was busy. */
+  function afterBusy() {
+    if (storedPending && !busy()) loadStored()
   }
 
   /** "14:02" for a scan today, "21 Oct, 14:02" for an older one. */
@@ -279,6 +324,7 @@
     } finally {
       toggling[k] = false
     }
+    afterBusy()
   }
 
   let refreshCalls = 0
@@ -346,8 +392,7 @@
   <div class="row">
     <h1>Clean up</h1>
     <span class="spacer"></span>
-    <button onclick={scan} disabled={scanning || cleaning || busyToggling}
-      >{scanned ? 'Rescan' : 'Scan'}</button
+    <button onclick={scan} disabled={busy()}>{scanned ? 'Rescan' : 'Scan'}</button
     >
   </div>
   <p class="muted">
@@ -363,6 +408,19 @@
 
   {#if error}
     <p class="error">{error}</p>
+  {/if}
+
+  {#if stale?.kind === 'newer'}
+    {@const found = stale.found}
+    <p class="panel stale" role="status">
+      <span>A newer scan from {scannedText(new Date(newest(found)).toISOString())} is ready.</span>
+      <button onclick={() => showStored(found)} disabled={busy()}>Show it</button>
+    </p>
+  {:else if stale?.kind === 'cleaned'}
+    <p class="panel stale" role="status">
+      <span>Picard cleaned in the background, so this list may be out of date.</span>
+      <button onclick={scan} disabled={busy()}>Scan again</button>
+    </p>
   {/if}
 
   {#if results}
@@ -519,7 +577,7 @@
       <button
         class="primary"
         onclick={clean}
-        disabled={cleaning || busyToggling || selectedCount === 0}
+        disabled={cleaning || busyToggling || checkingStored || selectedCount === 0}
       >
         {cleaning ? 'Cleaning…' : 'Clean selected'}
       </button>
@@ -770,5 +828,16 @@
   }
   .totals {
     font-variant-numeric: tabular-nums;
+  }
+
+  .stale {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .stale span {
+    flex: 1;
   }
 </style>

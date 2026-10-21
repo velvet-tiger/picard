@@ -323,9 +323,6 @@ pub async fn run_selected<R: Runtime>(
                 return Err(format!("{} is no longer mounted", selection.mount));
             };
             let chosen: HashSet<PathBuf> = selection.paths.iter().map(PathBuf::from).collect();
-            // The stored list may now name removed folders. The tab rescans
-            // after a clean; this covers a rescan that fails.
-            shared.forget_preview(&selection.mount);
             let result = runner::clean_volume(
                 &config,
                 volume,
@@ -335,6 +332,10 @@ pub async fn run_selected<R: Runtime>(
                 CleanRequest::Selected(chosen),
                 &runner::ignore_from_file(&shared.config_path, &shared.home),
             );
+            // The stored scan may list what was just removed.
+            if result.as_ref().is_ok_and(|r| !r.removed.is_empty()) {
+                shared.mark_cleaned(&selection.mount);
+            }
             out.push(run_view(&volume.name, result.map_err(|e| format!("{e:#}"))));
         }
         Ok(out)

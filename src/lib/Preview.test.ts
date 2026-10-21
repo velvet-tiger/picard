@@ -264,18 +264,18 @@ describe('Preview', () => {
     logged.mockRestore()
   })
 
-  it('shows a newer background scan when one lands, and ignores one that is not newer', async () => {
+  it('offers a newer background scan without touching the ticks, and shows it on request', async () => {
     let stored: VolumePreview[] = []
     const { sent } = backend({ get_last_preview: () => stored })
     await renderScanned()
     await fireEvent.click(box('shop/web'))
     expect(box('shop/web')).not.toBeChecked()
 
-    // The scan already on the page: nothing changes, so the untick stays.
+    // The scan already on the page: nothing to offer.
     stored = volumes()
     await emit('preview-changed')
     await settle()
-    expect(box('shop/web')).not.toBeChecked()
+    expect(screen.queryByRole('button', { name: 'Show it' })).not.toBeInTheDocument()
 
     const later = volumes()
     later[0].scanned_at = '2026-10-22T10:00:00Z'
@@ -283,9 +283,84 @@ describe('Preview', () => {
     stored = later
     await emit('preview-changed')
 
+    const showIt = await screen.findByRole('button', { name: 'Show it' })
+    expect(box('shop/web')).not.toBeChecked()
+    expect(screen.queryByRole('checkbox', { name: /docs/ })).not.toBeInTheDocument()
+
+    await fireEvent.click(showIt)
     expect(await screen.findByRole('checkbox', { name: /docs/ })).toBeChecked()
     expect(box('shop/web')).toBeChecked()
+    expect(screen.queryByRole('button', { name: 'Show it' })).not.toBeInTheDocument()
     expect(sent('preview')).toHaveLength(1)
+  })
+
+  it('reads the store again after a scan when a background scan landed during it', async () => {
+    const scan = deferred<VolumePreview[]>()
+    let stored: VolumePreview[] = []
+    backend({ preview: () => scan.promise, get_last_preview: () => stored })
+    render(Preview)
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }))
+    await screen.findByText('Scanning your folders…')
+
+    // An estimate that started after the manual scan finishes first.
+    const later = volumes()
+    later[0].scanned_at = '2026-10-22T10:00:00Z'
+    stored = later
+    await emit('preview-changed')
+    await settle()
+
+    scan.resolve(volumes())
+    expect(await screen.findByRole('button', { name: 'Show it' })).toBeInTheDocument()
+  })
+
+  it('says the list may be out of date after a background clean of a volume on the page', async () => {
+    let stored: VolumePreview[] = []
+    backend({ get_last_preview: () => stored })
+    await renderScanned()
+
+    // What the store holds after auto mode cleans the only volume.
+    stored = []
+    await emit('preview-changed')
+
+    expect(
+      await screen.findByText('Picard cleaned in the background, so this list may be out of date.'),
+    ).toBeInTheDocument()
+    expect(box('shop/web')).toBeChecked()
+  })
+
+  it('keeps Clean disabled until a stored scan is checked against the ignore list', async () => {
+    const protection = deferred<Protection[]>()
+    backend({ get_last_preview: () => volumes(), get_protection: () => protection.promise })
+    render(Preview)
+    await screen.findByText('Macintosh HD')
+
+    const clean = screen.getByRole('button', { name: 'Clean selected' })
+    expect(clean).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Rescan' })).toBeDisabled()
+
+    // SHOP was ignored after the stored scan ran.
+    protection.resolve(['ignored', null, 'ignored', null])
+    await waitFor(() => expect(clean).toBeEnabled())
+    expect(box('shop/web')).not.toBeChecked()
+  })
+
+  it('shows only the time for a scan today and adds the date for an older one', async () => {
+    const today = volumes()
+    today[0].scanned_at = new Date().toISOString()
+    const older = volumes()
+    older[0].mount = '/Volumes/Work'
+    older[0].name = 'Work'
+    older[0].scanned_at = '2026-01-05T09:00:00Z'
+    backend({ get_last_preview: () => [...today, ...older] })
+    render(Preview)
+    await screen.findByText('Work')
+
+    const clock = (d: Date) => d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+    const now = new Date(today[0].scanned_at)
+    const then = new Date(older[0].scanned_at)
+    const day = then.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
+    expect(screen.getByText(`· scanned ${clock(now)}`)).toBeInTheDocument()
+    expect(screen.getByText(`· scanned ${day}, ${clock(then)}`)).toBeInTheDocument()
   })
 
   it('reloads the total and recent list when a background clean writes history, without rescanning', async () => {

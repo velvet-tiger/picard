@@ -1,9 +1,11 @@
 //! State shared by the poll loop and the window commands.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
+use chrono::{DateTime, Utc};
 use tauri::{AppHandle, Runtime};
 
 use crate::commands::VolumePreview;
@@ -35,8 +37,10 @@ pub struct Shared {
     config_write: Mutex<()>,
     /// The latest preview scan of each volume, from a Scan in the Clean tab or
     /// from the estimate behind a notification. The Clean tab opens on it, so
-    /// a notification's numbers have a list behind them. Memory only.
-    previews: Mutex<Vec<VolumePreview>>,
+    /// a notification's numbers have a list behind them. Memory only, so a
+    /// clean from the CLI, which runs in another process, does not reach it;
+    /// the Clean button re-checks every item, so that costs only stale numbers.
+    previews: Mutex<PreviewStore>,
 }
 
 impl Shared {
@@ -51,7 +55,7 @@ impl Shared {
             cleaning: AtomicUsize::new(0),
             low: AtomicBool::new(false),
             config_write: Mutex::new(()),
-            previews: Mutex::new(Vec::new()),
+            previews: Mutex::new(PreviewStore::default()),
         }
     }
 
@@ -92,30 +96,30 @@ impl Shared {
 
     /// The stored preview of every volume. See `previews`.
     pub fn previews(&self) -> Vec<VolumePreview> {
-        self.lock_previews().clone()
+        self.lock_previews().list.clone()
     }
 
-    /// Stores a scan of every mounted volume. See `with_previews_replaced`.
+    /// Stores a scan of every mounted volume. See `PreviewStore::replace`.
     pub fn replace_previews(&self, fresh: Vec<VolumePreview>) {
-        let mut stored = self.lock_previews();
-        *stored = with_previews_replaced(std::mem::take(&mut *stored), fresh);
+        self.lock_previews().replace(fresh);
     }
 
-    /// Stores a scan of one volume. See `with_preview`.
+    /// Stores a scan of one volume. See `PreviewStore::record`.
     pub fn record_preview(&self, fresh: VolumePreview) {
-        let mut stored = self.lock_previews();
-        *stored = with_preview(std::mem::take(&mut *stored), fresh);
+        self.lock_previews().record(fresh);
     }
 
-    /// Drops the stored preview of the volume at `mount`, because a clean
-    /// there may have removed folders it lists.
-    pub fn forget_preview(&self, mount: &str) {
-        self.lock_previews().retain(|v| v.mount != mount);
+    /// Drops the stored preview of the volume at `mount` after a clean there,
+    /// and refuses any scan of it that started before now. Call it once the
+    /// clean has finished.
+    pub fn mark_cleaned(&self, mount: &str) {
+        self.lock_previews().mark_cleaned(mount, Utc::now());
     }
 
-    /// A panic while holding the lock cannot leave a half-written list, since
-    /// every write swaps in a finished one, so a poisoned lock is still usable.
-    fn lock_previews(&self) -> MutexGuard<'_, Vec<VolumePreview>> {
+    /// A panic while holding the lock cannot leave the store half-written:
+    /// each write is one `retain`, `insert` or swap of a finished list, so a
+    /// poisoned lock is still usable.
+    fn lock_previews(&self) -> MutexGuard<'_, PreviewStore> {
         self.previews.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -132,34 +136,60 @@ impl Shared {
     }
 }
 
-/// `stored` with `fresh` in place of the entry for the same mount. A stored
-/// entry from a scan that started later wins, because two scans can finish in
-/// either order.
-fn with_preview(mut stored: Vec<VolumePreview>, fresh: VolumePreview) -> Vec<VolumePreview> {
-    match stored.iter_mut().find(|v| v.mount == fresh.mount) {
-        Some(old) if old.scanned_at > fresh.scanned_at => {}
-        Some(old) => *old = fresh,
-        None => stored.push(fresh),
-    }
-    stored
+/// The latest preview scan of each volume, and when each was last cleaned.
+/// See `Shared::previews`.
+#[derive(Debug, Default)]
+struct PreviewStore {
+    list: Vec<VolumePreview>,
+    /// When the last clean of each volume finished, keyed by mount.
+    cleaned: HashMap<String, DateTime<Utc>>,
 }
 
-/// `fresh`, a scan of every mounted volume, in place of `stored`. A volume
-/// missing from `fresh` is no longer mounted, so it is dropped. A stored entry
-/// from a scan that started later is kept, as in `with_preview`.
-fn with_previews_replaced(
-    stored: Vec<VolumePreview>,
-    fresh: Vec<VolumePreview>,
-) -> Vec<VolumePreview> {
-    fresh
-        .into_iter()
-        .map(
-            |new| match stored.iter().find(|old| old.mount == new.mount) {
-                Some(old) if old.scanned_at > new.scanned_at => old.clone(),
+impl PreviewStore {
+    /// False for a scan that started before the last clean of its volume
+    /// finished, since it may list folders that clean removed. Scans and
+    /// cleans run at the same time, so such a scan can finish afterwards.
+    fn is_current(&self, fresh: &VolumePreview) -> bool {
+        self.cleaned
+            .get(&fresh.mount)
+            .is_none_or(|&cleaned| fresh.scanned_at >= cleaned)
+    }
+
+    /// Puts `fresh` in place of the entry for the same mount. A stored entry
+    /// from a scan that started later wins, because two scans can finish in
+    /// either order.
+    fn record(&mut self, fresh: VolumePreview) {
+        if !self.is_current(&fresh) {
+            return;
+        }
+        match self.list.iter_mut().find(|v| v.mount == fresh.mount) {
+            Some(old) if old.scanned_at > fresh.scanned_at => {}
+            Some(old) => *old = fresh,
+            None => self.list.push(fresh),
+        }
+    }
+
+    /// Puts `fresh`, a scan of every mounted volume, in place of the list. A
+    /// volume missing from `fresh` is no longer mounted, so it is dropped.
+    /// Stale scans and later stored entries are handled as in `record`.
+    fn replace(&mut self, fresh: Vec<VolumePreview>) {
+        let old = std::mem::take(&mut self.list);
+        let kept: Vec<VolumePreview> = fresh
+            .into_iter()
+            .filter(|new| self.is_current(new))
+            .map(|new| match old.iter().find(|o| o.mount == new.mount) {
+                Some(o) if o.scanned_at > new.scanned_at => o.clone(),
                 _ => new,
-            },
-        )
-        .collect()
+            })
+            .collect();
+        self.list = kept;
+    }
+
+    /// Drops the entry for `mount` and refuses its scans that started before `at`.
+    fn mark_cleaned(&mut self, mount: &str, at: DateTime<Utc>) {
+        self.list.retain(|v| v.mount != mount);
+        self.cleaned.insert(mount.to_string(), at);
+    }
 }
 
 /// Ends one "cleaning" mark when dropped. See `Shared::start_cleaning`.
@@ -178,7 +208,7 @@ impl<R: Runtime> Drop for CleaningGuard<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, TimeZone, Utc};
+    use chrono::TimeZone;
 
     fn at(minute: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 22, 9, minute, 0).unwrap()
@@ -196,54 +226,95 @@ mod tests {
         }
     }
 
-    fn mounts_and_minutes(list: &[VolumePreview]) -> Vec<(&str, DateTime<Utc>)> {
-        list.iter()
+    fn store(list: Vec<VolumePreview>) -> PreviewStore {
+        PreviewStore {
+            list,
+            cleaned: HashMap::new(),
+        }
+    }
+
+    fn mounts_and_times(store: &PreviewStore) -> Vec<(&str, DateTime<Utc>)> {
+        store
+            .list
+            .iter()
             .map(|v| (v.mount.as_str(), v.scanned_at))
             .collect()
     }
 
     #[test]
     fn a_volume_scan_replaces_only_its_own_volume() {
-        let stored = vec![preview("/", 1), preview("/Volumes/Work", 1)];
-        let merged = with_preview(stored, preview("/Volumes/Work", 5));
+        let mut s = store(vec![preview("/", 1), preview("/Volumes/Work", 1)]);
+        s.record(preview("/Volumes/Work", 5));
         assert_eq!(
-            mounts_and_minutes(&merged),
+            mounts_and_times(&s),
             vec![("/", at(1)), ("/Volumes/Work", at(5))]
         );
     }
 
     #[test]
     fn a_volume_scan_of_a_new_volume_is_added() {
-        let merged = with_preview(vec![preview("/", 1)], preview("/Volumes/Work", 5));
+        let mut s = store(vec![preview("/", 1)]);
+        s.record(preview("/Volumes/Work", 5));
         assert_eq!(
-            mounts_and_minutes(&merged),
+            mounts_and_times(&s),
             vec![("/", at(1)), ("/Volumes/Work", at(5))]
         );
     }
 
     #[test]
     fn a_scan_that_started_earlier_does_not_replace_a_later_one() {
-        let merged = with_preview(vec![preview("/", 5)], preview("/", 1));
-        assert_eq!(mounts_and_minutes(&merged), vec![("/", at(5))]);
-        let replaced = with_previews_replaced(vec![preview("/", 5)], vec![preview("/", 1)]);
-        assert_eq!(mounts_and_minutes(&replaced), vec![("/", at(5))]);
+        let mut s = store(vec![preview("/", 5)]);
+        s.record(preview("/", 1));
+        assert_eq!(mounts_and_times(&s), vec![("/", at(5))]);
+        s.replace(vec![preview("/", 1)]);
+        assert_eq!(mounts_and_times(&s), vec![("/", at(5))]);
     }
 
     #[test]
     fn a_full_scan_drops_volumes_that_are_no_longer_mounted() {
-        let stored = vec![preview("/", 1), preview("/Volumes/Gone", 1)];
-        let replaced = with_previews_replaced(stored, vec![preview("/", 5)]);
-        assert_eq!(mounts_and_minutes(&replaced), vec![("/", at(5))]);
+        let mut s = store(vec![preview("/", 1), preview("/Volumes/Gone", 1)]);
+        s.replace(vec![preview("/", 5)]);
+        assert_eq!(mounts_and_times(&s), vec![("/", at(5))]);
     }
 
     #[test]
-    fn forget_drops_one_volume_and_keeps_the_rest() {
+    fn a_clean_drops_its_volume_and_keeps_the_rest() {
+        let mut s = store(vec![preview("/", 1), preview("/Volumes/Work", 1)]);
+        s.mark_cleaned("/", at(3));
+        assert_eq!(mounts_and_times(&s), vec![("/Volumes/Work", at(1))]);
+    }
+
+    #[test]
+    fn a_scan_that_started_before_a_clean_finished_is_refused() {
+        // A notification's estimate starts at :2, a clean of the same volume
+        // finishes at :3, and the estimate lands after it.
+        let mut s = store(Vec::new());
+        s.mark_cleaned("/", at(3));
+        s.record(preview("/", 2));
+        assert!(s.list.is_empty(), "the late estimate must not come back");
+        s.replace(vec![preview("/", 2), preview("/Volumes/Work", 2)]);
+        assert_eq!(mounts_and_times(&s), vec![("/Volumes/Work", at(2))]);
+    }
+
+    #[test]
+    fn a_scan_that_started_after_a_clean_is_kept() {
+        let mut s = store(Vec::new());
+        s.mark_cleaned("/", at(3));
+        s.record(preview("/", 4));
+        assert_eq!(mounts_and_times(&s), vec![("/", at(4))]);
+    }
+
+    #[test]
+    fn shared_previews_go_through_the_store() {
         let shared = Shared::new(PathBuf::from("/u"), PathBuf::from("/u/config.toml"));
         shared.replace_previews(vec![preview("/", 1), preview("/Volumes/Work", 1)]);
-        shared.forget_preview("/");
-        assert_eq!(
-            mounts_and_minutes(&shared.previews()),
-            vec![("/Volumes/Work", at(1))]
-        );
+        shared.mark_cleaned("/");
+        let left: Vec<String> = shared.previews().into_iter().map(|v| v.mount).collect();
+        assert_eq!(left, vec!["/Volumes/Work".to_string()]);
+        // Stamped with the real clock, so a scan from 2000 is stale.
+        let mut old = preview("/", 1);
+        old.scanned_at = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
+        shared.record_preview(old);
+        assert_eq!(shared.previews().len(), 1);
     }
 }

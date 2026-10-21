@@ -780,8 +780,12 @@ impl<R: Runtime> Poller<R> {
             None => log::info!("auto mode ({trigger:?}): nothing removed on {name}"),
         }
         if run.is_ok_and(|r| !r.removed.is_empty()) {
-            // The stored scan may list what was just removed.
-            self.shared.forget_preview(&mount);
+            // The stored scan may list what was just removed. An open Clean
+            // tab is told, so it can say its list is out of date.
+            self.shared.mark_cleaned(&mount);
+            if let Err(e) = windows::preview_changed(&self.app) {
+                log::warn!("could not tell the window about the clean: {e}");
+            }
             Cleaned::Removed
         } else {
             Cleaned::NothingRemoved

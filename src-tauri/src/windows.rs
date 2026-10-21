@@ -101,8 +101,9 @@ pub fn history_changed<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     app.emit_to(WINDOW_LABEL, HISTORY_CHANGED_EVENT, ())
 }
 
-/// Tells the open window that a background scan stored a new preview, so the
-/// Clean tab can show it. Does nothing when no window is open.
+/// Tells the open window that the stored previews changed: a background scan
+/// stored one, or a background clean dropped one. The Clean tab compares the
+/// store with its list. Does nothing when no window is open.
 pub fn preview_changed<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     if app.get_webview_window(WINDOW_LABEL).is_none() {
         return Ok(());
