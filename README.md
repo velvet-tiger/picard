@@ -233,14 +233,6 @@ You need Rust, Node.js, pnpm and the Xcode command-line tools.
 | `make bundle` | Build the release `.app` and `.dmg` without the checks |
 | `make verify` | Check the signature and the `.dmg` contents |
 
-Builds are ad-hoc signed, which is enough to run them on the Mac that built them. To sign with a Developer ID instead:
-
-```bash
-make dmg APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-```
-
-`security find-identity -v -p codesigning` lists your identities. Builds are for Apple Silicon only, and they are not notarised. Notarising is needed only to share the `.dmg` with other Macs.
-
 The menu bar icons are drawn by `src-tauri/icons/make_tray_icons.py`. The app icon comes from `src-tauri/icons/app-icon.svg` through `pnpm tauri icon`.
 
 ## Licence
