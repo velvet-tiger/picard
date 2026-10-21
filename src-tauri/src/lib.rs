@@ -49,6 +49,7 @@ pub fn run() {
             commands::get_appearance,
             commands::save_settings,
             commands::preview,
+            commands::get_last_preview,
             commands::run_selected,
             commands::get_history,
             commands::get_totals,

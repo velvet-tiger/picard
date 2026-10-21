@@ -21,6 +21,9 @@ const SHOW_TAB_EVENT: &str = "show-tab";
 /// Must match the event name `onHistoryChanged` in api.ts listens for.
 const HISTORY_CHANGED_EVENT: &str = "history-changed";
 
+/// Must match the event name `onPreviewChanged` in api.ts listens for.
+const PREVIEW_CHANGED_EVENT: &str = "preview-changed";
+
 /// Must match the event name `onUpdateStatus` in api.ts listens for.
 const UPDATE_STATUS_EVENT: &str = "update-status";
 
@@ -96,6 +99,15 @@ pub fn history_changed<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         return Ok(());
     }
     app.emit_to(WINDOW_LABEL, HISTORY_CHANGED_EVENT, ())
+}
+
+/// Tells the open window that a background scan stored a new preview, so the
+/// Clean tab can show it. Does nothing when no window is open.
+pub fn preview_changed<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    if app.get_webview_window(WINDOW_LABEL).is_none() {
+        return Ok(());
+    }
+    app.emit_to(WINDOW_LABEL, PREVIEW_CHANGED_EVENT, ())
 }
 
 /// Tells the open window how the update is going, so the About tab can follow

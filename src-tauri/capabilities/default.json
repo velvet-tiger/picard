@@ -11,6 +11,7 @@
     "allow-get-appearance",
     "allow-save-settings",
     "allow-preview",
+    "allow-get-last-preview",
     "allow-run-selected",
     "allow-get-history",
     "allow-get-totals",

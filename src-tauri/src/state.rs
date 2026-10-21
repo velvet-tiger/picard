@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use tauri::{AppHandle, Runtime};
 
+use crate::commands::VolumePreview;
 use crate::tray::{self, TrayState};
 
 use crate::env::ToolEnv;
@@ -32,6 +33,10 @@ pub struct Shared {
     /// window, so two quick edits (Ignore on two rows, or Ignore and Save)
     /// cannot both start from the old text and lose one of them.
     config_write: Mutex<()>,
+    /// The latest preview scan of each volume, from a Scan in the Clean tab or
+    /// from the estimate behind a notification. The Clean tab opens on it, so
+    /// a notification's numbers have a list behind them. Memory only.
+    previews: Mutex<Vec<VolumePreview>>,
 }
 
 impl Shared {
@@ -46,6 +51,7 @@ impl Shared {
             cleaning: AtomicUsize::new(0),
             low: AtomicBool::new(false),
             config_write: Mutex::new(()),
+            previews: Mutex::new(Vec::new()),
         }
     }
 
@@ -84,6 +90,35 @@ impl Shared {
         tray::set_state(app, state);
     }
 
+    /// The stored preview of every volume. See `previews`.
+    pub fn previews(&self) -> Vec<VolumePreview> {
+        self.lock_previews().clone()
+    }
+
+    /// Stores a scan of every mounted volume. See `with_previews_replaced`.
+    pub fn replace_previews(&self, fresh: Vec<VolumePreview>) {
+        let mut stored = self.lock_previews();
+        *stored = with_previews_replaced(std::mem::take(&mut *stored), fresh);
+    }
+
+    /// Stores a scan of one volume. See `with_preview`.
+    pub fn record_preview(&self, fresh: VolumePreview) {
+        let mut stored = self.lock_previews();
+        *stored = with_preview(std::mem::take(&mut *stored), fresh);
+    }
+
+    /// Drops the stored preview of the volume at `mount`, because a clean
+    /// there may have removed folders it lists.
+    pub fn forget_preview(&self, mount: &str) {
+        self.lock_previews().retain(|v| v.mount != mount);
+    }
+
+    /// A panic while holding the lock cannot leave a half-written list, since
+    /// every write swaps in a finished one, so a poisoned lock is still usable.
+    fn lock_previews(&self) -> MutexGuard<'_, Vec<VolumePreview>> {
+        self.previews.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The resolved tool PATH, or `None` while it is still being resolved.
     pub fn tools(&self) -> Option<Arc<ToolEnv>> {
         self.tools.get().cloned()
@@ -97,6 +132,36 @@ impl Shared {
     }
 }
 
+/// `stored` with `fresh` in place of the entry for the same mount. A stored
+/// entry from a scan that started later wins, because two scans can finish in
+/// either order.
+fn with_preview(mut stored: Vec<VolumePreview>, fresh: VolumePreview) -> Vec<VolumePreview> {
+    match stored.iter_mut().find(|v| v.mount == fresh.mount) {
+        Some(old) if old.scanned_at > fresh.scanned_at => {}
+        Some(old) => *old = fresh,
+        None => stored.push(fresh),
+    }
+    stored
+}
+
+/// `fresh`, a scan of every mounted volume, in place of `stored`. A volume
+/// missing from `fresh` is no longer mounted, so it is dropped. A stored entry
+/// from a scan that started later is kept, as in `with_preview`.
+fn with_previews_replaced(
+    stored: Vec<VolumePreview>,
+    fresh: Vec<VolumePreview>,
+) -> Vec<VolumePreview> {
+    fresh
+        .into_iter()
+        .map(
+            |new| match stored.iter().find(|old| old.mount == new.mount) {
+                Some(old) if old.scanned_at > new.scanned_at => old.clone(),
+                _ => new,
+            },
+        )
+        .collect()
+}
+
 /// Ends one "cleaning" mark when dropped. See `Shared::start_cleaning`.
 pub struct CleaningGuard<R: Runtime> {
     shared: Arc<Shared>,
@@ -107,5 +172,78 @@ impl<R: Runtime> Drop for CleaningGuard<R> {
     fn drop(&mut self) {
         self.shared.cleaning.fetch_sub(1, Ordering::SeqCst);
         self.shared.refresh_tray(&self.app);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    fn at(minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 22, 9, minute, 0).unwrap()
+    }
+
+    fn preview(mount: &str, minute: u32) -> VolumePreview {
+        VolumePreview {
+            name: mount.to_string(),
+            mount: mount.to_string(),
+            free_text: String::new(),
+            tasks: Vec::new(),
+            total_bytes: 0,
+            total_text: String::new(),
+            scanned_at: at(minute),
+        }
+    }
+
+    fn mounts_and_minutes(list: &[VolumePreview]) -> Vec<(&str, DateTime<Utc>)> {
+        list.iter()
+            .map(|v| (v.mount.as_str(), v.scanned_at))
+            .collect()
+    }
+
+    #[test]
+    fn a_volume_scan_replaces_only_its_own_volume() {
+        let stored = vec![preview("/", 1), preview("/Volumes/Work", 1)];
+        let merged = with_preview(stored, preview("/Volumes/Work", 5));
+        assert_eq!(
+            mounts_and_minutes(&merged),
+            vec![("/", at(1)), ("/Volumes/Work", at(5))]
+        );
+    }
+
+    #[test]
+    fn a_volume_scan_of_a_new_volume_is_added() {
+        let merged = with_preview(vec![preview("/", 1)], preview("/Volumes/Work", 5));
+        assert_eq!(
+            mounts_and_minutes(&merged),
+            vec![("/", at(1)), ("/Volumes/Work", at(5))]
+        );
+    }
+
+    #[test]
+    fn a_scan_that_started_earlier_does_not_replace_a_later_one() {
+        let merged = with_preview(vec![preview("/", 5)], preview("/", 1));
+        assert_eq!(mounts_and_minutes(&merged), vec![("/", at(5))]);
+        let replaced = with_previews_replaced(vec![preview("/", 5)], vec![preview("/", 1)]);
+        assert_eq!(mounts_and_minutes(&replaced), vec![("/", at(5))]);
+    }
+
+    #[test]
+    fn a_full_scan_drops_volumes_that_are_no_longer_mounted() {
+        let stored = vec![preview("/", 1), preview("/Volumes/Gone", 1)];
+        let replaced = with_previews_replaced(stored, vec![preview("/", 5)]);
+        assert_eq!(mounts_and_minutes(&replaced), vec![("/", at(5))]);
+    }
+
+    #[test]
+    fn forget_drops_one_volume_and_keeps_the_rest() {
+        let shared = Shared::new(PathBuf::from("/u"), PathBuf::from("/u/config.toml"));
+        shared.replace_previews(vec![preview("/", 1), preview("/Volumes/Work", 1)]);
+        shared.forget_preview("/");
+        assert_eq!(
+            mounts_and_minutes(&shared.previews()),
+            vec![("/Volumes/Work", at(1))]
+        );
     }
 }

@@ -7,6 +7,7 @@ const COMMANDS: &[&str] = &[
     "get_appearance",
     "save_settings",
     "preview",
+    "get_last_preview",
     "run_selected",
     "get_history",
     "get_totals",

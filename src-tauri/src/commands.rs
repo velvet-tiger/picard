@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime, State, WebviewWindow};
 use tauri_plugin_autostart::ManagerExt;
@@ -74,6 +75,8 @@ pub struct VolumePreview {
     pub tasks: Vec<PreviewTask>,
     pub total_bytes: u64,
     pub total_text: String,
+    /// When the scan of this volume started. A stored scan can be hours old.
+    pub scanned_at: DateTime<Utc>,
 }
 
 /// Paths the user ticked on one volume.
@@ -277,16 +280,25 @@ pub async fn preview(state: SharedState<'_>) -> Result<Vec<VolumePreview>, Strin
         let config = load_config(&shared)?;
         let tools = shared.tools().ok_or(STILL_STARTING)?;
         log::info!("preview scan started");
+        let started = Utc::now();
         let found = poll::scan(&config.roots, &shared.uuids);
         let mut out = Vec::new();
         for (volume, space) in &found.readings {
             let scans = runner::preview_volume(&config, volume, &shared.sizes, &tools)
                 .map_err(|e| format!("{}: {e:#}", volume.name))?;
-            out.push(preview_view(volume, *space, &scans));
+            out.push(preview_view(volume, *space, &scans, started));
         }
+        shared.replace_previews(out.clone());
         Ok(out)
     })
     .await
+}
+
+/// The latest scan of each volume, from a Scan in the Clean tab or from the
+/// estimate behind a notification. Empty when neither has run since launch.
+#[tauri::command]
+pub fn get_last_preview(state: SharedState<'_>) -> Vec<VolumePreview> {
+    state.previews()
 }
 
 #[tauri::command]
@@ -311,6 +323,9 @@ pub async fn run_selected<R: Runtime>(
                 return Err(format!("{} is no longer mounted", selection.mount));
             };
             let chosen: HashSet<PathBuf> = selection.paths.iter().map(PathBuf::from).collect();
+            // The stored list may now name removed folders. The tab rescans
+            // after a clean; this covers a rescan that fails.
+            shared.forget_preview(&selection.mount);
             let result = runner::clean_volume(
                 &config,
                 volume,
@@ -462,7 +477,13 @@ fn status_view(
     }
 }
 
-fn preview_view(volume: &Volume, space: DiskSpace, scans: &[TaskScan]) -> VolumePreview {
+/// The Clean tab's view of one volume's preview scan, which started at `scanned_at`.
+pub(crate) fn preview_view(
+    volume: &Volume,
+    space: DiskSpace,
+    scans: &[TaskScan],
+    scanned_at: DateTime<Utc>,
+) -> VolumePreview {
     let tasks: Vec<PreviewTask> = scans
         .iter()
         .map(|s| match &s.result {
@@ -496,6 +517,7 @@ fn preview_view(volume: &Volume, space: DiskSpace, scans: &[TaskScan]) -> Volume
         tasks,
         total_bytes,
         total_text: disk::format_bytes(total_bytes),
+        scanned_at,
     }
 }
 
@@ -626,7 +648,7 @@ mod tests {
                 holds_ignored: Default::default(),
             },
         ];
-        let view = preview_view(&volume(), SPACE, &scans);
+        let view = preview_view(&volume(), SPACE, &scans, Utc::now());
         assert_eq!(view.total_bytes, 2_500_000_000);
         assert_eq!(view.total_text, "2.5 GB");
         assert_eq!(view.free_text, "20 GB free (2%)");

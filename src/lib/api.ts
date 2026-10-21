@@ -71,6 +71,8 @@ export interface VolumePreview {
   tasks: PreviewTask[]
   total_bytes: number
   total_text: string
+  /** RFC 3339 time the scan of this volume started. A stored scan can be hours old. */
+  scanned_at: string
 }
 
 export interface Selection {
@@ -110,6 +112,8 @@ export const getSettings = () => invoke<Settings>('get_settings')
 export const getAppearance = () => invoke<Appearance>('get_appearance')
 export const saveSettings = (settings: Settings) => invoke<void>('save_settings', { settings })
 export const preview = () => invoke<VolumePreview[]>('preview')
+/** The latest scan of each volume, including the one behind a notification. No scan runs. */
+export const getLastPreview = () => invoke<VolumePreview[]>('get_last_preview')
 export const runSelected = (selections: Selection[]) =>
   invoke<RunResult[]>('run_selected', { selections })
 export const getHistory = (limit: number) => invoke<HistoryEntry[]>('get_history', { limit })
@@ -277,6 +281,14 @@ export const onUpdateStatus = (handler: (status: UpdateStatus) => void) =>
  */
 export const onHistoryChanged = (handler: () => void) =>
   getCurrentWebviewWindow().listen('history-changed', () => handler())
+
+/**
+ * Calls `handler` when a background scan stores a new preview, such as the one
+ * behind a low-space or daily-scan notification (see `remember_preview` in
+ * src-tauri/src/poll.rs). Resolves to an unlisten function.
+ */
+export const onPreviewChanged = (handler: () => void) =>
+  getCurrentWebviewWindow().listen('preview-changed', () => handler())
 
 /** Errors from invoke arrive as strings; anything else is shown as-is. */
 export function errorText(e: unknown): string {

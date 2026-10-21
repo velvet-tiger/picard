@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_notification::{Action, ActionType, NotificationExt};
@@ -21,6 +21,7 @@ use tauri_plugin_notification::{Action, ActionType, NotificationExt};
 use crate::windows::{self, Tab};
 use tokio::sync::mpsc;
 
+use crate::commands::{self, VolumePreview};
 use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::env::ToolEnv;
@@ -484,7 +485,7 @@ impl<R: Runtime> Poller<R> {
                 DailyAction::Skip => log::info!("daily scan: skipping {}", volume.name),
                 DailyAction::Offer => {
                     let name = volume.name.clone();
-                    let cleanable = self.cleanable(&config, volume).await;
+                    let cleanable = self.estimate(&config, volume, space).await;
                     match monitor::daily_scan_message(&name, space, cleanable) {
                         Some((title, body)) => self.notify(&title, &body),
                         None => log::info!("daily scan: nothing to offer on {name}"),
@@ -636,7 +637,7 @@ impl<R: Runtime> Poller<R> {
             }
             let volume = found.readings.iter().find(|(v, _)| v.mount == alert.mount);
             let cleanable = match volume {
-                Some((v, _)) => self.cleanable(&config, v.clone()).await,
+                Some((v, space)) => self.estimate(&config, v.clone(), *space).await,
                 None => None,
             };
             let (title, body) = alert.message(cleanable);
@@ -671,9 +672,28 @@ impl<R: Runtime> Poller<R> {
         }
     }
 
-    /// How much a preview scan finds on `volume`, for the ask-mode estimate.
+    /// How much can be cleaned on `volume`, for an ask-mode notification.
+    /// The scan behind the number is stored for the Clean tab, which the
+    /// notification opens, so the tab can list what the number counted.
     /// `None` if the scan cannot run yet or fails; the reason is logged.
-    async fn cleanable(&self, config: &Config, volume: Volume) -> Option<u64> {
+    async fn estimate(&self, config: &Config, volume: Volume, space: DiskSpace) -> Option<u64> {
+        let started = Utc::now();
+        let scans = self.preview_scan(config, volume.clone()).await?;
+        self.remember_preview(commands::preview_view(&volume, space, &scans, started));
+        Some(scans.iter().map(TaskScan::cleanable_bytes).sum())
+    }
+
+    /// Stores `preview` for the Clean tab and tells an open window about it.
+    fn remember_preview(&self, preview: VolumePreview) {
+        self.shared.record_preview(preview);
+        if let Err(e) = windows::preview_changed(&self.app) {
+            log::warn!("could not tell the window about the new scan: {e}");
+        }
+    }
+
+    /// A preview scan of `volume`. `None` if the scan cannot run yet or
+    /// fails; the reason is logged.
+    async fn preview_scan(&self, config: &Config, volume: Volume) -> Option<Vec<TaskScan>> {
         let name = volume.name.clone();
         let Some(tools) = self.shared.tools() else {
             log::warn!("cleanup estimate for {name} skipped: tool paths are not resolved");
@@ -686,7 +706,7 @@ impl<R: Runtime> Poller<R> {
         })
         .await;
         match scanned {
-            Ok(Ok(scans)) => Some(scans.iter().map(TaskScan::cleanable_bytes).sum()),
+            Ok(Ok(scans)) => Some(scans),
             Ok(Err(e)) => {
                 log::warn!("cleanup estimate for {name} failed: {e:#}");
                 None
@@ -718,6 +738,7 @@ impl<R: Runtime> Poller<R> {
         let paths = self.shared.paths.clone();
         let (config_path, home) = (self.shared.config_path.clone(), self.shared.home.clone());
         let name = volume.name.clone();
+        let mount = volume.mount.display().to_string();
         let outcome = tauri::async_runtime::spawn_blocking(move || {
             let run = runner::clean_volume(
                 &config,
@@ -759,6 +780,8 @@ impl<R: Runtime> Poller<R> {
             None => log::info!("auto mode ({trigger:?}): nothing removed on {name}"),
         }
         if run.is_ok_and(|r| !r.removed.is_empty()) {
+            // The stored scan may list what was just removed.
+            self.shared.forget_preview(&mount);
             Cleaned::Removed
         } else {
             Cleaned::NothingRemoved

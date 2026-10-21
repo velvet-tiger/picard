@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/sv
 // so these tests send the global event. The Rust side targets the window.
 import { emit } from '@tauri-apps/api/event'
 import { mockWindows } from '@tauri-apps/api/mocks'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import Preview from './Preview.svelte'
 import {
   notifyIgnoreChanged,
@@ -40,6 +40,7 @@ function volumes(): VolumePreview[] {
       free_text: '12 GB free',
       total_bytes: 0,
       total_text: '',
+      scanned_at: '2026-10-22T09:00:00Z',
       tasks: [
         {
           task: 'node_modules',
@@ -58,6 +59,7 @@ function backend(handlers: Record<string, Handler> = {}) {
   mockWindows('main')
   return fakeBackend({
     preview: () => volumes(),
+    get_last_preview: () => [],
     get_history: () => [],
     get_totals: () => ({ bytes: 0, items: 0, since: null }) satisfies Totals,
     set_ignored: () => null,
@@ -229,6 +231,61 @@ describe('Preview', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Clean selected' }))
 
     expect(await findTotal('Picard has freed 4.5 GB across 4 items')).toBeInTheDocument()
+  })
+
+  it('opens on the latest stored scan, such as the one behind a notification, without scanning', async () => {
+    const { sent } = backend({ get_last_preview: () => volumes() })
+    render(Preview)
+
+    expect(await screen.findByText('Macintosh HD')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Rescan' })).toBeInTheDocument()
+    expect(box('shop/web')).toBeChecked()
+    expect(box('blog/site')).not.toBeChecked()
+    // The ignore list may have changed since the stored scan.
+    await waitFor(() => expect(sent('get_protection')).toHaveLength(1))
+    await settle()
+    expect(sent('preview')).toHaveLength(0)
+  })
+
+  it('shows the Scan prompt when the stored scan cannot be read', async () => {
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
+    backend({
+      get_last_preview: () => {
+        throw 'stored scan unavailable'
+      },
+    })
+    render(Preview)
+
+    await waitFor(() => expect(logged).toHaveBeenCalled())
+    expect(
+      screen.getByText('Press Scan to find build folders, caches and stale worktrees.'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('stored scan unavailable')).not.toBeInTheDocument()
+    logged.mockRestore()
+  })
+
+  it('shows a newer background scan when one lands, and ignores one that is not newer', async () => {
+    let stored: VolumePreview[] = []
+    const { sent } = backend({ get_last_preview: () => stored })
+    await renderScanned()
+    await fireEvent.click(box('shop/web'))
+    expect(box('shop/web')).not.toBeChecked()
+
+    // The scan already on the page: nothing changes, so the untick stays.
+    stored = volumes()
+    await emit('preview-changed')
+    await settle()
+    expect(box('shop/web')).not.toBeChecked()
+
+    const later = volumes()
+    later[0].scanned_at = '2026-10-22T10:00:00Z'
+    later[0].tasks[0].items.push(item('/Users/a/w/docs/node_modules', 3e9))
+    stored = later
+    await emit('preview-changed')
+
+    expect(await screen.findByRole('checkbox', { name: /docs/ })).toBeChecked()
+    expect(box('shop/web')).toBeChecked()
+    expect(sent('preview')).toHaveLength(1)
   })
 
   it('reloads the total and recent list when a background clean writes history, without rescanning', async () => {

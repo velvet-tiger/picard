@@ -1,6 +1,8 @@
 <script lang="ts">
   import {
     preview,
+    getLastPreview,
+    onPreviewChanged,
     runSelected,
     getHistory,
     getTotals,
@@ -30,7 +32,9 @@
   let history = $state<HistoryEntry[]>([])
   let totals = $state<Totals | null>(null)
   let scanning = $state(false)
-  // A scan can take half a minute, so the page waits for a click before the first one.
+  // A scan can take half a minute, so the page does not start one itself. It
+  // shows the latest stored scan, such as the one behind a notification, or
+  // waits for a click.
   let scanned = $state(false)
   let elapsed = $state(0)
 
@@ -93,30 +97,72 @@
   )
   const selectedCount = $derived(Object.values(checked).filter(Boolean).length)
 
+  /** Puts a scan's results on the page, with its ticks and open categories reset. */
+  function show(found: VolumePreview[]) {
+    volumes = found
+    // Everything not ignored starts ticked; one click on "Clean selected" removes it all.
+    checked = Object.fromEntries(
+      found.flatMap((v) =>
+        v.tasks.flatMap((t) => t.items.map((i) => [key(v.mount, i.path), !isProtected(i)])),
+      ),
+    )
+    // Set on every scan only. An Ignore click that empties a category leaves
+    // it open, so the list does not vanish from under the pointer.
+    open = Object.fromEntries(
+      found.flatMap((v) => v.tasks.map((t) => [key(v.mount, t.task), startsOpen(t)])),
+    )
+    scanned = true
+  }
+
   async function scan() {
     scanning = true
     error = null
     try {
-      const found = await preview()
-      volumes = found
-      // Everything not ignored starts ticked; one click on "Clean selected" removes it all.
-      checked = Object.fromEntries(
-        found.flatMap((v) =>
-          v.tasks.flatMap((t) => t.items.map((i) => [key(v.mount, i.path), !isProtected(i)])),
-        ),
-      )
-      // Set on every scan only. An Ignore click that empties a category leaves
-      // it open, so the list does not vanish from under the pointer.
-      open = Object.fromEntries(
-        found.flatMap((v) => v.tasks.map((t) => [key(v.mount, t.task), startsOpen(t)])),
-      )
-      scanned = true
+      show(await preview())
     } catch (e) {
       error = errorText(e)
     } finally {
       scanning = false
     }
     reloadRecords()
+  }
+
+  /** The newest scan time in `list`, in ms since the epoch; 0 for an empty list. */
+  const newest = (list: VolumePreview[]) =>
+    Math.max(0, ...list.map((v) => Date.parse(v.scanned_at)))
+
+  // A scan, a clean or an Ignore click owns the list while it runs.
+  const busy = () => scanning || cleaning || busyToggling
+
+  /**
+   * Shows the latest stored scan if it is newer than the list on the page.
+   * The stored scan can come from a notification, so the page lists what the
+   * notification counted. The ignore list may have changed since that scan,
+   * so the rows are re-checked against it.
+   */
+  async function loadStored() {
+    if (busy()) return
+    let found: VolumePreview[]
+    try {
+      found = await getLastPreview()
+    } catch (e) {
+      // Like history, the stored scan is a convenience; Scan still works.
+      console.error('last preview', e)
+      return
+    }
+    if (busy() || newest(found) <= newest(volumes)) return
+    show(found)
+    // Same handling as an Ignore change from Settings.
+    refreshProtection().catch((e) => (error = errorText(e)))
+  }
+
+  /** "14:02" for a scan today, "21 Oct, 14:02" for an older one. */
+  function scannedText(time: string): string {
+    const when = new Date(time)
+    const clock = when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+    if (when.toDateString() === new Date().toDateString()) return clock
+    const day = when.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
+    return `${day}, ${clock}`
   }
 
   // A clean appends once per task, and FSEvents reports each append as several
@@ -277,6 +323,14 @@
     }
   })
 
+  // A notification's scan lands while the window is open.
+  $effect(() => {
+    const unlisten = onPreviewChanged(loadStored)
+    return () => {
+      unlisten.then((stop) => stop())
+    }
+  })
+
   $effect(() =>
     onIgnoreChanged((change) => {
       if (change.source === 'clean') return
@@ -285,6 +339,7 @@
   )
 
   reloadRecords()
+  loadStored()
 </script>
 
 <main>
@@ -364,6 +419,7 @@
         <div class="row">
           <h2>{v.name}</h2>
           <span class="muted">{v.free_text}</span>
+          <span class="muted">· scanned {scannedText(v.scanned_at)}</span>
           <span class="spacer"></span>
           <span class="muted">up to {formatBytes(volumeTotal(v))}</span>
         </div>
