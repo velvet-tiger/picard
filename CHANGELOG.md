@@ -6,8 +6,11 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-21
+
 ### Added
 
+- Each category on the Clean page has a chevron toggle. After every scan a category is closed when nothing in it can be cleaned, and open otherwise. It is also open when the scan failed, so the error shows. A closed heading shows a summary. Closing hides the list only, so Select all and Clean still reach it.
 - The Clean page shows how much Picard has freed in total, and since when. The total is summed from `history.jsonl` (`get_totals` command).
 - The total and the "Recently removed" list on the Clean page update while the window is open when auto mode, the daily scan or `picard run` removes something. Picard watches `history.jsonl` and sends the window a `history-changed` event. Only those two parts reload; the scan results stay as they are.
 
@@ -15,6 +18,11 @@ All notable changes to Picard are recorded here. The format follows
 
 - The Clean page no longer scans when it opens. Press Scan to find build folders, caches and stale worktrees. The total and the "Recently removed" list still load on open.
 - Worktrees merged into a branch other than the default one are now found. A merge commit or a reflog `merge` entry in any local branch counts as merged, so repos that integrate into a branch such as `2.0-dev` are cleaned after `min_idle_minutes`. A worktree whose commits another local branch holds, with no record of a merge, is cleaned after `stale_days`.
+
+### Fixed
+
+- The scrollbar track is always reserved, so the tab bar and the cards keep the same width on every tab, whether or not the page scrolls.
+- After a failed first scan the Clean page no longer shows an empty-state line. The button stays labelled Scan until a scan succeeds.
 
 ## [0.2.0] - 2026-10-21
 
@@ -100,5 +108,6 @@ and removes build output and finished work when a drive runs low.
 - Disk image volume test (a918137).
 - Vitest tests for `api.ts`, Preview and Settings (5eeb28a).
 
+[0.3.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.3.0
 [0.2.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.2.0
 [0.1.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.1.0
