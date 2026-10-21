@@ -8,6 +8,7 @@
     getProtection,
     notifyIgnoreChanged,
     onIgnoreChanged,
+    onHistoryChanged,
     errorText,
     formatBytes,
     itemTitle,
@@ -87,8 +88,31 @@
     } finally {
       scanning = false
     }
-    loadHistory()
-    loadTotals()
+    reloadRecords()
+  }
+
+  // A clean appends once per task, and FSEvents reports each append as several
+  // events, each a `history-changed`. Reloads in flight absorb those events,
+  // and one more reload follows them,
+  // so the page ends on the newest file without a request per event.
+  let reloading = false
+  let reloadAgain = false
+
+  /** Reloads the total and "Recently removed" list. Never throws; both loaders log their own errors. */
+  async function reloadRecords() {
+    if (reloading) {
+      reloadAgain = true
+      return
+    }
+    reloading = true
+    try {
+      do {
+        reloadAgain = false
+        await Promise.all([loadHistory(), loadTotals()])
+      } while (reloadAgain)
+    } finally {
+      reloading = false
+    }
   }
 
   async function loadHistory() {
@@ -214,6 +238,16 @@
       item.holds_ignored = holds
     })
   }
+
+  // Background cleans (auto mode, the daily scan, the CLI) change the history
+  // while this page is open. Only the records reload; a rescan would be slow
+  // and would reset the ticks.
+  $effect(() => {
+    const unlisten = onHistoryChanged(reloadRecords)
+    return () => {
+      unlisten.then((stop) => stop())
+    }
+  })
 
   $effect(() =>
     onIgnoreChanged((change) => {

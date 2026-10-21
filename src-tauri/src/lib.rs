@@ -78,12 +78,20 @@ pub fn run() {
 
             // Capacity 16 is plenty: the loop drains the queue on every wake.
             let (tx, rx) = mpsc::channel(16);
-            match poll::start_watchers(&config_path, tx) {
+            let handle = app.handle().clone();
+            let on_history = move || {
+                if let Err(e) = windows::history_changed(&handle) {
+                    log::warn!("could not tell the window that history changed: {e}");
+                }
+            };
+            match poll::start_watchers(&config_path, tx, on_history) {
                 // Managed state keeps the watcher alive for the life of the app.
                 Ok(watcher) => {
                     app.manage(watcher);
                 }
-                Err(e) => log::error!("live reload and drive detection are off: {e:#}"),
+                Err(e) => log::error!(
+                    "live reload, drive detection and the Clean tab's history refresh are off: {e:#}"
+                ),
             }
 
             let shared = Arc::new(state::Shared::new(home, config_path));
