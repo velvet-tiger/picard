@@ -15,6 +15,7 @@ mod tasks;
 mod tray;
 mod updater;
 mod volume;
+mod welcome;
 mod windows;
 
 use std::sync::Arc;
@@ -105,12 +106,27 @@ pub fn run() {
             let shared = Arc::new(state::Shared::new(home, config_path));
             app.manage(Arc::clone(&shared));
             let poller = poll::Poller::new(app.handle().clone(), tray, Arc::clone(&shared));
-            tauri::async_runtime::spawn(poller.run(rx));
-            tauri::async_runtime::spawn(updater::run_in_background(
-                app.handle().clone(),
-                shared,
-                updates,
-            ));
+            // Nothing that cleans or updates runs until the first-run warning is
+            // accepted. Quit in the dialog exits before any of it starts.
+            let accepted = welcome::confirm(app.handle(), shared.paths.warning_accepted.clone());
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                match accepted.await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        log::info!("the first-run warning was declined; quitting");
+                        handle.exit(0);
+                        return;
+                    }
+                    Err(_) => {
+                        log::error!("the first-run warning closed without an answer; quitting");
+                        handle.exit(1);
+                        return;
+                    }
+                }
+                tauri::async_runtime::spawn(poller.run(rx));
+                tauri::async_runtime::spawn(updater::run_in_background(handle, shared, updates));
+            });
             Ok(())
         })
         .build(tauri::generate_context!())

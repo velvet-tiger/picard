@@ -29,6 +29,8 @@ pub struct DataPaths {
     pub lock: PathBuf,
     /// The local date of the last daily scan, as `YYYY-MM-DD`.
     pub daily_scan: PathBuf,
+    /// Exists once the user has accepted the first-run warning (see welcome.rs).
+    pub warning_accepted: PathBuf,
 }
 
 impl DataPaths {
@@ -38,6 +40,7 @@ impl DataPaths {
             history: dir.join("history.jsonl"),
             lock: dir.join("run.lock"),
             daily_scan: dir.join("daily-scan.txt"),
+            warning_accepted: dir.join("warning-accepted.txt"),
         }
     }
 }
