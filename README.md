@@ -10,7 +10,7 @@ Picard only works inside the folders you list as **roots**, such as `~/working`.
 
 | Task | Removes | Only when |
 |---|---|---|
-| `git_worktrees` | Linked git worktrees | Clean, not locked, not in use by any running process, and their commits are already in `main` (or `master`) or fully pushed. Merged ones go after `min_idle_minutes`, others after `stale_days`. |
+| `git_worktrees` | Linked git worktrees | Clean, not locked, not in use by any running process, and their commits are already in `main` (or `master`), in another local branch, or fully pushed. Merged ones go after `min_idle_minutes`, others after `stale_days`. |
 | `node_modules` | `node_modules` next to a `package.json` | The project has not changed for `stale_days`. |
 | `cargo_clean` | `target/` next to a `Cargo.toml` | The project has not changed for `stale_days`, or every project with `mode = "all"`. |
 | `python_venv` | `.venv` or `venv` holding a `pyvenv.cfg`, next to a `pyproject.toml`, `requirements.txt`, `setup.py`, `setup.cfg` or `Pipfile` | The project has not changed for `stale_days`. |
@@ -29,6 +29,8 @@ These rules always hold:
 - Only one cleanup runs at a time.
 
 A project "has not changed" when no file in it has a newer modification time. Build output does not count. Neither does agent config that tools such as Automatic rewrite on every sync: `.agents`, `.automatic`, `.automatic.json`, `.claude`, `.codex`, `.cursor`, `.gemini`, `.junie`, `.mcp.json`, `.opencode`, `.windsurf`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` and `opencode.json`. Edits you make to those by hand do not count either. Git checkouts inside them, such as `.claude/worktrees/*`, still count. Those are the defaults. Change the list in **Settings…** under "Changes that don't count as work", or set `activity_ignore` in the config. A list you set replaces the defaults, so it must name every default you want to keep. An empty list makes every change count. **Restore defaults** puts the default list back. When you save a list that holds exactly the defaults, Picard takes the key out of the config, with any comment above it, so later releases can update the defaults. This happens on any save from **Settings…**.
+
+A worktree counts as merged when git holds a record of the merge. Its HEAD is in the default branch, or another local branch has a merge commit with that HEAD as a parent other than the first, or another local branch's reflog shows a `merge` that moved it to that HEAD. The reflog covers fast-forward merges, but only while the reflog exists. A bare repo keeps no reflogs by default, and git expires old entries. So a repo that integrates into `develop` or `2.0-dev` works without any setting. The **Clean…** list says which branch, for example "merged into 2.0-dev by 374877e". A worktree whose commits another branch holds, with no record of a merge, waits for `stale_days`. Squash merges leave no record, so those worktrees wait for `stale_days` too, and only if a branch still holds their commits. Git cannot tell which way a merge went. A branch merged into any other local branch counts as merged, even when the merge only synced that branch. For example, if feature branch B merges in unfinished work from feature branch A, A's worktree counts as merged. Its branch is kept, so no commit is lost. Ignored files in the worktree, such as a local `.env`, are lost. In **Ask** mode you can untick or **Ignore** it.
 
 One thing to know: removing a worktree also deletes files git ignores inside it, such as a local `.env`. Git's own `git worktree remove` behaves the same way. The same goes for `build_output`: it trusts your `.gitignore`. If you keep files you cannot rebuild in an ignored `build` folder, add that folder to `exclude`. Picard keeps a worktree that holds another checkout by finding its `.git`. A checkout made with `--separate-git-dir`, or one whose git folder lives elsewhere, has no `.git` inside the worktree, so exclude it yourself.
 
@@ -211,7 +213,7 @@ chmod go-w ~/Library/Application\ Support/Picard ~/Library/Application\ Support/
 
 **No notifications appear.** Check System Settings, then Notifications, then Picard. In a development build (`make dev`), notifications come from "Terminal" instead, so allow them for Terminal.
 
-**A worktree is never offered.** Picard keeps worktrees that a running process is using, such as an open Claude Code session or terminal. It also keeps any with uncommitted changes, unmerged commits, submodules, or filters set in the repo's own git config.
+**A worktree is never offered.** Picard keeps worktrees that a running process is using, such as an open Claude Code session or terminal. It also keeps any with uncommitted changes, commits that no other branch or remote holds, unsafe submodules, or filters set in the repo's own git config.
 
 **Roots in Documents, Desktop or Downloads.** macOS asks for permission before an app reads these folders. Allow it when asked, or give Picard Full Disk Access in System Settings, then Privacy & Security.
 

@@ -7,10 +7,24 @@
 //! - `git status --porcelain` is empty, so nothing uncommitted or untracked
 //! - any checked-out submodule is clean and holds no commit missing from its
 //!   remote branches (`GitCmd::unsafe_to_inspect`)
-//! - its commits exist elsewhere: HEAD is in the default branch, or its branch
-//!   has an upstream with nothing unpushed
-//! - and either HEAD is in the default branch and the folder has been idle for
-//!   `min_idle`, or the folder has been idle for `stale_days`
+//! - its commits exist elsewhere: HEAD is in the default branch, or in a local
+//!   branch other than its own, or its branch has an upstream with nothing
+//!   unpushed
+//! - and either it was merged and the folder has been idle for `min_idle`, or
+//!   the folder has been idle for `stale_days`
+//!
+//! "Merged" needs evidence, because the branch a repo integrates into is not
+//! always the default one, and being contained in some branch proves nothing.
+//! It holds when HEAD is in the default branch, or when another local branch
+//! has a merge commit with HEAD as a non-first parent, or when another local
+//! branch's reflog records a `merge` that moved it to HEAD. The reflog catches
+//! fast-forward merges, which leave no merge commit. It needs reflogs, which a
+//! bare repo does not keep by default and `gc` expires; without one, a
+//! fast-forward waits for `stale_days`. Neither check can tell which way a
+//! merge went. A branch merged into any other local branch counts as merged,
+//! even when the merge only synced the other branch, such as a feature branch
+//! pulling in unfinished work from a second one. The branch is kept, so no
+//! commit is lost, but ignored files in the worktree are.
 //!
 //! Removal is `git worktree remove` without `--force`, so git refuses anything
 //! dirty or locked as a second guard. The exception is a worktree with
@@ -37,6 +51,28 @@ const SECS_PER_DAY: u64 = 86_400;
 /// Supplies the in-use list. `lsof` in the app, a fixed list in tests.
 pub type InUseSource = Arc<dyn Fn() -> Result<InUse> + Send + Sync>;
 
+/// Where a worktree's commits are, which decides whether and when it can go.
+#[derive(Debug, PartialEq)]
+enum Standing {
+    /// There is evidence it was merged. It can go once idle for `min_idle`.
+    /// Holds the start of the candidate reason, such as "merged into dev".
+    Merged(String),
+    /// Its commits survive the removal, but nothing shows it was merged. It
+    /// can go once idle for `stale_days`.
+    Elsewhere,
+    /// Removing it could lose commits.
+    Unsafe,
+}
+
+/// The branches of one repo that every worktree in it is judged against.
+struct RepoBranches {
+    /// The default branch, from `default_branch`.
+    default: String,
+    /// The branch checked out in the main worktree, if any. It proves nothing
+    /// about merges. It only goes first when a reason names a branch.
+    main_checkout: Option<String>,
+}
+
 pub struct GitWorktrees {
     git: GitCmd,
     stale_days: u32,
@@ -58,7 +94,7 @@ impl GitWorktrees {
     fn assess(
         &self,
         repo: &Path,
-        default_branch: &str,
+        branches: &RepoBranches,
         wt: &WorktreeEntry,
         ctx: &Ctx,
         in_use: &InUse,
@@ -85,18 +121,12 @@ impl GitWorktrees {
             log::debug!("worktree {}: has uncommitted changes", wt.path.display());
             return Ok(None);
         }
-        let merged = self.git.check(
-            repo,
-            &["merge-base", "--is-ancestor", &wt.head, default_branch],
-        )?;
-        let pushed = match &wt.branch {
-            Some(branch) if !merged => self.fully_pushed(repo, branch)?,
-            _ => false,
-        };
-        if !merged && !pushed {
+        let standing = self.standing(repo, branches, wt)?;
+        if standing == Standing::Unsafe {
             log::debug!(
-                "worktree {}: has commits that are not in {default_branch} or pushed",
-                wt.path.display()
+                "worktree {}: has commits that are not in {}, another local branch, or pushed",
+                wt.path.display(),
+                branches.default
             );
             return Ok(None);
         }
@@ -107,16 +137,168 @@ impl GitWorktrees {
             return Ok(None);
         };
         let stale = Duration::from_secs(u64::from(self.stale_days) * SECS_PER_DAY);
-        if merged && idle >= self.min_idle {
-            return Ok(Some(format!(
-                "merged into {default_branch}, idle {}",
-                format_idle(idle)
-            )));
+        if let Standing::Merged(how) = &standing
+            && idle >= self.min_idle
+        {
+            return Ok(Some(format!("{how}, idle {}", format_idle(idle))));
         }
         if idle >= stale {
             return Ok(Some(format!("idle {}", format_idle(idle))));
         }
         Ok(None)
+    }
+
+    /// Decides where a worktree's commits are. Reads only; runs no program a
+    /// repo can configure.
+    fn standing(
+        &self,
+        repo: &Path,
+        branches: &RepoBranches,
+        wt: &WorktreeEntry,
+    ) -> Result<Standing> {
+        let default = branches.default.as_str();
+        if self
+            .git
+            .check(repo, &["merge-base", "--is-ancestor", &wt.head, default])?
+        {
+            return Ok(Standing::Merged(format!("merged into {default}")));
+        }
+        let others = self.other_branches_containing(repo, branches, wt)?;
+        if let Some(how) = self.merge_evidence(repo, &wt.head, &others)? {
+            return Ok(Standing::Merged(how));
+        }
+        if !others.is_empty() {
+            return Ok(Standing::Elsewhere);
+        }
+        let pushed = match &wt.branch {
+            Some(branch) => self.fully_pushed(repo, branch)?,
+            None => false,
+        };
+        Ok(if pushed {
+            Standing::Elsewhere
+        } else {
+            Standing::Unsafe
+        })
+    }
+
+    /// Local branches that contain the worktree's HEAD, apart from its own.
+    /// The branch checked out in the main worktree comes first, then the rest
+    /// by name. The order only decides which branch a reason names.
+    fn other_branches_containing(
+        &self,
+        repo: &Path,
+        branches: &RepoBranches,
+        wt: &WorktreeEntry,
+    ) -> Result<Vec<String>> {
+        let raw = self.git.output(
+            repo,
+            &[
+                "for-each-ref",
+                "--contains",
+                &wt.head,
+                "--format=%(refname)",
+                "refs/heads/",
+            ],
+        )?;
+        let mut others: Vec<String> = raw
+            .lines()
+            .filter_map(|r| r.strip_prefix("refs/heads/"))
+            .filter(|b| wt.branch.as_deref() != Some(*b))
+            .map(str::to_string)
+            .collect();
+        if let Some(main) = &branches.main_checkout
+            && let Some(i) = others.iter().position(|b| b == main)
+        {
+            let b = others.remove(i);
+            others.insert(0, b);
+        }
+        Ok(others)
+    }
+
+    /// Why `head` counts as merged into one of `branches`, or None if nothing
+    /// shows it was. A merge commit is checked first, then the reflogs.
+    fn merge_evidence(
+        &self,
+        repo: &Path,
+        head: &str,
+        branches: &[String],
+    ) -> Result<Option<String>> {
+        if branches.is_empty() {
+            return Ok(None);
+        }
+        if let Some(merge) = self.merge_commit_of(repo, head, branches)? {
+            for b in branches {
+                let tip = format!("refs/heads/{b}");
+                if self
+                    .git
+                    .check(repo, &["merge-base", "--is-ancestor", &merge, &tip])?
+                {
+                    let short: String = merge.chars().take(7).collect();
+                    return Ok(Some(format!("merged into {b} by {short}")));
+                }
+            }
+        }
+        Ok(self
+            .reflog_merged_into(repo, head, branches)?
+            .map(|b| format!("merged into {b} (reflog)")))
+    }
+
+    /// A merge commit in `branches` that has `head` as a non-first parent.
+    /// Refs are passed in full, so a branch name can never read as an option.
+    fn merge_commit_of(
+        &self,
+        repo: &Path,
+        head: &str,
+        branches: &[String],
+    ) -> Result<Option<String>> {
+        let exclude = format!("^{head}");
+        let tips: Vec<String> = branches.iter().map(|b| format!("refs/heads/{b}")).collect();
+        let mut args = vec![
+            "rev-list",
+            "--merges",
+            "--parents",
+            "--ancestry-path",
+            exclude.as_str(),
+        ];
+        args.extend(tips.iter().map(String::as_str));
+        let raw = self.git.output(repo, &args)?;
+        Ok(raw.lines().find_map(|line| {
+            let mut ids = line.split_whitespace();
+            let merge = ids.next()?;
+            // The first parent is the branch merged into, so skip it.
+            ids.skip(1)
+                .any(|parent| parent == head)
+                .then(|| merge.to_string())
+        }))
+    }
+
+    /// The first of `branches` whose reflog records a `merge` that moved it to
+    /// `head`. One git call reads every reflog, so a repo with many branches
+    /// costs one process per worktree. A missing or expired reflog reads as
+    /// empty. `--no-show-signature` stops repo config from making `log` run gpg.
+    fn reflog_merged_into(
+        &self,
+        repo: &Path,
+        head: &str,
+        branches: &[String],
+    ) -> Result<Option<String>> {
+        let refs: Vec<String> = branches.iter().map(|b| format!("refs/heads/{b}")).collect();
+        let mut args = vec![
+            "log",
+            "--walk-reflogs",
+            "--no-show-signature",
+            "--format=%H%x09%gD%x09%gs",
+        ];
+        args.extend(refs.iter().map(String::as_str));
+        let raw = self.git.output(repo, &args)?;
+        let merged: Vec<&str> = raw
+            .lines()
+            .filter_map(|line| reflog_merge_branch(line, head))
+            .collect();
+        Ok(branches
+            .iter()
+            .find(|b| merged.contains(&b.as_str()))
+            .cloned())
     }
 
     /// True if `branch` has an upstream and nothing on it is unpushed.
@@ -189,10 +371,15 @@ impl GitWorktrees {
         let raw = self
             .git
             .output(repo, &["worktree", "list", "--porcelain", "-z"])?;
-        let mut found = Vec::new();
+        let worktrees = parse_worktree_list(&raw);
         // The first entry is always the main worktree.
-        for wt in parse_worktree_list(&raw).iter().skip(1) {
-            match self.assess(repo, &default_branch, wt, ctx, in_use) {
+        let branches = RepoBranches {
+            default: default_branch,
+            main_checkout: worktrees.first().and_then(|w| w.branch.clone()),
+        };
+        let mut found = Vec::new();
+        for wt in worktrees.iter().skip(1) {
+            match self.assess(repo, &branches, wt, ctx, in_use) {
                 Ok(Some(reason)) => found.push((wt.path.clone(), reason)),
                 Ok(None) => {}
                 Err(e) => log::warn!("worktree {}: {e:#}", wt.path.display()),
@@ -399,6 +586,19 @@ fn written_since(dir: &Path, since: SystemTime, skip_build: bool) -> bool {
                 .and_then(|m| m.modified().ok())
                 .is_none_or(|modified| modified > since),
         })
+}
+
+/// The branch a reflog line belongs to, if the line records a `merge` that
+/// moved the branch to `head`. Lines are `<commit>\t<ref>@{<n>}\t<subject>`.
+/// Git refuses `@{` in branch names, so the last one ends the name.
+fn reflog_merge_branch<'a>(line: &'a str, head: &str) -> Option<&'a str> {
+    let mut fields = line.splitn(3, '\t');
+    let (id, selector, subject) = (fields.next()?, fields.next()?, fields.next()?);
+    if id != head || !subject.starts_with("merge ") {
+        return None;
+    }
+    let (name, _) = selector.strip_prefix("refs/heads/")?.rsplit_once("@{")?;
+    Some(name)
 }
 
 fn format_idle(idle: Duration) -> String {
@@ -634,6 +834,276 @@ mod tests {
         age(&fx, &off_main, 60);
         let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found), vec!["agent-on-main"]);
+    }
+
+    /// Checks out a new `dev` branch in the main worktree, as a repo that
+    /// integrates somewhere other than its default branch does.
+    fn integrate_on_dev(repo: &Path) {
+        git(repo, &["checkout", "-q", "-b", "dev"]);
+    }
+
+    fn reason_of<'a>(found: &'a [Candidate], name: &str) -> &'a str {
+        &found
+            .iter()
+            .find(|c| c.path.file_name().is_some_and(|n| n == name))
+            .unwrap_or_else(|| panic!("{name} is not a candidate: {found:?}"))
+            .reason
+    }
+
+    #[test]
+    fn merge_commit_into_another_branch_counts_as_merged() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        integrate_on_dev(&r);
+        let wt = worktree(&r, "feat");
+        commit(&wt, "feature");
+        git(&r, &["merge", "-q", "--no-ff", "-m", "merge feat", "feat"]);
+        // Cut after the merge, so it holds the merge commit too. It sorts
+        // before "dev", so only the main checkout coming first names dev.
+        git(&r, &["branch", "aaa-later"]);
+        age(&fx, &wt, 1);
+
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["feat"]);
+        let reason = reason_of(&found, "feat");
+        assert!(reason.starts_with("merged into dev by "), "{reason}");
+        assert!(reason.ends_with(", idle 24 h"), "{reason}");
+
+        let report = t.run(&ctx, &found);
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(git(&r, &["branch", "--list", "feat"]).contains("feat"));
+    }
+
+    #[test]
+    fn fast_forward_into_another_branch_counts_as_merged_from_the_reflog() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        integrate_on_dev(&r);
+        let wt = worktree(&r, "ff");
+        commit(&wt, "feature");
+        git(&r, &["merge", "-q", "--ff-only", "ff"]);
+        age(&fx, &wt, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found), vec!["ff"]);
+        assert_eq!(
+            reason_of(&found, "ff"),
+            "merged into dev (reflog), idle 24 h"
+        );
+    }
+
+    #[test]
+    fn detached_head_at_a_merge_result_counts_as_merged_from_the_reflog() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        integrate_on_dev(&r);
+        let feat = worktree(&r, "feat");
+        commit(&feat, "feature");
+        git(&r, &["merge", "-q", "--no-ff", "-m", "merge feat", "feat"]);
+        let at_merge = r.join(".claude/worktrees/at-merge");
+        git(
+            &r,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                at_merge.to_str().unwrap(),
+                "dev",
+            ],
+        );
+        age(&fx, &at_merge, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(
+            reason_of(&found, "at-merge"),
+            "merged into dev (reflog), idle 24 h"
+        );
+    }
+
+    #[test]
+    fn branch_held_by_another_branch_without_a_merge_waits_for_stale_days() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "base");
+        commit(&wt, "work");
+        // A branch stacked on top: the commits survive, but nothing merged them.
+        git(&r, &["branch", "stacked", "base"]);
+        age(&fx, &wt, 5);
+        assert!(
+            task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty(),
+            "not stale yet"
+        );
+        age(&fx, &wt, 20);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found), vec!["base"]);
+        assert_eq!(reason_of(&found, "base"), "idle 20 days");
+    }
+
+    /// A detached worktree whose commit is held only by a branch made for it,
+    /// as Claude Code does. The branch keeps the commit safe, but it is the
+    /// worktree's own unmerged work, so it must not count as merged.
+    #[test]
+    fn detached_head_held_only_by_its_own_branch_waits_for_stale_days() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = r.join(".claude/worktrees/agent-own");
+        git(
+            &r,
+            &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+        );
+        commit(&wt, "agent-work");
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        git(&r, &["branch", "agent-own-branch", head.trim()]);
+        age(&fx, &wt, 1);
+        assert!(
+            task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty(),
+            "not stale yet"
+        );
+        age(&fx, &wt, 20);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(reason_of(&found, "agent-own"), "idle 20 days");
+    }
+
+    /// When a branch merges something else in, the branch's own commit is
+    /// the merge's first parent. That is not evidence it was merged anywhere.
+    #[test]
+    fn first_parent_of_a_merge_does_not_count_as_merged() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "base");
+        commit(&wt, "work");
+        git(&r, &["branch", "other", "main"]);
+        git(&r, &["checkout", "-q", "other"]);
+        commit(&r, "other-work");
+        git(&r, &["checkout", "-q", "-b", "combo", "base"]);
+        git(
+            &r,
+            &["merge", "-q", "--no-ff", "-m", "merge other", "other"],
+        );
+        git(&r, &["checkout", "-q", "main"]);
+        age(&fx, &wt, 1);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_branch_in_an_octopus_merge_counts_as_merged() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        integrate_on_dev(&r);
+        let a = worktree(&r, "octo-a");
+        commit(&a, "a.txt");
+        let b = worktree(&r, "octo-b");
+        commit(&b, "b.txt");
+        git(
+            &r,
+            &[
+                "merge", "-q", "--no-ff", "-m", "octopus", "octo-a", "octo-b",
+            ],
+        );
+        age(&fx, &a, 1);
+        age(&fx, &b, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        for name in ["octo-a", "octo-b"] {
+            let reason = reason_of(&found, name);
+            assert!(reason.starts_with("merged into dev by "), "{reason}");
+        }
+    }
+
+    /// Without its reflog, a fast-forward leaves no record. The commits are
+    /// still in another branch, so the worktree waits for `stale_days`.
+    #[test]
+    fn fast_forward_with_an_expired_reflog_waits_for_stale_days() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        integrate_on_dev(&r);
+        let wt = worktree(&r, "ff-old");
+        commit(&wt, "feature");
+        git(&r, &["merge", "-q", "--ff-only", "ff-old"]);
+        git(&r, &["reflog", "expire", "--expire=now", "--all"]);
+        age(&fx, &wt, 1);
+        assert!(
+            task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty(),
+            "not stale yet"
+        );
+        age(&fx, &wt, 20);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(reason_of(&found, "ff-old"), "idle 20 days");
+    }
+
+    /// Git cannot tell which way a merge went. Merging a branch into another
+    /// to sync it, here an integration branch into a feature branch, counts
+    /// as merged. The README and module doc say so. The branch is kept.
+    #[test]
+    fn a_branch_merged_in_to_sync_another_counts_as_merged() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let dev = worktree(&r, "dev");
+        commit(&dev, "integration-work");
+        git(&r, &["checkout", "-q", "-b", "feature"]);
+        commit(&r, "feature-work");
+        git(&r, &["merge", "-q", "--no-ff", "-m", "sync dev", "dev"]);
+        age(&fx, &dev, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        let reason = reason_of(&found, "dev");
+        assert!(reason.starts_with("merged into feature by "), "{reason}");
+    }
+
+    /// A detached worktree with a commit no branch holds, and a repo that
+    /// rewrites `main`'s history to claim that commit as a parent.
+    fn detached_commit_claimed_by_main(fx: &Fixture, name: &str) -> (PathBuf, PathBuf, String) {
+        let r = repo(fx);
+        let wt = r.join(".claude/worktrees").join(name);
+        git(
+            &r,
+            &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+        );
+        commit(&wt, "orphan-work");
+        let x = git(&wt, &["rev-parse", "HEAD"]).trim().to_string();
+        (r, wt, x)
+    }
+
+    #[test]
+    fn replace_ref_cannot_make_a_commit_look_merged() {
+        let fx = Fixture::new(&[]);
+        let (r, wt, x) = detached_commit_claimed_by_main(&fx, "replaced");
+        git(&r, &["replace", "--graft", "main", &x]);
+        age(&fx, &wt, 30);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn grafts_keep_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let (r, wt, x) = detached_commit_claimed_by_main(&fx, "grafted");
+        let main = git(&r, &["rev-parse", "main"]);
+        std::fs::write(r.join(".git/info/grafts"), format!("{} {x}\n", main.trim())).unwrap();
+        age(&fx, &wt, 30);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+        assert_eq!(
+            refusal(&wt),
+            "repo has info/grafts, which can make history look merged"
+        );
+    }
+
+    #[test]
+    fn reads_the_branch_from_a_reflog_merge_line() {
+        let head = "a".repeat(40);
+        let line = |id: &str, subject: &str| format!("{id}\trefs/heads/fix/x@y@{{3}}\t{subject}");
+        assert_eq!(
+            reflog_merge_branch(&line(&head, "merge fix/z: Fast-forward"), &head),
+            Some("fix/x@y")
+        );
+        assert_eq!(
+            reflog_merge_branch(&line(&head, "branch: Created from main"), &head),
+            None
+        );
+        assert_eq!(
+            reflog_merge_branch(&line(&"b".repeat(40), "merge z: Fast-forward"), &head),
+            None
+        );
+        assert_eq!(reflog_merge_branch("garbage", &head), None);
     }
 
     #[test]

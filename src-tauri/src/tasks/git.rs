@@ -49,13 +49,16 @@ impl GitCmd {
         // Picard runs git unattended in every repo under the roots, including
         // repos it did not create (an unpacked archive can carry a .git folder).
         // Repo config can name programs for git to run. Command-line config wins
-        // over repo config, so these two cannot be set by a repo. Filters are
+        // over repo config, so these cannot be set by a repo. With
+        // `log.showSignature`, `git log` runs `gpg.program`. Filters are
         // handled by `untrusted_filters`, because their names are not known ahead.
         cmd.args([
             "-c",
             "core.fsmonitor=false",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "log.showSignature=false",
         ]);
         cmd.arg("-C").arg(dir).args(args);
         // Picard only reads, apart from `worktree remove`. Skipping optional
@@ -69,6 +72,11 @@ impl GitCmd {
         // covers older git, and environment beats repo `protocol.*.allow`.
         cmd.env("GIT_NO_LAZY_FETCH", "1");
         cmd.env("GIT_ALLOW_PROTOCOL", "none");
+        // A replace ref can make a commit look contained in, or merged into, a
+        // branch that does not hold it. Picard decides safety from history, so
+        // it reads the real one. Grafts do the same and are refused in
+        // `unsafe_to_inspect`, because no variable turns them off.
+        cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
         if let Some(path) = &self.path_var {
             cmd.env("PATH", path);
         }
@@ -168,6 +176,15 @@ impl GitCmd {
     /// Only then is nothing lost. The checkout is checked before git runs
     /// `status` in it, and nothing here runs a program the repos name.
     pub fn unsafe_to_inspect(&self, dir: &Path) -> Result<Option<String>> {
+        let common = self.output(
+            dir,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        if std::fs::symlink_metadata(Path::new(common.trim()).join("info/grafts")).is_ok() {
+            return Ok(Some(
+                "repo has info/grafts, which can make history look merged".to_string(),
+            ));
+        }
         let filters = self.untrusted_filters(dir)?;
         if !filters.is_empty() {
             return Ok(Some(format!(
@@ -506,6 +523,21 @@ pub fn parse_worktree_list(raw: &str) -> Vec<WorktreeEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Repo config cannot turn on `log.showSignature`, which makes `git log`
+    /// run the repo's `gpg.program`.
+    #[test]
+    fn repo_config_cannot_turn_on_signature_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitCmd::default();
+        git.output(dir.path(), &["init", "-q"]).unwrap();
+        git.output(dir.path(), &["config", "log.showSignature", "true"])
+            .unwrap();
+        let seen = git
+            .output(dir.path(), &["config", "--bool", "log.showSignature"])
+            .unwrap();
+        assert_eq!(seen.trim(), "false");
+    }
 
     #[test]
     fn parses_main_branch_detached_locked_and_prunable() {
