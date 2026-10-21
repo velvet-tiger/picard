@@ -17,6 +17,7 @@
     "allow-pick-folder",
     "allow-get-ignored",
     "allow-set-ignored",
-    "allow-get-protection"
+    "allow-get-protection",
+    "allow-get-not-activity"
   ]
 }

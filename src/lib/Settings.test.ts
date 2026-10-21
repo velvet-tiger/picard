@@ -15,6 +15,7 @@ function config(): Settings {
     daily_scan: '05:30',
     roots: ['~/working'],
     exclude: [],
+    activity_ignore: [],
     tasks: [{ type: 'node_modules', enabled: true, stale_days: 30, prune_package_caches: false }],
   }
 }
@@ -27,6 +28,7 @@ function backend(handlers: Record<string, Handler> = {}) {
     get_settings: () => config(),
     get_launch_at_login: () => false,
     get_ignored: () => ignored,
+    get_not_activity: () => ['.claude', 'AGENTS.md'],
     save_settings: () => null,
     set_ignored: (args) => {
       ignored = ignored.filter((p) => p !== args.path)
@@ -87,6 +89,83 @@ describe('Settings', () => {
       { settings: expect.objectContaining({ roots: ['~/projects'], exclude: [] }) },
     ])
     expect(view.hasUnsavedChanges()).toBe(false)
+  })
+
+  it('shows the built-in names that never count as work', async () => {
+    backend()
+    await renderLoaded()
+
+    expect(await screen.findByText('Built in: .claude, AGENTS.md')).toBeInTheDocument()
+  })
+
+  it('saves added names, trimmed, and drops blank ones', async () => {
+    const { sent } = backend()
+    const view = await renderLoaded()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Add name' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Add name' }))
+    const [first] = screen.getAllByPlaceholderText('.vscode')
+    await fireEvent.input(first, { target: { value: '  .vscode  ' } })
+    expect(view.hasUnsavedChanges()).toBe(true)
+    await fireEvent.click(saveButton())
+
+    expect(
+      await screen.findByText('Saved. Picard has reloaded the settings.'),
+    ).toBeInTheDocument()
+    expect(sent('save_settings')).toEqual([
+      { settings: expect.objectContaining({ activity_ignore: ['.vscode'] }) },
+    ])
+    expect(view.hasUnsavedChanges()).toBe(false)
+  })
+
+  it('still loads when the built-in names cannot be read', async () => {
+    backend({
+      get_not_activity: () => {
+        throw 'not allowed'
+      },
+    })
+    await renderLoaded()
+
+    expect(
+      await screen.findByText('Could not read the built-in names: not allowed'),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Add name' })).toBeInTheDocument()
+  })
+
+  it('sends an emptied list after Remove', async () => {
+    const { sent } = backend({
+      get_settings: () => ({ ...config(), activity_ignore: ['.vscode'] }),
+    })
+    await renderLoaded()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove .vscode' }))
+    await fireEvent.click(saveButton())
+
+    await screen.findByText('Saved. Picard has reloaded the settings.')
+    expect(sent('save_settings')).toEqual([
+      { settings: expect.objectContaining({ activity_ignore: [] }) },
+    ])
+  })
+
+  it('shows the error for an invalid name and keeps it to fix', async () => {
+    const message =
+      'activity_ignore entry "src/lib" must be a plain file or folder name, not a path or pattern'
+    backend({
+      save_settings: () => {
+        throw message
+      },
+    })
+    const view = await renderLoaded()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Add name' }))
+    await fireEvent.input(screen.getByPlaceholderText('.vscode'), {
+      target: { value: 'src/lib' },
+    })
+    await fireEvent.click(saveButton())
+
+    expect(await screen.findByText(message)).toBeInTheDocument()
+    expect(screen.getByDisplayValue('src/lib')).toBeInTheDocument()
+    expect(view.hasUnsavedChanges()).toBe(true)
   })
 
   it('shows the save error and keeps the edits', async () => {

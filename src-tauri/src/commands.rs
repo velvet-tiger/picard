@@ -20,7 +20,7 @@ use crate::poll;
 use crate::runner::{self, CleanRequest, TaskScan, VolumeRun};
 use crate::settings::{self, Settings};
 use crate::state::Shared;
-use crate::tasks::{IgnoreList, Protected};
+use crate::tasks::{IgnoreList, NOT_ACTIVITY, Protected};
 use crate::volume::Volume;
 
 type SharedState<'a> = State<'a, Arc<Shared>>;
@@ -159,6 +159,13 @@ pub async fn save_settings(state: SharedState<'_>, settings: Settings) -> Result
         Ok(())
     })
     .await
+}
+
+/// The built-in names whose changes never count as work, for the Settings
+/// tab to show beside the user's own `activity_ignore` names.
+#[tauri::command]
+pub fn get_not_activity() -> Vec<String> {
+    NOT_ACTIVITY.iter().map(|name| name.to_string()).collect()
 }
 
 /// The `ignore` list as written in the config, for the Settings tab.
@@ -477,6 +484,14 @@ fn run_view(name: &str, result: Result<VolumeRun, String>) -> RunResult {
 mod tests {
     use super::*;
     use crate::tasks::{Candidate, Estimate, Removed};
+
+    #[test]
+    fn not_activity_lists_the_built_in_names() {
+        let names = get_not_activity();
+        assert_eq!(names.len(), NOT_ACTIVITY.len());
+        assert!(names.contains(&"AGENTS.md".to_string()));
+        assert!(names.contains(&".claude".to_string()));
+    }
 
     #[test]
     fn preview_is_refused_only_while_a_clean_runs() {

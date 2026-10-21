@@ -554,13 +554,32 @@ fn validate_activity_ignore(name: &str) -> Result<()> {
         || name == "."
         || name == ".."
         || name.contains('/')
-        || name.chars().any(|c| c.is_control() || "*?[]\\".contains(c))
+        || name
+            .chars()
+            .any(|c| c.is_control() || is_invisible(c) || "*?[]\\".contains(c))
     {
         bail!(
             "activity_ignore entry {name:?} must be a plain file or folder name, not a path or pattern"
         );
     }
     Ok(())
+}
+
+/// Characters that show as nothing or change text direction: whitespace other
+/// than a plain space, zero-width and joining marks, direction overrides and
+/// the byte order mark. A name holding one looks like another name but never
+/// matches it.
+fn is_invisible(c: char) -> bool {
+    (c.is_whitespace() && c != ' ')
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
 }
 
 /// Checks task options that serde cannot.
@@ -853,6 +872,24 @@ mod tests {
             ));
             assert!(e.contains("activity_ignore"), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn rejects_activity_ignore_names_with_invisible_characters() {
+        for bad in [
+            "a\u{200B}b",
+            "\u{FEFF}AGENTS.md",
+            "a\u{202E}b",
+            "a\u{2028}b",
+            "a\u{00A0}b",
+            "a\u{00AD}b",
+        ] {
+            assert!(validate_activity_ignore(bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_activity_ignore("my notes.md").is_ok());
+        // As written in a file, with TOML's own escape.
+        let e = parse_err("min_free_gb = 1\nroots = [\"/a\"]\nactivity_ignore = [\"a\\u200Bb\"]");
+        assert!(e.contains("activity_ignore"), "{e}");
     }
 
     #[test]

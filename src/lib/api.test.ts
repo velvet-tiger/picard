@@ -3,6 +3,7 @@ import {
   BUILT_IN_TASKS,
   errorText,
   formatBytes,
+  getNotActivity,
   getProtection,
   itemTitle,
   newTask,
@@ -211,9 +212,16 @@ describe('backend commands', () => {
       daily_scan: null,
       roots: ['~/working'],
       exclude: [],
+      activity_ignore: [],
       tasks: [],
     }
     await saveSettings(settings)
     expect(sent('save_settings')).toEqual([{ settings }])
+  })
+
+  it('asks get_not_activity for the built-in names, with no arguments', async () => {
+    const { sent } = fakeBackend({ get_not_activity: () => ['.claude'] })
+    expect(await getNotActivity()).toEqual(['.claude'])
+    expect(sent('get_not_activity')).toHaveLength(1)
   })
 })

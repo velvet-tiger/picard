@@ -50,6 +50,7 @@ pub fn run() {
             commands::get_ignored,
             commands::set_ignored,
             commands::get_protection,
+            commands::get_not_activity,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

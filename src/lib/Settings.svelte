@@ -6,6 +6,7 @@
     setLaunchAtLogin,
     pickFolder,
     getIgnored,
+    getNotActivity,
     setIgnored,
     notifyIgnoreChanged,
     onIgnoreChanged,
@@ -61,6 +62,18 @@
 
   $effect(() => onIgnoreChanged(() => loadIgnored()))
 
+  // Fixed in the app, shown so the user can see what is already left out.
+  let builtInNames = $state<string[]>([])
+  let builtInError = $state<string | null>(null)
+
+  async function loadBuiltInNames() {
+    try {
+      builtInNames = await getNotActivity()
+    } catch (e) {
+      builtInError = `Could not read the built-in names: ${errorText(e)}`
+    }
+  }
+
   // The time to restore when the daily scan is ticked again after unticking it.
   let lastDailyTime = '03:00'
 
@@ -109,10 +122,12 @@
     const clean = $state.snapshot(settings)
     clean.roots = clean.roots.map((r) => r.trim()).filter(Boolean)
     clean.exclude = clean.exclude.map((p) => p.trim()).filter(Boolean)
+    clean.activity_ignore = clean.activity_ignore.map((n) => n.trim()).filter(Boolean)
     try {
       await saveSettings(clean)
       settings.roots = clean.roots
       settings.exclude = clean.exclude
+      settings.activity_ignore = clean.activity_ignore
       savedJson = JSON.stringify(settings)
       saved = true
     } catch (e) {
@@ -175,6 +190,7 @@
 
   load()
   loadIgnored()
+  loadBuiltInNames()
 </script>
 
 <main>
@@ -280,6 +296,33 @@
         </div>
       {/each}
       <button onclick={() => settings!.exclude.push('')}>Add pattern</button>
+
+      <h2 class="sub">Changes that don't count as work</h2>
+      <p class="muted">
+        A project is idle when nothing in it has changed. Changes to files or folders with these
+        names never count, at any depth. Git checkouts inside them, such as .claude/worktrees,
+        still do.
+      </p>
+      {#if builtInError}
+        <p class="error">{builtInError}</p>
+      {:else if builtInNames.length > 0}
+        <p class="muted path">Built in: {builtInNames.join(', ')}</p>
+      {/if}
+      {#each settings.activity_ignore as _, i}
+        <div class="row">
+          <input
+            class="wide path"
+            bind:value={settings.activity_ignore[i]}
+            placeholder=".vscode"
+            aria-label="Name that does not count as work"
+          />
+          <button
+            onclick={() => settings!.activity_ignore.splice(i, 1)}
+            aria-label={`Remove ${settings.activity_ignore[i] || 'blank name'}`}>Remove</button
+          >
+        </div>
+      {/each}
+      <button onclick={() => settings!.activity_ignore.push('')}>Add name</button>
 
       <h2 class="sub">Ignored folders</h2>
       <p class="muted">

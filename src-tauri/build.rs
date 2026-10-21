@@ -14,6 +14,7 @@ const COMMANDS: &[&str] = &[
     "get_ignored",
     "set_ignored",
     "get_protection",
+    "get_not_activity",
 ];
 
 fn main() {

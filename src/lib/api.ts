@@ -37,6 +37,8 @@ export interface Settings {
   daily_scan: string | null
   roots: string[]
   exclude: string[]
+  /** Names added to the built-in list whose changes do not count as work. */
+  activity_ignore: string[]
   tasks: Task[]
 }
 
@@ -96,6 +98,8 @@ export const preview = () => invoke<VolumePreview[]>('preview')
 export const runSelected = (selections: Selection[]) =>
   invoke<RunResult[]>('run_selected', { selections })
 export const getHistory = (limit: number) => invoke<HistoryEntry[]>('get_history', { limit })
+/** The built-in file and folder names whose changes never count as work. */
+export const getNotActivity = () => invoke<string[]>('get_not_activity')
 /** The config's `ignore` list as written, so `~/…` stays `~/…`. */
 export const getIgnored = () => invoke<string[]>('get_ignored')
 /** Adds a folder to the `ignore` list, or takes it off. Safe to repeat. */

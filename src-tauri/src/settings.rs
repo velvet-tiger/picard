@@ -31,6 +31,8 @@ pub struct Settings {
     /// As written in the file, so `~/working` stays `~/working`.
     pub roots: Vec<String>,
     pub exclude: Vec<String>,
+    /// Names added to the built-in list whose changes do not count as work.
+    pub activity_ignore: Vec<String>,
     pub tasks: Vec<TaskConfig>,
 }
 
@@ -60,6 +62,7 @@ pub fn read(text: &str, home: &Path) -> Result<Settings> {
             .map(|t| t.format(config::DAILY_SCAN_FORMAT).to_string()),
         roots,
         exclude: cfg.exclude,
+        activity_ignore: cfg.activity_ignore,
         tasks: cfg.tasks,
     })
 }
@@ -109,6 +112,18 @@ pub fn apply(text: &str, settings: &Settings, home: &Path) -> Result<String> {
         "exclude",
         Value::Array(strings(&settings.exclude)),
     );
+    // Optional, so an empty list adds no key to a file without one. A key
+    // already there is set to `[]` rather than removed, which would also
+    // remove the comments above it.
+    if settings.activity_ignore.is_empty() && !doc.contains_key("activity_ignore") {
+        // Nothing to write.
+    } else {
+        set(
+            &mut doc,
+            "activity_ignore",
+            Value::Array(strings(&settings.activity_ignore)),
+        );
+    }
     doc.insert("task", tasks_item(&settings.tasks)?);
 
     let out = doc.to_string();
@@ -457,18 +472,48 @@ mod tests {
     }
 
     #[test]
-    fn saving_settings_leaves_activity_ignore_alone() {
+    fn activity_ignore_is_read_saved_and_cleared_keeping_its_comment() {
         let text = DEFAULT_TOML.replacen(
             "exclude = []",
-            "exclude = []\nactivity_ignore = [\".vscode\"]",
+            "exclude = []\n# names of my own\nactivity_ignore = [\".vscode\"]",
             1,
         );
         let mut s = read(&text, home()).unwrap();
-        s.mode = Mode::Auto;
+        assert_eq!(s.activity_ignore, vec![".vscode"]);
+
+        s.activity_ignore.push("NOTES.md".to_string());
         let out = apply(&text, &s, home()).unwrap();
         let parsed = crate::config::parse(&out, home()).unwrap();
-        assert_eq!(parsed.activity_ignore, vec![".vscode"]);
-        assert_eq!(parsed.mode, Mode::Auto);
+        assert_eq!(parsed.activity_ignore, vec![".vscode", "NOTES.md"]);
+        assert!(
+            out.contains("# names of my own\nactivity_ignore = ["),
+            "{out}"
+        );
+
+        s.activity_ignore.clear();
+        let out = apply(&out, &s, home()).unwrap();
+        assert!(
+            out.contains("# names of my own\nactivity_ignore = []"),
+            "{out}"
+        );
+        assert!(
+            crate::config::parse(&out, home())
+                .unwrap()
+                .activity_ignore
+                .is_empty()
+        );
+        // Saving an untouched form from a file without the key adds nothing.
+        let plain = read(DEFAULT_TOML, home()).unwrap();
+        let out = apply(DEFAULT_TOML, &plain, home()).unwrap();
+        assert!(!out.contains("\nactivity_ignore"), "{out}");
+    }
+
+    #[test]
+    fn saving_an_invalid_activity_ignore_name_changes_nothing() {
+        let mut s = read(DEFAULT_TOML, home()).unwrap();
+        s.activity_ignore = vec!["src/lib".to_string()];
+        let e = format!("{:#}", apply(DEFAULT_TOML, &s, home()).unwrap_err());
+        assert!(e.contains("activity_ignore"), "{e}");
     }
 
     #[test]
