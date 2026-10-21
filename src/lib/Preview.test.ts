@@ -1,4 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
+// The Tauri mock does not deliver `emitTo('main', …)` to a window's listener,
+// so these tests send the global event. The Rust side targets the window.
 import { emit } from '@tauri-apps/api/event'
 import { mockWindows } from '@tauri-apps/api/mocks'
 import { afterEach, describe, expect, it } from 'vitest'

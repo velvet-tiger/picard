@@ -91,8 +91,9 @@
     reloadRecords()
   }
 
-  // A clean appends once per task, and each append sends `history-changed`.
-  // Reloads in flight absorb those events, and one more reload follows them,
+  // A clean appends once per task, and FSEvents reports each append as several
+  // events, each a `history-changed`. Reloads in flight absorb those events,
+  // and one more reload follows them,
   // so the page ends on the newest file without a request per event.
   let reloading = false
   let reloadAgain = false

@@ -842,6 +842,9 @@ mod tests {
             let _ = seen_tx.send(());
         })
         .unwrap();
+        // FSEvents can replay the append made before the watch started. Wait
+        // until the stream is quiet, so only the append below can pass.
+        while seen_rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
         crate::history::append(&history, &[entry]).unwrap();
 
         let seen = seen_rx.recv_timeout(Duration::from_secs(10));
