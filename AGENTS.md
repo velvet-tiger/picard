@@ -524,4 +524,115 @@ Triggers that mean you're shipping a bad handoff:
 - A suggestion that depends on the user noticing a file-name suffix, a commented-out block, or a convention you didn't state.
 
 In each case: rewrite as a numbered script, run the simplest diagnostic yourself, or spell out the convention explicitly as step 1.
+
+# Thinking-effort recommendations. 
+
+When laying out next steps — in a plan or in ordinary conversation — classify them and flag where the effort level should differ from the current one. Trigger only when three or more steps are in view and at least one differs; otherwise say nothing. Recommend down for mechanical steps (running a script and reporting output, bulk edits following an already-decided pattern, file moves, regenerating derived artefacts, session-end checklists) and up for steps involving judgement about correctness, client-facing prose, or edits to a source-of-truth record. Name the step, the level, and the reason in a clause. If a step classified as mechanical turns out to need judgement, stop and say so rather than continuing at the lower effort. Recommend a model change only when the difference is large enough to matter on its own — effort is the default lever.
+
+## Subagent workflow
+
+If you can spawn subagents, follow this workflow. If you cannot, do the work
+yourself, run the same reviews afterwards, and state in your final report that
+the reviews were self-reviews.
+
+When working, follow the "Agent Problem-Solving Process", if available.
+
+### Scope
+
+Decide scope from the diff's file list after development is done.
+
+| Diff contains                          | QA review | Security review |
+|----------------------------------------|-----------|-----------------|
+| Only docs, comments, or formatting     | No        | No              |
+| Only tests                             | Yes       | No              |
+| Production code, no security surface   | Yes       | No              |
+| Any security-surface change            | Yes       | Yes             |
+
+Security surface: authentication, authorisation, routes, controllers, middleware,
+input parsing or validation, database queries or migrations, file and path
+handling, serialisation, cryptography, secrets, environment config, dependency
+manifests or lockfiles, CI and infrastructure config. If unsure, treat a change
+as security surface.
+
+### Steps
+
+1. Spawn a development agent with the task and acceptance criteria. It
+   implements, runs tests and static analysis, and commits to a working branch.
+2. Run tests, static analysis, and dependency audit against that commit.
+   Record the results.
+3. Spawn the reviewers in parallel, each in its own worktree at that commit.
+   Give each one the ticket, the diff, and the check results. Do not give them
+   the development agent's summary.
+    - QA reviewer: QA Reviewer skill.
+    - Security reviewer: Security Reviewer skill.
+      If worktrees are unavailable, run the security review first, then QA.
+4. Merge the findings. Critical and High findings are blocking. Medium and Low
+   findings are fixed in the same fix round, unless a fix needs an owner
+   decision or the user gated it.
+5. Send every finding that is to be fixed to the same development agent
+   (continue it, do not spawn a new one). It fixes them and commits.
+6. Send each fixed finding to the reviewer that raised it, for re-check only.
+7. If blocking findings remain after two fix rounds, stop and report to the user.
+
+### Final report
+
+- Scope decision and which rows of the table applied.
+- Check results.
+- Findings, with status: fixed, disputed, or needs the owner. "Needs the owner"
+  is allowed only for the three reasons in Phase 7 of the process rule: an owner
+  decision, an explicit user gate, or an unrelated item. Each comes with one
+  recommendation, or the ticket for an unrelated item.
+- Anything verified by inspection only.
+
+# Worktrees and testing
+
+## Before you ask the user to test, run, or check anything, stop.
+
+Work out where the change lives. Run `git rev-parse --show-toplevel` and `git branch --show-current`. Compare the result with the folder the user builds and runs from. Assume that is the main checkout unless the user has told you otherwise.
+
+If the change is anywhere other than the main checkout (a worktree, another branch, or uncommitted files in another folder), your test request must start with this, before anything else:
+
+> **This change is in a worktree, not your main checkout.**
+> Path: `<worktree path>`
+> Branch: `<branch>` (committed / uncommitted)
+> Your normal build will not include it.
+
+Then give one way to get the change into what the user runs:
+
+1. Offer to merge it into the main checkout, then they build as usual. This is the default.
+2. Or give the exact command to build and run from the worktree, with a `cd` to its full path.
+
+Do not ask the user to test until one of these is done or chosen.
+
+## Before you start work in a worktree, say so.
+
+The first message of the task names the worktree path and branch. Mention it again in every summary that asks the user to act.
+
+**Red flag:** you are about to write "please test", "try it now", "can you confirm", or "run the export again", and the words "worktree" and "main checkout" do not appear in the first line.
+
+# Automatic-managed .gitignore
+
+This project ignores the agent configuration that Automatic generates.
+
+Automatic writes the instruction files and agent config directories in this
+project. It also keeps a managed block in `.gitignore` that lists those paths.
+The block is bounded by these markers:
+
+```
+# BEGIN Automatic-managed
+...
+# END Automatic-managed
+```
+
+Follow these rules:
+
+1. Do not commit the ignored files. They are generated. Automatic rewrites them
+   on every sync, so committing them causes churn and merge conflicts.
+2. Do not edit inside the managed block. Automatic regenerates it on each sync.
+   Any manual change between the markers is lost.
+3. Do not remove the managed block to force these files into version control. If
+   the team wants to share agent config through git, turn off "Manage .gitignore"
+   for this project in Automatic instead. That removes the block cleanly.
+4. Add your own ignore entries outside the markers. Automatic never touches the
+   rest of the file.
 <!-- automatic:rules:end -->
