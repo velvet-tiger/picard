@@ -29,7 +29,9 @@
   let checked = $state<Record<string, boolean>>({})
   let history = $state<HistoryEntry[]>([])
   let totals = $state<Totals | null>(null)
-  let scanning = $state(true)
+  let scanning = $state(false)
+  // A scan can take half a minute, so the page waits for a click before the first one.
+  let scanned = $state(false)
   let elapsed = $state(0)
 
   // Counts seconds while a scan runs. The scan reports no progress of its own,
@@ -87,6 +89,7 @@
       error = errorText(e)
     } finally {
       scanning = false
+      scanned = true
     }
     reloadRecords()
   }
@@ -256,14 +259,16 @@
     }),
   )
 
-  scan()
+  reloadRecords()
 </script>
 
 <main>
   <div class="row">
     <h1>Clean up</h1>
     <span class="spacer"></span>
-    <button onclick={scan} disabled={scanning || cleaning || busyToggling}>Rescan</button>
+    <button onclick={scan} disabled={scanning || cleaning || busyToggling}
+      >{scanned ? 'Rescan' : 'Scan'}</button
+    >
   </div>
   <p class="muted">
     Nothing is removed until you press Clean. Picard re-checks every item just before removing it.
@@ -321,6 +326,8 @@
         </div>
       {/each}
     </div>
+  {:else if !scanned}
+    <p class="muted">Press Scan to find build folders, caches and stale worktrees.</p>
   {:else if volumes.length === 0}
     <p class="muted">No mounted volumes hold a configured root.</p>
   {:else}
