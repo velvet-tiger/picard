@@ -3,6 +3,7 @@
     preview,
     runSelected,
     getHistory,
+    getTotals,
     setIgnored,
     getProtection,
     notifyIgnoreChanged,
@@ -19,12 +20,14 @@
     type PreviewItem,
     type RunResult,
     type HistoryEntry,
+    type Totals,
   } from './api'
 
   let volumes = $state<VolumePreview[]>([])
   // Keyed by "mount\u0000path" so the same path on two volumes cannot collide.
   let checked = $state<Record<string, boolean>>({})
   let history = $state<HistoryEntry[]>([])
+  let totals = $state<Totals | null>(null)
   let scanning = $state(true)
   let elapsed = $state(0)
 
@@ -85,6 +88,7 @@
       scanning = false
     }
     loadHistory()
+    loadTotals()
   }
 
   async function loadHistory() {
@@ -95,6 +99,23 @@
       console.error('history', e)
     }
   }
+
+  async function loadTotals() {
+    try {
+      totals = await getTotals()
+    } catch (e) {
+      // Like history, the total is a convenience; hide it rather than show a stale one.
+      totals = null
+      console.error('totals', e)
+    }
+  }
+
+  const sinceText = (time: string) =>
+    new Date(time).toLocaleDateString(undefined, {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+    })
 
   async function clean() {
     cleaning = true
@@ -213,6 +234,13 @@
   <p class="muted">
     Nothing is removed until you press Clean. Picard re-checks every item just before removing it.
   </p>
+
+  {#if totals && totals.items > 0 && totals.since}
+    <p class="totals">
+      Picard has freed <strong>{formatBytes(totals.bytes)}</strong> across {totals.items}
+      {totals.items === 1 ? 'item' : 'items'} since {sinceText(totals.since)}.
+    </p>
+  {/if}
 
   {#if error}
     <p class="error">{error}</p>
@@ -562,5 +590,8 @@
   }
   .history li {
     font-size: 12px;
+  }
+  .totals {
+    font-variant-numeric: tabular-nums;
   }
 </style>

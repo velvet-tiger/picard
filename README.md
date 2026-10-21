@@ -42,6 +42,8 @@ One thing to know: removing a worktree also deletes files git ignores inside it,
 
 Picard never switches modes by itself.
 
+The **Clean…** page shows how much Picard has freed, and how many items, across every drive and mode since the first removal. It adds up `history.jsonl`, so deleting that file starts the total again from zero.
+
 ### Ignoring a folder
 
 Each folder in the **Clean…** list has an **Ignore** button. An ignored folder stays in the list, greyed out and unticked, so you can find it again. No cleanup removes it, in any mode, and it is left out of the totals. Press **Unignore** to undo it.

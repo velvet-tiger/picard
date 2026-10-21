@@ -6,6 +6,7 @@ import {
   type PreviewItem,
   type Protection,
   type RunResult,
+  type Totals,
   type VolumePreview,
 } from './api'
 import { deferred, fakeBackend, type Handler } from './fake-backend'
@@ -51,6 +52,7 @@ function backend(handlers: Record<string, Handler> = {}) {
   return fakeBackend({
     preview: () => volumes(),
     get_history: () => [],
+    get_totals: () => ({ bytes: 0, items: 0, since: null }) satisfies Totals,
     set_ignored: () => null,
     get_protection: () => [null, null, 'ignored', null] satisfies Protection[],
     run_selected: () => [],
@@ -67,6 +69,20 @@ const box = (title: string) =>
  * Used to show that nothing more happens.
  */
 const settle = () => new Promise((r) => setTimeout(r, 0))
+
+/** The totals line, matched on its whole text; `start` is everything before the date. */
+function findTotal(start: string) {
+  const since = new Date('2026-09-03T08:30:00Z').toLocaleDateString(undefined, {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  })
+  return screen.findByText(
+    (_, el) =>
+      el?.tagName === 'P' &&
+      el.textContent?.replace(/\s+/g, ' ').trim() === `${start} since ${since}.`,
+  )
+}
 
 async function renderScanned() {
   render(Preview)
@@ -118,6 +134,55 @@ describe('Preview', () => {
       { selections: [{ mount: '/', paths: [SHOP, WORKTREE] }] },
     ])
     await waitFor(() => expect(sent('preview')).toHaveLength(2))
+  })
+
+  it('shows how much Picard has freed in total', async () => {
+    backend({
+      get_totals: () => ({ bytes: 42.3e9, items: 318, since: '2026-09-03T08:30:00Z' }),
+    })
+    await renderScanned()
+
+    expect(await findTotal('Picard has freed 42 GB across 318 items')).toBeInTheDocument()
+  })
+
+  it('hides the total until something has been removed', async () => {
+    const { sent } = backend()
+    await renderScanned()
+    await waitFor(() => expect(sent('get_totals')).toHaveLength(1))
+    await settle()
+
+    expect(screen.queryByText(/Picard has freed/)).not.toBeInTheDocument()
+  })
+
+  it('hides the total when it cannot be read', async () => {
+    const { sent } = backend({
+      get_totals: () => {
+        throw 'history.jsonl is unreadable'
+      },
+    })
+    await renderScanned()
+    await waitFor(() => expect(sent('get_totals')).toHaveLength(1))
+    await settle()
+
+    expect(screen.queryByText(/Picard has freed/)).not.toBeInTheDocument()
+    expect(screen.queryByText('history.jsonl is unreadable')).not.toBeInTheDocument()
+  })
+
+  it('updates the total after a clean', async () => {
+    let totals: Totals = { bytes: 1e9, items: 1, since: '2026-09-03T08:30:00Z' }
+    backend({
+      get_totals: () => totals,
+      run_selected: () => {
+        totals = { bytes: 4.5e9, items: 4, since: '2026-09-03T08:30:00Z' }
+        return []
+      },
+    })
+    await renderScanned()
+    expect(await findTotal('Picard has freed 1.0 GB across 1 item')).toBeInTheDocument()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Clean selected' }))
+
+    expect(await findTotal('Picard has freed 4.5 GB across 4 items')).toBeInTheDocument()
   })
 
   it('unticks only one task when its group box is unticked', async () => {

@@ -6,6 +6,10 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The Clean page shows how much Picard has freed in total, and since when. The total is summed from `history.jsonl` (`get_totals` command).
+
 ### Changed
 
 - Worktrees merged into a branch other than the default one are now found. A merge commit or a reflog `merge` entry in any local branch counts as merged, so repos that integrate into a branch such as `2.0-dev` are cleaned after `min_idle_minutes`. A worktree whose commits another local branch holds, with no record of a merge, is cleaned after `stale_days`.

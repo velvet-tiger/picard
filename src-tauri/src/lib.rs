@@ -46,6 +46,7 @@ pub fn run() {
             commands::preview,
             commands::run_selected,
             commands::get_history,
+            commands::get_totals,
             commands::get_launch_at_login,
             commands::set_launch_at_login,
             commands::pick_folder,

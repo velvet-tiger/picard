@@ -9,6 +9,7 @@ const COMMANDS: &[&str] = &[
     "preview",
     "run_selected",
     "get_history",
+    "get_totals",
     "get_launch_at_login",
     "set_launch_at_login",
     "pick_folder",
