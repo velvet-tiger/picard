@@ -13,6 +13,7 @@ All notable changes to Picard are recorded here. The format follows
 
 ### Changed
 
+- The Clean page no longer scans when it opens. Press Scan to find build folders, caches and stale worktrees. The total and the "Recently removed" list still load on open.
 - Worktrees merged into a branch other than the default one are now found. A merge commit or a reflog `merge` entry in any local branch counts as merged, so repos that integrate into a branch such as `2.0-dev` are cleaned after `min_idle_minutes`. A worktree whose commits another local branch holds, with no record of a merge, is cleaned after `stale_days`.
 
 ## [0.2.0] - 2026-10-21

@@ -20,8 +20,8 @@
   const initial = window.location.hash.replace('#/', '')
   const firstTab: TabId | null = isTab(initial) ? initial : null
   let active = $state<TabId | null>(firstTab)
-  // A tab mounts the first time it is shown and then stays mounted, so the
-  // Clean scan only starts when asked for and switching tabs keeps its state.
+  // A tab mounts the first time it is shown and then stays mounted, so
+  // switching tabs keeps its state, such as the Clean scan results.
   let opened = $state<Record<TabId, boolean>>({
     clean: firstTab === 'clean',
     settings: firstTab === 'settings',
