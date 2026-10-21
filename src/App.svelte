@@ -1,15 +1,17 @@
 <script lang="ts">
-  // One window holds both views as tabs. The URL hash (#/clean or #/settings),
+  // One window holds every view as a tab. The URL hash (#/clean or #/settings),
   // set by src-tauri/src/windows.rs, picks the first tab and then tracks the
   // active one. When the window is
   // already open, the menu bar sends a `show-tab` event instead.
   import Preview from './lib/Preview.svelte'
   import SettingsView from './lib/Settings.svelte'
+  import About from './lib/About.svelte'
   import { closeWindow, onShowTab } from './lib/api'
 
   const TABS = [
     { id: 'clean', label: 'Clean' },
     { id: 'settings', label: 'Settings' },
+    { id: 'about', label: 'About' },
   ] as const
   type TabId = (typeof TABS)[number]['id']
 
@@ -23,6 +25,7 @@
   let opened = $state<Record<TabId, boolean>>({
     clean: firstTab === 'clean',
     settings: firstTab === 'settings',
+    about: firstTab === 'about',
   })
   let settingsView = $state<SettingsView | undefined>()
 
@@ -90,6 +93,11 @@
       hidden={active !== 'settings'}
     >
       <SettingsView bind:this={settingsView} />
+    </div>
+  {/if}
+  {#if opened.about}
+    <div role="tabpanel" id="panel-about" aria-labelledby="tab-about" hidden={active !== 'about'}>
+      <About />
     </div>
   {/if}
 {/if}

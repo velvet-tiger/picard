@@ -2780,6 +2780,7 @@ dependencies = [
  "log",
  "notify",
  "rayon",
+ "semver",
  "serde",
  "serde_json",
  "tauri",

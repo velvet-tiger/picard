@@ -1,5 +1,6 @@
 // Typed wrappers for the Rust commands in src-tauri/src/commands.rs.
 // The shapes here mirror the serde structs there; keep them in step.
+import { getVersion } from '@tauri-apps/api/app'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
@@ -196,6 +197,23 @@ export function withEveryBuiltIn(tasks: Task[]): Task[] {
   )
   return [...tasks, ...missing]
 }
+
+/** The running version beside the latest GitHub release. Mirrors `UpdateCheck` in about.rs. */
+export interface UpdateCheck {
+  current: string
+  latest: string
+  /** True when `latest` is newer than `current`. */
+  newer: boolean
+}
+
+/** The pages the About tab may open. The URLs live in about.rs, not here. */
+export type Link = 'website' | 'issues' | 'latest_release'
+
+/** The version Picard was built as, from tauri.conf.json. */
+export const appVersion = () => getVersion()
+/** Asks GitHub for the latest release. Rejects with a readable reason when it cannot. */
+export const checkForUpdate = () => invoke<UpdateCheck>('check_for_update')
+export const openLink = (link: Link) => invoke<void>('open_link', { link })
 
 /** Closes the window this page is in. */
 export const closeWindow = () => getCurrentWindow().close()

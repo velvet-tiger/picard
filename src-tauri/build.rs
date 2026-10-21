@@ -15,6 +15,8 @@ const COMMANDS: &[&str] = &[
     "set_ignored",
     "get_protection",
     "get_not_activity",
+    "check_for_update",
+    "open_link",
 ];
 
 fn main() {

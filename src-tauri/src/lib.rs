@@ -1,3 +1,4 @@
+mod about;
 pub mod cli;
 mod commands;
 mod config;
@@ -51,6 +52,8 @@ pub fn run() {
             commands::set_ignored,
             commands::get_protection,
             commands::get_not_activity,
+            commands::check_for_update,
+            commands::open_link,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

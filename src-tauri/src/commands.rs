@@ -13,6 +13,7 @@ use tauri::{AppHandle, Runtime, State, WebviewWindow};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 
+use crate::about::{self, Link, UpdateCheck};
 use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::history::{self, Entry};
@@ -329,6 +330,19 @@ pub fn set_launch_at_login<R: Runtime>(app: AppHandle<R>, enabled: bool) -> Resu
     result.map_err(err)?;
     log::info!("launch at login {}", if enabled { "on" } else { "off" });
     Ok(())
+}
+
+/// Compares the running version with the latest release on GitHub.
+#[tauri::command]
+pub async fn check_for_update<R: Runtime>(app: AppHandle<R>) -> Result<UpdateCheck, String> {
+    let current = app.package_info().version.clone();
+    blocking(move || about::check(&current)).await
+}
+
+/// Opens one of the About tab's fixed pages in the default browser.
+#[tauri::command]
+pub fn open_link(link: Link) -> Result<(), String> {
+    about::open(link)
 }
 
 /// Shows the macOS folder picker as a sheet on the calling window. Returns the
