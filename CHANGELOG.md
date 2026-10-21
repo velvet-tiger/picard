@@ -6,11 +6,14 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-22
+
 ### Added
 
 - Picard updates itself. It checks GitHub for a newer release shortly after it starts and then once a day, downloads it, verifies it against a public key built into the app, and replaces `Picard.app`. The menu and the About tab then offer **Restart to finish updating**. Picard never restarts by itself and refuses to restart during a cleanup. Turn it off with **Check for updates daily and install them** in Settings, or `auto_update = false` in the config. With it off, the About tab offers **Install it** when you check by hand.
 - Updates are installed only from a GitHub release download, only when Picard runs from an installed `Picard.app`, and without an administrator password prompt. Otherwise the About tab offers **Install it**. A failed install is retried after 1, 2, 4 hours and so on, up to a day.
 - The release workflow builds a signed update archive and a `latest.json` and attaches both to the release. It signs in a job of its own, so build scripts never see the key. It needs the `TAURI_SIGNING_PRIVATE_KEY` repository secret, and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if the key has a password. See "Update signing key" in the README.
+- On first run, Picard shows a use-at-your-own-risk warning before it watches disk space or checks for updates. **I understand** continues, and **Quit** exits Picard. The warning shows once. Picard saves the acceptance as `warning-accepted.txt` next to the config, and existing installs see it once too.
 
 ### Changed
 
@@ -120,6 +123,7 @@ and removes build output and finished work when a drive runs low.
 - Disk image volume test (a918137).
 - Vitest tests for `api.ts`, Preview and Settings (5eeb28a).
 
+[0.4.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.4.0
 [0.3.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.3.0
 [0.2.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.2.0
 [0.1.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.1.0
