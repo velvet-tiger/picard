@@ -5,6 +5,7 @@
 //! on their own thread and send `Wake` messages into the loop. When
 //! `daily_scan` is set it also wakes at that time and runs the daily scan.
 
+use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -222,13 +223,53 @@ pub fn ensure_config_file(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// What a file event on one path means.
+#[derive(Debug, PartialEq, Eq)]
+enum Watched {
+    Wake(Wake),
+    /// `history.jsonl` changed: some clean, here or in the CLI, removed something.
+    History,
+}
+
+/// Sorts one event path. Paths are matched on their file name, not in full,
+/// because FSEvents can report a path through a different spelling of the
+/// same folder (`/private/var` for `/var`, say).
+fn classify(
+    path: &Path,
+    config_name: Option<&OsStr>,
+    history_name: Option<&OsStr>,
+) -> Option<Watched> {
+    if path.starts_with(VOLUMES_DIR) {
+        return Some(Watched::Wake(Wake::VolumesChanged));
+    }
+    let name = path.file_name();
+    if name.is_some() && name == config_name {
+        Some(Watched::Wake(Wake::ConfigChanged))
+    } else if name.is_some() && name == history_name {
+        Some(Watched::History)
+    } else {
+        None
+    }
+}
+
 /// Starts watching the config folder and `/Volumes`.
 ///
 /// The returned watcher must be kept alive; dropping it stops the events.
 /// The config folder is watched rather than the file, because many editors
 /// save by replacing the file, which would end a watch on the file itself.
-pub fn start_watchers(config_path: &Path, tx: mpsc::Sender<Wake>) -> Result<RecommendedWatcher> {
-    let config_name = config_path.file_name().map(|n| n.to_os_string());
+/// `history.jsonl` lives in the same folder, so a change to it calls
+/// `on_history` on the watcher's thread, at most once per event. The CLI runs
+/// in its own process, and this is the only way the app learns it cleaned.
+pub fn start_watchers(
+    config_path: &Path,
+    tx: mpsc::Sender<Wake>,
+    on_history: impl Fn() + Send + 'static,
+) -> Result<RecommendedWatcher> {
+    let config_name = config_path.file_name().map(OsStr::to_os_string);
+    let history_name = runner::DataPaths::beside(config_path)
+        .history
+        .file_name()
+        .map(OsStr::to_os_string);
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let event = match res {
             Ok(e) => e,
@@ -237,16 +278,19 @@ pub fn start_watchers(config_path: &Path, tx: mpsc::Sender<Wake>) -> Result<Reco
                 return;
             }
         };
+        let mut history_changed = false;
         for path in &event.paths {
-            let wake = if path.starts_with(VOLUMES_DIR) {
-                Wake::VolumesChanged
-            } else if path.file_name().map(|n| n.to_os_string()) == config_name {
-                Wake::ConfigChanged
-            } else {
-                continue;
-            };
-            // A full queue already holds a pending wake, so dropping this one loses nothing.
-            let _ = tx.try_send(wake);
+            match classify(path, config_name.as_deref(), history_name.as_deref()) {
+                // A full queue already holds a pending wake, so dropping this one loses nothing.
+                Some(Watched::Wake(wake)) => {
+                    let _ = tx.try_send(wake);
+                }
+                Some(Watched::History) => history_changed = true,
+                None => {}
+            }
+        }
+        if history_changed {
+            on_history();
         }
     })
     .context("creating file watcher")?;
@@ -726,6 +770,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn classify_sorts_config_history_and_volume_events() {
+        let config = Some(OsStr::new("config.toml"));
+        let history = Some(OsStr::new("history.jsonl"));
+        let sort = |p: &str| classify(Path::new(p), config, history);
+
+        assert_eq!(
+            sort("/Users/a/.config/picard/config.toml"),
+            Some(Watched::Wake(Wake::ConfigChanged))
+        );
+        // FSEvents can name the same folder another way; only the file name counts.
+        assert_eq!(
+            sort("/private/var/u/picard/history.jsonl"),
+            Some(Watched::History)
+        );
+        assert_eq!(
+            sort("/Volumes/Work"),
+            Some(Watched::Wake(Wake::VolumesChanged))
+        );
+        assert_eq!(sort("/Users/a/.config/picard/run.lock"), None);
+        assert_eq!(sort("/Users/a/.config/picard/daily-scan.txt"), None);
+        assert_eq!(sort("/"), None);
+    }
+
+    #[test]
+    fn classify_matches_nothing_when_a_name_is_missing() {
+        assert_eq!(classify(Path::new("/"), None, None), None);
+        assert_eq!(classify(Path::new("/a/history.jsonl"), None, None), None);
+    }
+
+    #[test]
     fn ensure_config_file_writes_once_and_keeps_edits() {
         let dir = std::env::temp_dir().join(format!("picard-config-test-{}", std::process::id()));
         let path = dir.join("nested/config.toml");
@@ -742,6 +816,37 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Runs the real watcher, so it proves FSEvents reports an append to a file
+    // that already exists. That is how every clean after the first one writes.
+    #[test]
+    fn start_watchers_reports_an_append_to_history() {
+        let dir = std::env::temp_dir().join(format!("picard-watch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let history = runner::DataPaths::beside(&config_path).history;
+        let entry = crate::history::Entry {
+            time: chrono::Utc::now(),
+            task: "node_modules".to_string(),
+            volume: "Macintosh HD".to_string(),
+            path: "/Users/a/w/shop/node_modules".to_string(),
+            bytes: 1,
+        };
+        crate::history::append(&history, std::slice::from_ref(&entry)).unwrap();
+
+        let (tx, _rx) = mpsc::channel(16);
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let _watcher = start_watchers(&config_path, tx, move || {
+            let _ = seen_tx.send(());
+        })
+        .unwrap();
+        crate::history::append(&history, &[entry]).unwrap();
+
+        let seen = seen_rx.recv_timeout(Duration::from_secs(10));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(seen.is_ok(), "no history event within 10 s of the append");
     }
 
     fn stamp(at: Option<(u32, u32)>) -> DailyStamp {

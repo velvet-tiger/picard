@@ -248,6 +248,14 @@ export const closeWindow = () => getCurrentWindow().close()
 export const onShowTab = (handler: (tab: string) => void) =>
   getCurrentWebviewWindow().listen<string>('show-tab', (e) => handler(e.payload))
 
+/**
+ * Calls `handler` when `history.jsonl` changes: a clean from this window, auto
+ * mode, the daily scan or the CLI removed something (see `start_watchers` in
+ * src-tauri/src/poll.rs). Resolves to an unlisten function.
+ */
+export const onHistoryChanged = (handler: () => void) =>
+  getCurrentWebviewWindow().listen('history-changed', () => handler())
+
 /** Errors from invoke arrive as strings; anything else is shown as-is. */
 export function errorText(e: unknown): string {
   if (typeof e === 'string') return e

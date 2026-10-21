@@ -9,6 +9,7 @@ All notable changes to Picard are recorded here. The format follows
 ### Added
 
 - The Clean page shows how much Picard has freed in total, and since when. The total is summed from `history.jsonl` (`get_totals` command).
+- The total and the "Recently removed" list on the Clean page update while the window is open when auto mode, the daily scan or `picard run` removes something. Picard watches `history.jsonl` and sends the window a `history-changed` event. Only those two parts reload; the scan results stay as they are.
 
 ### Changed
 

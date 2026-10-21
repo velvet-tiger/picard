@@ -17,6 +17,9 @@ const WINDOW_LABEL: &str = "main";
 /// Must match the event name App.svelte listens for.
 const SHOW_TAB_EVENT: &str = "show-tab";
 
+/// Must match the event name `onHistoryChanged` in api.ts listens for.
+const HISTORY_CHANGED_EVENT: &str = "history-changed";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Clean,
@@ -79,6 +82,16 @@ pub fn set_appearance<R: Runtime>(app: &AppHandle<R>, appearance: Appearance) ->
         Some(window) => window.set_theme(theme(appearance)),
         None => Ok(()),
     }
+}
+
+/// Tells the open window that `history.jsonl` changed, so the Clean tab can
+/// reload its total and its "Recently removed" list. Does nothing when no
+/// window is open, which is most of the time for a menu bar app.
+pub fn history_changed<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    if app.get_webview_window(WINDOW_LABEL).is_none() {
+        return Ok(());
+    }
+    app.emit_to(WINDOW_LABEL, HISTORY_CHANGED_EVENT, ())
 }
 
 /// The appearance the config asks for.

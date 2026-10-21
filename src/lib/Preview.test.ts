@@ -1,8 +1,11 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
-import { describe, expect, it } from 'vitest'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
+import { emit } from '@tauri-apps/api/event'
+import { mockWindows } from '@tauri-apps/api/mocks'
+import { afterEach, describe, expect, it } from 'vitest'
 import Preview from './Preview.svelte'
 import {
   notifyIgnoreChanged,
+  type HistoryEntry,
   type PreviewItem,
   type Protection,
   type RunResult,
@@ -49,6 +52,8 @@ function volumes(): VolumePreview[] {
 
 /** The scan above, with replies that change nothing. `handlers` override them per command. */
 function backend(handlers: Record<string, Handler> = {}) {
+  // The page listens for `history-changed` on its own window.
+  mockWindows('main')
   return fakeBackend({
     preview: () => volumes(),
     get_history: () => [],
@@ -90,6 +95,13 @@ async function renderScanned() {
 }
 
 describe('Preview', () => {
+  // The page stops listening for `history-changed` when it unmounts. That needs
+  // the Tauri mocks, which test-setup.ts clears in an afterEach that runs after this one.
+  afterEach(async () => {
+    cleanup()
+    await settle()
+  })
+
   it('ticks every item the ignore list does not protect', async () => {
     backend()
     await renderScanned()
@@ -183,6 +195,56 @@ describe('Preview', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Clean selected' }))
 
     expect(await findTotal('Picard has freed 4.5 GB across 4 items')).toBeInTheDocument()
+  })
+
+  it('reloads the total and recent list when a background clean writes history, without rescanning', async () => {
+    let totals: Totals = { bytes: 0, items: 0, since: null }
+    let history: HistoryEntry[] = []
+    const { sent } = backend({ get_totals: () => totals, get_history: () => history })
+    await renderScanned()
+    await waitFor(() => expect(sent('get_totals')).toHaveLength(1))
+    expect(screen.queryByText('Recently removed')).not.toBeInTheDocument()
+
+    // What auto mode, the daily scan or the CLI leaves behind.
+    totals = { bytes: 2e9, items: 1, since: '2026-09-03T08:30:00Z' }
+    history = [
+      { time: '2026-09-03T08:30:00Z', task: 'node_modules', volume: 'Macintosh HD', path: API, bytes: 2e9 },
+    ]
+    await emit('history-changed')
+
+    expect(await findTotal('Picard has freed 2.0 GB across 1 item')).toBeInTheDocument()
+    expect(screen.getByText('Recently removed')).toBeInTheDocument()
+    expect(sent('get_history')).toHaveLength(2)
+    expect(sent('preview')).toHaveLength(1)
+  })
+
+  it('folds events that arrive during a reload into one more reload', async () => {
+    const replies: ReturnType<typeof deferred<Totals>>[] = []
+    const { sent } = backend({
+      get_totals: () => {
+        const reply = deferred<Totals>()
+        replies.push(reply)
+        return reply.promise
+      },
+    })
+    await renderScanned()
+    const none: Totals = { bytes: 0, items: 0, since: null }
+    replies[0].resolve(none)
+    await settle()
+
+    // One append per task: three events while the first reload is still waiting.
+    await emit('history-changed')
+    await emit('history-changed')
+    await emit('history-changed')
+    await settle()
+    expect(sent('get_totals')).toHaveLength(2)
+
+    replies[1].resolve(none)
+    await waitFor(() => expect(sent('get_totals')).toHaveLength(3))
+    replies[2].resolve(none)
+    await settle()
+    expect(sent('get_totals')).toHaveLength(3)
+    expect(sent('preview')).toHaveLength(1)
   })
 
   it('unticks only one task when its group box is unticked', async () => {
