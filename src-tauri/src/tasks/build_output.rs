@@ -96,7 +96,7 @@ impl CleanupTask for BuildOutput {
             }
             // Staleness first: it is cheap, and it spares running git for
             // every project that is still in use.
-            let idle = match idle_days(&project, ctx.now, &names) {
+            let idle = match idle_days(&project, ctx, &names) {
                 Some(idle) if idle >= u64::from(self.stale_days) => idle,
                 _ => continue,
             };

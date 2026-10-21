@@ -457,6 +457,21 @@ mod tests {
     }
 
     #[test]
+    fn saving_settings_leaves_activity_ignore_alone() {
+        let text = DEFAULT_TOML.replacen(
+            "exclude = []",
+            "exclude = []\nactivity_ignore = [\".vscode\"]",
+            1,
+        );
+        let mut s = read(&text, home()).unwrap();
+        s.mode = Mode::Auto;
+        let out = apply(&text, &s, home()).unwrap();
+        let parsed = crate::config::parse(&out, home()).unwrap();
+        assert_eq!(parsed.activity_ignore, vec![".vscode"]);
+        assert_eq!(parsed.mode, Mode::Auto);
+    }
+
+    #[test]
     fn display_root_uses_tilde_inside_home_only() {
         let home = Path::new("/Users/test");
         assert_eq!(

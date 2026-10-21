@@ -123,7 +123,7 @@ impl CleanupTask for StaleDirs {
             }
             let reason = match self.stale_days {
                 None => "cleans all (mode = \"all\")".to_string(),
-                Some(days) => match idle_days(&project, ctx.now, self.dir_names) {
+                Some(days) => match idle_days(&project, ctx, self.dir_names) {
                     Some(idle) if idle >= u64::from(days) => format!("untouched for {idle} days"),
                     _ => continue,
                 },
@@ -220,38 +220,122 @@ fn is_real_dir(path: &Path) -> bool {
 }
 
 /// Whole days since anything in the project last changed, ignoring build
-/// output, `.git` and the folders named in `also_skip` (the task's own
-/// targets, so rebuilding them is not activity). `None` if nothing could be
-/// read or the newest mtime is in the future (a clock or exFAT oddity), which
-/// counts as "not stale".
-pub(super) fn idle_days(project: &Path, now: SystemTime, also_skip: &[&str]) -> Option<u64> {
-    let newest = newest_mtime_skipping(project, also_skip)?;
-    let idle = now.duration_since(newest).ok()?;
+/// output, `.git`, `ctx.not_activity` and the folders named in `also_skip`
+/// (the task's own targets, so rebuilding them is not activity). `None` if
+/// nothing could be read or the newest mtime is in the future (a clock or
+/// exFAT oddity), which counts as "not stale".
+pub(super) fn idle_days(project: &Path, ctx: &Ctx, also_skip: &[&str]) -> Option<u64> {
+    let newest = newest_mtime_skipping(project, also_skip, &ctx.not_activity)?;
+    let idle = ctx.now.duration_since(newest).ok()?;
     Some(idle.as_secs() / SECS_PER_DAY)
 }
 
-/// Newest mtime of any file in the project, ignoring build output and `.git`.
+/// Newest mtime of any file in the project, ignoring build output, `.git` and
+/// the names in `not_activity` (agent config that tools rewrite on their own).
 ///
 /// Folder mtimes are not counted. Finder writes a `.DS_Store` into every
 /// folder you open, which bumps that folder's mtime, so merely looking at an
 /// old project would make it look active. The `.DS_Store` files themselves
 /// are skipped for the same reason. A deleted file therefore no longer counts
 /// as activity; editing or adding one still does.
-pub(super) fn newest_mtime(project: &Path) -> Option<SystemTime> {
-    newest_mtime_skipping(project, &[])
+pub(super) fn newest_mtime(project: &Path, not_activity: &[String]) -> Option<SystemTime> {
+    newest_mtime_skipping(project, &[], not_activity)
 }
 
 /// `newest_mtime`, also skipping folders named in `also_skip`.
-fn newest_mtime_skipping(project: &Path, also_skip: &[&str]) -> Option<SystemTime> {
-    WalkDir::new(project)
+fn newest_mtime_skipping(
+    project: &Path,
+    also_skip: &[&str],
+    not_activity: &[String],
+) -> Option<SystemTime> {
+    newest_within(project, MTIME_DEPTH, also_skip, not_activity)
+}
+
+/// Newest file mtime under `root`, at most `depth` levels down.
+///
+/// A `not_activity` folder is skipped, except for git checkouts inside it.
+/// Claude Code keeps worktrees in `.claude/worktrees/`, and edits there are
+/// real work, so they still count, up to the same overall depth.
+fn newest_within(
+    root: &Path,
+    depth: usize,
+    also_skip: &[&str],
+    not_activity: &[String],
+) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    let mut walk = WalkDir::new(root)
         .follow_links(false)
-        .max_depth(MTIME_DEPTH)
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !is_skipped(e.path(), also_skip))
-        .filter_map(|e| e.ok())
-        .filter(|e| !e.file_type().is_dir() && e.file_name() != FINDER_METADATA)
-        .filter_map(|e| e.metadata().ok()?.modified().ok())
-        .max()
+        .max_depth(depth)
+        .into_iter();
+    while let Some(entry) = walk.next() {
+        let Ok(e) = entry else { continue };
+        if e.depth() == 0 {
+            continue;
+        }
+        let is_dir = e.file_type().is_dir();
+        if is_skipped(e.path(), also_skip) {
+            if is_dir {
+                walk.skip_current_dir();
+            }
+            continue;
+        }
+        let agent_config = e
+            .file_name()
+            .to_str()
+            .is_some_and(|n| not_activity.iter().any(|skip| skip == n));
+        if agent_config {
+            if is_dir {
+                walk.skip_current_dir();
+                for checkout in checkouts_within(e.path(), depth - e.depth()) {
+                    let left = depth - e.depth() - checkout.levels;
+                    newest =
+                        newest.max(newest_within(&checkout.path, left, also_skip, not_activity));
+                }
+            }
+            continue;
+        }
+        if is_dir || e.file_name() == FINDER_METADATA {
+            continue;
+        }
+        if let Some(modified) = e.metadata().ok().and_then(|m| m.modified().ok()) {
+            newest = newest.max(Some(modified));
+        }
+    }
+    newest
+}
+
+/// A git checkout found inside a folder, and how many levels below it.
+struct NestedCheckout {
+    path: PathBuf,
+    levels: usize,
+}
+
+/// Folders under `dir`, at most `depth` levels down, that hold a `.git` file or
+/// folder. A checkout is not searched for further checkouts.
+fn checkouts_within(dir: &Path, depth: usize) -> Vec<NestedCheckout> {
+    let mut found = Vec::new();
+    let mut walk = WalkDir::new(dir)
+        .follow_links(false)
+        .min_depth(1)
+        .max_depth(depth)
+        .into_iter();
+    while let Some(entry) = walk.next() {
+        let Ok(e) = entry else { continue };
+        if !e.file_type().is_dir() || is_skipped(e.path(), &[]) {
+            if e.file_type().is_dir() {
+                walk.skip_current_dir();
+            }
+            continue;
+        }
+        if std::fs::symlink_metadata(e.path().join(".git")).is_ok() {
+            found.push(NestedCheckout {
+                path: e.path().to_path_buf(),
+                levels: e.depth(),
+            });
+            walk.skip_current_dir();
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -327,6 +411,49 @@ mod tests {
         let found = node_modules(30).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
         assert_eq!(found[0].reason, "untouched for 40 days");
+    }
+
+    #[test]
+    fn agent_config_rewrites_do_not_make_a_project_fresh() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 10, 40);
+        // What an Automatic sync rewrites, at the top and deeper down.
+        fx.file("p/AGENTS.md", 1);
+        fx.file("p/.mcp.json", 1);
+        fx.file("p/.automatic/project.json", 1);
+        fx.file("p/.claude/rules/general.md", 1);
+        fx.file("p/packages/web/CLAUDE.md", 1);
+        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
+        assert_eq!(found[0].reason, "untouched for 40 days");
+        // A real edit still counts.
+        fx.file("p/src/edit.js", 1);
+        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn work_in_a_checkout_inside_agent_config_still_counts() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 10, 40);
+        fx.file("p/.claude/worktrees/w/.git", 1);
+        fx.file("p/.claude/worktrees/w/src/x.js", 1);
+        fx.age("p/.claude/worktrees/w", 40);
+        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
+        // An edit in the nested worktree is work on the project.
+        fx.file("p/.claude/worktrees/w/src/edit.js", 1);
+        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn configured_activity_ignore_names_are_skipped_too() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 10, 40);
+        fx.file("p/.vscode/settings.json", 1);
+        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+        let ctx = fx.ctx().with_activity_ignore(&[".vscode".to_string()]);
+        let found = node_modules(30).scan(&ctx).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
     }
 
     #[test]

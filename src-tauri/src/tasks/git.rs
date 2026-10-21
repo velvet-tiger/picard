@@ -178,6 +178,13 @@ impl GitCmd {
         let modules = self.submodule_store_root(dir)?;
         let has_stores = std::fs::symlink_metadata(&modules).is_ok();
         let index = self.output(dir, &["ls-files", "--stage", "-z"])?;
+        let submodules: Vec<PathBuf> = index_gitlinks(&index).iter().map(|g| dir.join(g)).collect();
+        if let Some(other) = other_checkout(dir, &submodules)? {
+            return Ok(Some(format!(
+                "holds another git checkout at {}",
+                other.display()
+            )));
+        }
         for gitlink in index_gitlinks(&index) {
             let folder = dir.join(gitlink);
             let Some(why) = submodule_folder_problem(&folder) else {
@@ -292,6 +299,49 @@ impl GitCmd {
             ))),
         }
     }
+}
+
+/// Folders never searched for nested checkouts: regenerable build output and
+/// dependencies, which can be huge, and which Picard removes anyway.
+const NOT_SEARCHED: &[&str] = &["node_modules", "target", ".next"];
+
+/// The first git checkout inside worktree `dir` other than its submodule
+/// checkouts, which `unsafe_to_inspect` verifies. Claude Code puts worktrees
+/// in `.claude/worktrees/`, which git ignores, so `status` never lists their
+/// untracked files, yet removing `dir` deletes them. No depth limit. An
+/// unreadable folder is an error, so the worktree is kept.
+pub fn other_checkout(dir: &Path, submodules: &[PathBuf]) -> Result<Option<PathBuf>> {
+    let mut walk = walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .min_depth(1)
+        .into_iter();
+    while let Some(entry) = walk.next() {
+        let e = entry.with_context(|| format!("looking for checkouts in {}", dir.display()))?;
+        let name = e.file_name();
+        if name == ".git" {
+            if e.file_type().is_dir() {
+                walk.skip_current_dir();
+            }
+            // The worktree's own `.git` file sits at the top.
+            if e.depth() == 1 {
+                continue;
+            }
+            let checkout = e.path().parent().unwrap_or(dir);
+            if !submodules.iter().any(|s| s == checkout) {
+                return Ok(Some(checkout.to_path_buf()));
+            }
+            continue;
+        }
+        if e.file_type().is_dir() && name.to_str().is_some_and(|n| NOT_SEARCHED.contains(&n)) {
+            // A checkout can itself be called `target`, so look before skipping.
+            let is_checkout = std::fs::symlink_metadata(e.path().join(".git")).is_ok();
+            if is_checkout && !submodules.iter().any(|s| s == e.path()) {
+                return Ok(Some(e.path().to_path_buf()));
+            }
+            walk.skip_current_dir();
+        }
+    }
+    Ok(None)
 }
 
 /// The submodule repositories under `modules`. A submodule's name can contain

@@ -21,14 +21,16 @@ Picard only works inside the folders you list as **roots**, such as `~/working`.
 These rules always hold:
 
 - Nothing outside your roots is removed, and symlinks are never followed out of them. Tool caches are the exception: Picard never deletes them itself. It asks each tool to prune its own cache.
-- Git branches are never deleted. Worktrees are removed with `git worktree remove`, never with `--force`.
-- A worktree with uncommitted or untracked changes is never removed.
+- Git branches are never deleted. Worktrees are removed with `git worktree remove`. A worktree with checked-out submodules needs `--force`, so Picard first checks each submodule itself: it must be clean, and every commit in it must be on a remote branch.
+- A worktree with uncommitted or untracked changes is never removed. Neither is one that holds another git checkout, such as a Claude Code worktree in `.claude/worktrees/`.
 - Every item is checked again just before it is removed.
 - A folder you ignore is never removed, in any mode. Neither is a folder that holds one, such as a worktree with an ignored `node_modules` inside it.
 - Every removal is logged to `history.jsonl`.
 - Only one cleanup runs at a time.
 
-One thing to know: removing a worktree also deletes files git ignores inside it, such as a local `.env`. Git's own `git worktree remove` behaves the same way. The same goes for `build_output`: it trusts your `.gitignore`. If you keep files you cannot rebuild in an ignored `build` folder, add that folder to `exclude`.
+A project "has not changed" when no file in it has a newer modification time. Build output does not count. Neither does agent config that tools such as Automatic rewrite on every sync: `.agents`, `.automatic`, `.automatic.json`, `.claude`, `.codex`, `.cursor`, `.gemini`, `.junie`, `.mcp.json`, `.opencode`, `.windsurf`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` and `opencode.json`. Edits you make to those by hand do not count either. Git checkouts inside them, such as `.claude/worktrees/*`, still count. Add more names with `activity_ignore`.
+
+One thing to know: removing a worktree also deletes files git ignores inside it, such as a local `.env`. Git's own `git worktree remove` behaves the same way. The same goes for `build_output`: it trusts your `.gitignore`. If you keep files you cannot rebuild in an ignored `build` folder, add that folder to `exclude`. Picard keeps a worktree that holds another checkout by finding its `.git`. A checkout made with `--separate-git-dir`, or one whose git folder lives elsewhere, has no `.git` inside the worktree, so exclude it yourself.
 
 ## Modes
 
@@ -91,6 +93,7 @@ daily_scan = "03:00"      # also scan once a day at this local time; leave out t
 roots = ["~/working"]     # Picard only removes things inside these folders
 exclude = ["**/keep-*/**"] # glob patterns Picard never touches or lists
 ignore = ["~/working/site/node_modules"] # folders listed but never cleaned; set with Ignore
+activity_ignore = [".vscode"] # file or folder names whose changes never count as work
 
 [[task]]                  # tasks run in this order
 type = "git_worktrees"

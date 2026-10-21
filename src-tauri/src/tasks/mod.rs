@@ -159,6 +159,27 @@ impl IgnoreList {
     }
 }
 
+/// Agent config that tools such as Automatic rewrite on every sync. A change
+/// to these is not someone working on the project, so it never resets a
+/// project's idle time. Matched against each file and folder name at any depth.
+pub const NOT_ACTIVITY: &[&str] = &[
+    ".agents",
+    ".automatic",
+    ".automatic.json",
+    ".claude",
+    ".codex",
+    ".cursor",
+    ".gemini",
+    ".junie",
+    ".mcp.json",
+    ".opencode",
+    ".windsurf",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    "opencode.json",
+];
+
 /// What a task may touch on one volume.
 pub struct Ctx<'a> {
     /// Canonical roots on this volume. Roots that cannot be resolved are left out.
@@ -172,6 +193,9 @@ pub struct Ctx<'a> {
     pub exclude: &'a GlobSet,
     pub now: SystemTime,
     pub sizes: &'a SizeCache,
+    /// File and folder names whose changes do not make a project look in use.
+    /// `NOT_ACTIVITY` plus the config's `activity_ignore`.
+    pub not_activity: Vec<String>,
     /// Ignored folders, checked again on the resolved path just before each
     /// removal. Not part of `check_target`, because scans must still list them.
     /// Behind a lock so a run can refresh it between tasks.
@@ -203,8 +227,15 @@ impl<'a> Ctx<'a> {
             exclude,
             now,
             sizes,
+            not_activity: NOT_ACTIVITY.iter().map(|n| n.to_string()).collect(),
             keep: RwLock::default(),
         }
+    }
+
+    /// Adds the config's `activity_ignore` names to the built-in list.
+    pub fn with_activity_ignore(mut self, names: &[String]) -> Self {
+        self.not_activity.extend(names.iter().cloned());
+        self
     }
 
     /// Replaces the ignore list that removals check.

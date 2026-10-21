@@ -100,7 +100,7 @@ impl GitWorktrees {
             );
             return Ok(None);
         }
-        let Some(newest) = newest_mtime(&wt.path) else {
+        let Some(newest) = newest_mtime(&wt.path, &ctx.not_activity) else {
             return Ok(None);
         };
         let Ok(idle) = ctx.now.duration_since(newest) else {
@@ -1256,6 +1256,94 @@ mod tests {
         // Outside the worktree, in the repository `--force` would delete.
         let store = r.join(".git/worktrees/late-store/modules/vendor/lib");
         std::fs::write(store.join("description"), "touched").unwrap();
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(report.failed[0].1, "changed since the run started");
+        assert!(wt.exists());
+    }
+
+    /// Ignores `.claude/` in every worktree of `repo`, as Claude Code does.
+    fn ignore_claude_folder(repo: &Path) {
+        std::fs::write(repo.join(".git/info/exclude"), ".claude/\n").unwrap();
+    }
+
+    #[test]
+    fn worktree_holding_a_claude_worktree_is_kept() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        ignore_claude_folder(&r);
+        let outer = worktree(&r, "outer");
+        let inner = outer.join(".claude/worktrees/inner");
+        git(
+            &outer,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "inner",
+                inner.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(inner.join("work.txt"), "untracked work").unwrap();
+        age(&fx, &outer, 30);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(!names(&found).contains(&"outer".to_string()), "{found:?}");
+        let why = refusal(&outer);
+        assert!(why.starts_with("holds another git checkout at"), "{why}");
+        assert!(why.ends_with(".claude/worktrees/inner"), "{why}");
+    }
+
+    #[test]
+    fn nested_checkout_named_like_build_output_is_still_found() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        ignore_claude_folder(&r);
+        let outer = worktree(&r, "outer-target");
+        let inner = outer.join(".claude/worktrees/target");
+        git(
+            &outer,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "target",
+                inner.to_str().unwrap(),
+            ],
+        );
+        let why = refusal(&outer);
+        assert!(why.ends_with(".claude/worktrees/target"), "{why}");
+    }
+
+    #[test]
+    fn agent_config_written_lately_does_not_keep_a_worktree_busy() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        ignore_claude_folder(&r);
+        let wt = worktree(&r, "synced");
+        age(&fx, &wt, 1);
+        // An Automatic sync, moments ago. Ignored by git, so status is clean.
+        std::fs::create_dir_all(wt.join(".claude/rules")).unwrap();
+        std::fs::write(wt.join(".claude/rules/general.md"), "rules").unwrap();
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found), vec!["synced"]);
+    }
+
+    #[test]
+    fn agent_config_written_during_the_run_still_blocks_removal() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        ignore_claude_folder(&r);
+        let wt = worktree(&r, "late-sync");
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(found.len(), 1);
+        // The last check before removal counts every file, agent config too.
+        std::fs::create_dir_all(wt.join(".claude")).unwrap();
+        std::fs::write(wt.join(".claude/settings.local.json"), "{}").unwrap();
         let report = t.run(&ctx, &found);
         assert!(report.removed.is_empty(), "{report:?}");
         assert_eq!(report.failed[0].1, "changed since the run started");

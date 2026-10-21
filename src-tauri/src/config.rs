@@ -26,6 +26,9 @@ mode = "ask"              # auto | ask | off
 # daily_scan = "03:00"    # also scan once a day at this local time (24-hour)
 roots = ["~/working"]
 exclude = []
+# Files and folders whose changes never make a project look in use, on top of
+# the built-in agent config list (.claude, AGENTS.md, .mcp.json and others).
+# activity_ignore = [".vscode"]
 
 [[task]]
 type = "git_worktrees"
@@ -387,6 +390,9 @@ pub struct Config {
     /// `~` expanded. Unlike `exclude`, they still show in preview, marked as
     /// ignored, but no cleanup removes them.
     pub ignore: Vec<PathBuf>,
+    /// File and folder names whose changes do not count as work when deciding
+    /// whether a project is idle. Added to `tasks::NOT_ACTIVITY`.
+    pub activity_ignore: Vec<String>,
     pub volumes: Vec<VolumeOverride>,
     pub tasks: Vec<TaskConfig>,
     pub tools: ToolOverrides,
@@ -424,6 +430,8 @@ struct RawConfig {
     exclude: Vec<String>,
     #[serde(default)]
     ignore: Vec<String>,
+    #[serde(default)]
+    activity_ignore: Vec<String>,
     #[serde(default)]
     volume: Vec<RawVolume>,
     #[serde(default)]
@@ -494,6 +502,10 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
         .map(|p| expand_path(p, home).with_context(|| format!("ignore entry {p:?}")))
         .collect::<Result<Vec<_>>>()?;
 
+    for name in &raw.activity_ignore {
+        validate_activity_ignore(name)?;
+    }
+
     for task in &raw.task {
         validate_task(task)?;
     }
@@ -518,6 +530,7 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
         roots,
         exclude: raw.exclude,
         ignore,
+        activity_ignore: raw.activity_ignore,
         volumes,
         tasks: raw.task,
         tools: parse_tools(&raw.tools, home)?,
@@ -531,6 +544,23 @@ pub const DAILY_SCAN_FORMAT: &str = "%H:%M";
 fn parse_daily_time(raw: &str) -> Result<NaiveTime> {
     NaiveTime::parse_from_str(raw.trim(), DAILY_SCAN_FORMAT)
         .with_context(|| format!("daily_scan must be a 24-hour time like \"03:00\", got {raw:?}"))
+}
+
+/// An `activity_ignore` entry is matched against single file and folder
+/// names, so a path or a pattern would silently match nothing.
+fn validate_activity_ignore(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.trim() != name
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.chars().any(|c| c.is_control() || "*?[]\\".contains(c))
+    {
+        bail!(
+            "activity_ignore entry {name:?} must be a plain file or folder name, not a path or pattern"
+        );
+    }
+    Ok(())
 }
 
 /// Checks task options that serde cannot.
@@ -798,6 +828,31 @@ mod tests {
                 PathBuf::from("/V/y")
             ]
         );
+    }
+
+    #[test]
+    fn activity_ignore_defaults_to_empty_and_keeps_names() {
+        assert!(
+            parse_ok("min_free_gb = 1\nroots = [\"/a\"]")
+                .activity_ignore
+                .is_empty()
+        );
+        let c = parse_ok(
+            "min_free_gb = 1\nroots = [\"/a\"]\nactivity_ignore = [\".vscode\", \"NOTES.md\"]",
+        );
+        assert_eq!(c.activity_ignore, vec![".vscode", "NOTES.md"]);
+    }
+
+    #[test]
+    fn rejects_activity_ignore_paths_and_patterns() {
+        for bad in [
+            "a/b", "*.md", "..", ".", "", " .vscode", ".vscode ", "a\\b", "a\nb",
+        ] {
+            let e = parse_err(&format!(
+                "min_free_gb = 1\nroots = [\"/a\"]\nactivity_ignore = [{bad:?}]"
+            ));
+            assert!(e.contains("activity_ignore"), "{bad}: {e}");
+        }
     }
 
     #[test]

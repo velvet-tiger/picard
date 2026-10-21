@@ -345,7 +345,8 @@ pub fn preview_volume(
 ) -> Result<Vec<TaskScan>> {
     let exclude = tasks::build_exclude(&config.exclude)?;
     let ctx = Ctx::for_volume(volume, &exclude, SystemTime::now(), sizes)
-        .with_search_roots(&config.roots);
+        .with_search_roots(&config.roots)
+        .with_activity_ignore(&config.activity_ignore);
     let tasks = tasks::from_config(&config.tasks, env, &config.tools);
     Ok(preview(&tasks, &ctx, &IgnoreList::new(&config.ignore)))
 }
@@ -400,7 +401,8 @@ pub fn clean_volume(
     };
     let exclude = tasks::build_exclude(&config.exclude)?;
     let ctx = Ctx::for_volume(volume, &exclude, SystemTime::now(), sizes)
-        .with_search_roots(&config.roots);
+        .with_search_roots(&config.roots)
+        .with_activity_ignore(&config.activity_ignore);
     let tasks = tasks::from_config(&config.tasks, env, &config.tools);
     let read_free = || disk::query(&volume.mount).map(|s| s.free_bytes);
     let mut record = |task: &'static str, removed: &[Removed]| {
