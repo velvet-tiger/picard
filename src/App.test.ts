@@ -54,4 +54,13 @@ describe('app.css', () => {
     expect(forced.length).toBeGreaterThan(0)
     expect(vars(':root:not([data-theme]) {')).toEqual(forced)
   })
+
+  // A scrollbar that appears only on tall tabs narrows them and shifts the
+  // centred tab bar. jsdom has no layout, so the rule itself is what we check.
+  it('always reserves the scrollbar track so every tab has the same width', () => {
+    const start = css.search(/^html\s*\{/m)
+    expect(start, 'html rule').toBeGreaterThan(-1)
+    const body = css.slice(start, css.indexOf('}', start))
+    expect(body).toMatch(/overflow-y:\s*scroll\s*;/)
+  })
 })

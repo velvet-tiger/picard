@@ -45,6 +45,14 @@
   }
 }
 
+/* Settings is taller than the window and the other tabs are not. Without a
+   permanent scrollbar track, Settings would be narrower and the tab bar would
+   sit further left on that tab. scrollbar-gutter would do this too, but it
+   needs macOS 15.2 and the app sets no minimum macOS version. */
+html {
+  overflow-y: scroll;
+}
+
 * {
   box-sizing: border-box;
 }
