@@ -22,6 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+.junie/
 
 # BEGIN Automatic-managed
 # Files generated and managed by Automatic. Regenerated on sync; do not edit inside this block.
