@@ -356,4 +356,143 @@ describe('Preview', () => {
       await screen.findByText('get_protection returned 1 answers for 4 rows'),
     ).toBeInTheDocument()
   })
+
+  describe('category toggle', () => {
+    const VENV = '/Users/a/w/old/.venv'
+
+    /** The usual scan plus an empty, an all-ignored and a failed category. */
+    function mixed(): VolumePreview[] {
+      const [v] = volumes()
+      v.tasks.push(
+        { task: 'cargo_clean', error: null, items: [] },
+        { task: 'python_venv', error: null, items: [item(VENV, 1e9, { ignored: true })] },
+        { task: 'build_output', error: 'permission denied', items: [] },
+      )
+      return [v]
+    }
+
+    const toggle = (label: string) => screen.getByRole('button', { name: `${label} list` })
+
+    it('starts categories with something to clean open', async () => {
+      backend({ preview: mixed })
+      await renderScanned()
+
+      expect(toggle('node_modules')).toHaveAttribute('aria-expanded', 'true')
+      expect(toggle('Git worktrees')).toHaveAttribute('aria-expanded', 'true')
+      expect(box('shop/web')).toBeVisible()
+    })
+
+    it('starts empty and all-ignored categories closed, with a summary', async () => {
+      backend({ preview: mixed })
+      await renderScanned()
+
+      expect(toggle('Cargo target folders')).toHaveAttribute('aria-expanded', 'false')
+      expect(toggle('Python virtualenvs')).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.getByText('nothing to remove')).toBeInTheDocument()
+      expect(screen.getByText('all ignored')).toBeInTheDocument()
+      expect(screen.queryByRole('checkbox', { name: /w\/old/ })).not.toBeInTheDocument()
+    })
+
+    it('keeps a category that failed to scan open, so its error shows', async () => {
+      backend({ preview: mixed })
+      await renderScanned()
+
+      expect(toggle('Ignored build output')).toHaveAttribute('aria-expanded', 'true')
+      expect(screen.getByText('Could not scan: permission denied')).toBeVisible()
+    })
+
+    it('opens and closes a category when its toggle is clicked', async () => {
+      backend({ preview: mixed })
+      await renderScanned()
+
+      await fireEvent.click(toggle('Python virtualenvs'))
+      expect(toggle('Python virtualenvs')).toHaveAttribute('aria-expanded', 'true')
+      expect(screen.getByRole('checkbox', { name: /w\/old/ })).toBeDisabled()
+      expect(screen.queryByText('all ignored')).not.toBeInTheDocument()
+
+      await fireEvent.click(toggle('node_modules'))
+      expect(toggle('node_modules')).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.getByText('2 items, 1 ignored')).toBeInTheDocument()
+      expect(screen.queryByRole('checkbox', { name: /shop\/web/ })).not.toBeInTheDocument()
+    })
+
+    it('says a closed category failed to scan', async () => {
+      backend({ preview: mixed })
+      await renderScanned()
+
+      await fireEvent.click(toggle('Ignored build output'))
+
+      expect(screen.getByText('could not scan')).toBeInTheDocument()
+      expect(screen.queryByText('Could not scan: permission denied')).not.toBeVisible()
+    })
+
+    it('names the heading after the category alone', async () => {
+      backend()
+      await renderScanned()
+
+      expect(screen.getByRole('heading', { level: 3, name: 'node_modules' })).toBeInTheDocument()
+    })
+
+    it('keeps the open state of each volume apart', async () => {
+      const [first] = volumes()
+      const second: VolumePreview = {
+        ...volumes()[0],
+        name: 'Backup',
+        mount: '/Volumes/Backup',
+        tasks: [{ task: 'node_modules', error: null, items: [] }],
+      }
+      backend({ preview: () => [first, second] })
+      await renderScanned()
+
+      const [onFirst, onSecond] = screen.getAllByRole('button', { name: 'node_modules list' })
+      expect(onFirst).toHaveAttribute('aria-expanded', 'true')
+      expect(onSecond).toHaveAttribute('aria-expanded', 'false')
+      expect(onFirst.getAttribute('aria-controls')).not.toBe(onSecond.getAttribute('aria-controls'))
+    })
+
+    it('still selects and cleans items in a closed category', async () => {
+      const { sent } = backend()
+      await renderScanned()
+
+      await fireEvent.click(toggle('node_modules'))
+      await fireEvent.click(screen.getByRole('button', { name: 'Select none' }))
+      await fireEvent.click(screen.getByRole('button', { name: 'Select all' }))
+      await fireEvent.click(screen.getByRole('button', { name: 'Clean selected' }))
+
+      await waitFor(() =>
+        expect(sent('run_selected')).toEqual([
+          { selections: [{ mount: '/', paths: [SHOP, API, WORKTREE] }] },
+        ]),
+      )
+    })
+
+    it('leaves a category open when Ignore protects its last item', async () => {
+      backend({ get_protection: () => [null, null, 'ignored', 'ignored'] })
+      await renderScanned()
+
+      await fireEvent.click(screen.getByRole('button', { name: /^Ignore .*old-branch/ }))
+
+      await waitFor(() => expect(box('old-branch')).toBeDisabled())
+      expect(toggle('Git worktrees')).toHaveAttribute('aria-expanded', 'true')
+    })
+
+    it('closes a category on the next scan once a clean has emptied it', async () => {
+      let scans = 0
+      backend({
+        preview: () => {
+          const found = volumes()
+          if (++scans > 1) found[0].tasks[1].items = []
+          return found
+        },
+      })
+      await renderScanned()
+      expect(toggle('Git worktrees')).toHaveAttribute('aria-expanded', 'true')
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Clean selected' }))
+
+      await waitFor(() =>
+        expect(toggle('Git worktrees')).toHaveAttribute('aria-expanded', 'false'),
+      )
+    })
+  })
 })

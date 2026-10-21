@@ -62,6 +62,26 @@
   const volumeTotal = (v: VolumePreview) =>
     v.tasks.flatMap(selectable).reduce((sum, i) => sum + i.bytes, 0)
 
+  // Whether each category's list is shown, keyed by key(mount, task).
+  let open = $state<Record<string, boolean>>({})
+
+  /**
+   * A category starts closed when it holds nothing Clean could remove. One that
+   * failed to scan stays open so its error shows.
+   */
+  const startsOpen = (task: PreviewTask) => task.error !== null || selectable(task).length > 0
+
+  /** What a closed category's heading says about the hidden list. */
+  function closedSummary(task: PreviewTask): string {
+    if (task.error) return 'could not scan'
+    if (task.items.length === 0) return 'nothing to remove'
+    const free = selectable(task).length
+    if (free === 0) return 'all ignored'
+    const items = `${free} ${free === 1 ? 'item' : 'items'}`
+    const kept = task.items.length - free
+    return kept === 0 ? items : `${items}, ${kept} ignored`
+  }
+
   const selectedBytes = $derived(
     volumes
       .flatMap((v) =>
@@ -82,6 +102,11 @@
         found.flatMap((v) =>
           v.tasks.flatMap((t) => t.items.map((i) => [key(v.mount, i.path), !isProtected(i)])),
         ),
+      )
+      // Set on every scan only. An Ignore click that empties a category leaves
+      // it open, so the list does not vanish from under the pointer.
+      open = Object.fromEntries(
+        found.flatMap((v) => v.tasks.map((t) => [key(v.mount, t.task), startsOpen(t)])),
       )
     } catch (e) {
       error = errorText(e)
@@ -324,7 +349,7 @@
   {:else if volumes.length === 0}
     <p class="muted">No mounted volumes hold a configured root.</p>
   {:else}
-    {#each volumes as v}
+    {#each volumes as v, vi}
       <div class="panel">
         <div class="row">
           <h2>{v.name}</h2>
@@ -332,71 +357,90 @@
           <span class="spacer"></span>
           <span class="muted">up to {formatBytes(volumeTotal(v))}</span>
         </div>
-        {#each v.tasks as t}
-          {#if !t.error && selectable(t).length > 0}
-            {@const ticked = taskTickedCount(v.mount, t)}
-            {@const total = selectable(t).length}
+        {#each v.tasks as t, ti}
+          {@const tk = key(v.mount, t.task)}
+          {@const label = TASK_LABELS[t.task] ?? t.task}
+          {@const listId = `task-${vi}-${ti}`}
+          <!-- The toggle and summary sit outside the h3 so the heading's name is the category alone. -->
+          <div class="task">
+            <button
+              class="toggle"
+              aria-expanded={open[tk]}
+              aria-controls={listId}
+              aria-label="{label} list"
+              onclick={() => (open[tk] = !open[tk])}
+              ><span class="chevron" class:open={open[tk]} aria-hidden="true">▸</span></button
+            >
             <h3>
-              <label class="group">
-                <input
-                  type="checkbox"
-                  checked={ticked === total}
-                  indeterminate={ticked > 0 && ticked < total}
-                  onchange={(e) => setTask(v.mount, t, e.currentTarget.checked)}
-                />
-                {TASK_LABELS[t.task] ?? t.task}
-              </label>
+              {#if !t.error && selectable(t).length > 0}
+                {@const ticked = taskTickedCount(v.mount, t)}
+                {@const total = selectable(t).length}
+                <label class="group">
+                  <input
+                    type="checkbox"
+                    checked={ticked === total}
+                    indeterminate={ticked > 0 && ticked < total}
+                    onchange={(e) => setTask(v.mount, t, e.currentTarget.checked)}
+                  />
+                  {label}
+                </label>
+              {:else}
+                {label}
+              {/if}
             </h3>
-          {:else}
-            <h3>{TASK_LABELS[t.task] ?? t.task}</h3>
-          {/if}
-          {#if t.error}
-            <p class="error">Could not scan: {t.error}</p>
-          {:else if t.items.length === 0}
-            <p class="muted">Nothing to remove.</p>
-          {:else}
-            <ul>
-              {#each t.items as i}
-                {@const k = key(v.mount, i.path)}
-                <li class="candidate" class:ignored={isProtected(i)}>
-                  <!-- The row already shows the path; a tooltip only helps when shortPath has elided part of it. -->
-                  <label
-                    class="item"
-                    title={shortPath(i.path) !== tildePath(i.path) ? tildePath(i.path) : undefined}
-                  >
-                    <input
-                      type="checkbox"
-                      bind:checked={checked[k]}
-                      disabled={isProtected(i) || cleaning}
-                    />
-                    <span class="text">
-                      <span class="title"
-                        >{itemTitle(t.task, i.path)}
-                        <span class="muted reason"
-                          >{i.ignored
-                            ? 'ignored, never cleaned'
-                            : i.holds_ignored
-                              ? 'holds an ignored folder, never cleaned'
-                              : i.reason}</span
-                        ></span
-                      >
-                      <span class="path muted">{shortPath(i.path)}</span>
-                    </span>
-                    <span class="size">{i.size_text}</span>
-                  </label>
-                  {#if IGNORABLE_TASKS.includes(t.task)}
-                    <button
-                      class="ignore"
-                      onclick={() => toggleIgnore(v.mount, i)}
-                      disabled={toggling[k] || cleaning}
-                      aria-label="{i.ignored ? 'Stop ignoring' : 'Ignore'} {tildePath(i.path)}"
-                      >{i.ignored ? 'Unignore' : 'Ignore'}</button
+            {#if !open[tk]}
+              <span class="muted summary">{closedSummary(t)}</span>
+            {/if}
+          </div>
+          <div id={listId} hidden={!open[tk]}>
+            {#if t.error}
+              <p class="error">Could not scan: {t.error}</p>
+            {:else if t.items.length === 0}
+              <p class="muted">Nothing to remove.</p>
+            {:else}
+              <ul>
+                {#each t.items as i}
+                  {@const k = key(v.mount, i.path)}
+                  <li class="candidate" class:ignored={isProtected(i)}>
+                    <!-- The row already shows the path; a tooltip only helps when shortPath has elided part of it. -->
+                    <label
+                      class="item"
+                      title={shortPath(i.path) !== tildePath(i.path) ? tildePath(i.path) : undefined}
                     >
-                  {/if}
-                </li>
-              {/each}
-            </ul>
-          {/if}
+                      <input
+                        type="checkbox"
+                        bind:checked={checked[k]}
+                        disabled={isProtected(i) || cleaning}
+                      />
+                      <span class="text">
+                        <span class="title"
+                          >{itemTitle(t.task, i.path)}
+                          <span class="muted reason"
+                            >{i.ignored
+                              ? 'ignored, never cleaned'
+                              : i.holds_ignored
+                                ? 'holds an ignored folder, never cleaned'
+                                : i.reason}</span
+                          ></span
+                        >
+                        <span class="path muted">{shortPath(i.path)}</span>
+                      </span>
+                      <span class="size">{i.size_text}</span>
+                    </label>
+                    {#if IGNORABLE_TASKS.includes(t.task)}
+                      <button
+                        class="ignore"
+                        onclick={() => toggleIgnore(v.mount, i)}
+                        disabled={toggling[k] || cleaning}
+                        aria-label="{i.ignored ? 'Stop ignoring' : 'Ignore'} {tildePath(i.path)}"
+                        >{i.ignored ? 'Unignore' : 'Ignore'}</button
+                      >
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
         {/each}
       </div>
     {/each}
@@ -438,7 +482,37 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--muted);
+  }
+  /* chevron | checkbox and name | summary when closed */
+  .task {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     margin: 12px 0 4px;
+  }
+  .task h3 {
+    margin: 0;
+  }
+  /* 24px is the smallest target WCAG 2.2 (2.5.8) allows. */
+  .toggle {
+    min-width: 24px;
+    min-height: 24px;
+    border: none;
+    background: none;
+    padding: 0;
+    color: var(--muted);
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .chevron {
+    display: inline-block;
+    transition: transform 0.15s;
+  }
+  .chevron.open {
+    transform: rotate(90deg);
+  }
+  .summary {
+    font-size: 12px;
   }
   .group {
     display: inline-flex;
@@ -597,6 +671,9 @@
     }
   }
   @media (prefers-reduced-motion: reduce) {
+    .chevron {
+      transition: none;
+    }
     .spinner,
     .bar span,
     .skeleton .box,
