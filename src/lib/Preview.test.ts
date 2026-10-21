@@ -93,6 +93,7 @@ function findTotal(start: string) {
 
 async function renderScanned() {
   render(Preview)
+  await fireEvent.click(screen.getByRole('button', { name: 'Scan' }))
   await screen.findByText('Macintosh HD')
 }
 
@@ -102,6 +103,32 @@ describe('Preview', () => {
   afterEach(async () => {
     cleanup()
     await settle()
+  })
+
+  it('waits for Scan before scanning, but loads the total straight away', async () => {
+    const scan = deferred<VolumePreview[]>()
+    const { sent } = backend({
+      preview: () => scan.promise,
+      get_totals: () => ({ bytes: 42.3e9, items: 318, since: '2026-09-03T08:30:00Z' }),
+    })
+    const prompt = 'Press Scan to find build folders, caches and stale worktrees.'
+    render(Preview)
+
+    expect(await findTotal('Picard has freed 42 GB across 318 items')).toBeInTheDocument()
+    expect(screen.getByText(prompt)).toBeInTheDocument()
+    expect(sent('get_history')).toHaveLength(1)
+    await settle()
+    expect(sent('preview')).toHaveLength(0)
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }))
+    expect(await screen.findByText('Scanning your folders…')).toBeInTheDocument()
+    expect(screen.queryByText(prompt)).not.toBeInTheDocument()
+
+    scan.resolve(volumes())
+    await screen.findByText('Macintosh HD')
+    expect(sent('preview')).toHaveLength(1)
+    expect(screen.queryByText(prompt)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Rescan' })).toBeInTheDocument()
   })
 
   it('ticks every item the ignore list does not protect', async () => {
@@ -124,7 +151,12 @@ describe('Preview', () => {
       },
     })
     render(Preview)
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }))
     expect(await screen.findByText('Could not read config.toml')).toBeInTheDocument()
+    // Nothing was found because nothing was read, so neither empty-state line is true.
+    expect(screen.queryByText(/No mounted volumes/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Press Scan/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Scan' })).toBeInTheDocument()
   })
 
   it('cleans only the ticked items, then scans again', async () => {
@@ -154,14 +186,14 @@ describe('Preview', () => {
     backend({
       get_totals: () => ({ bytes: 42.3e9, items: 318, since: '2026-09-03T08:30:00Z' }),
     })
-    await renderScanned()
+    render(Preview)
 
     expect(await findTotal('Picard has freed 42 GB across 318 items')).toBeInTheDocument()
   })
 
   it('hides the total until something has been removed', async () => {
     const { sent } = backend()
-    await renderScanned()
+    render(Preview)
     await waitFor(() => expect(sent('get_totals')).toHaveLength(1))
     await settle()
 
@@ -174,7 +206,7 @@ describe('Preview', () => {
         throw 'history.jsonl is unreadable'
       },
     })
-    await renderScanned()
+    render(Preview)
     await waitFor(() => expect(sent('get_totals')).toHaveLength(1))
     await settle()
 
@@ -203,7 +235,7 @@ describe('Preview', () => {
     let totals: Totals = { bytes: 0, items: 0, since: null }
     let history: HistoryEntry[] = []
     const { sent } = backend({ get_totals: () => totals, get_history: () => history })
-    await renderScanned()
+    render(Preview)
     await waitFor(() => expect(sent('get_totals')).toHaveLength(1))
     expect(screen.queryByText('Recently removed')).not.toBeInTheDocument()
 
@@ -217,7 +249,7 @@ describe('Preview', () => {
     expect(await findTotal('Picard has freed 2.0 GB across 1 item')).toBeInTheDocument()
     expect(screen.getByText('Recently removed')).toBeInTheDocument()
     expect(sent('get_history')).toHaveLength(2)
-    expect(sent('preview')).toHaveLength(1)
+    expect(sent('preview')).toHaveLength(0)
   })
 
   it('folds events that arrive during a reload into one more reload', async () => {
@@ -229,7 +261,8 @@ describe('Preview', () => {
         return reply.promise
       },
     })
-    await renderScanned()
+    render(Preview)
+    await waitFor(() => expect(replies).toHaveLength(1))
     const none: Totals = { bytes: 0, items: 0, since: null }
     replies[0].resolve(none)
     await settle()
@@ -246,7 +279,7 @@ describe('Preview', () => {
     replies[2].resolve(none)
     await settle()
     expect(sent('get_totals')).toHaveLength(3)
-    expect(sent('preview')).toHaveLength(1)
+    expect(sent('preview')).toHaveLength(0)
   })
 
   it('unticks only one task when its group box is unticked', async () => {
