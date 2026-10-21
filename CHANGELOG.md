@@ -4,12 +4,32 @@ All notable changes to Picard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-21
 
 ### Added
 
-- About tab with the running version, links to the Velvet Tiger website and GitHub issues, and a check for a newer release on GitHub.
-- Appearance setting to make the window light or dark, or follow macOS (`appearance` in the config).
+- About tab with the running version, links to the Velvet Tiger website and GitHub issues, and a check for a newer release on GitHub. The check runs only when you open the tab or press Check again (debf414, a409677, 4ec3979).
+- Appearance setting to make the window light or dark, or follow macOS (`appearance` in the config) (e13c16d).
+- `activity_ignore` config key, edited in Settings under "Changes that don't count as work". It lists the names whose changes do not make a project look active. The defaults can be removed or restored (d3e1d68, a080985, a43ead0).
+
+### Changed
+
+- Changes to agent config such as `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, `.automatic/` and `.claude/` no longer make a project look active. Stale build output in projects that tools like Automatic sync is now cleaned. Git checkouts inside those folders still count as work (d3e1d68).
+- Worktrees with checked-out submodules are removed when nothing would be lost: every submodule is clean, filter-free and has no commit missing from its remote (622eea2).
+
+### Security
+
+- Every git call sets `GIT_NO_LAZY_FETCH=1` and `GIT_ALLOW_PROTOCOL=none`, so a crafted repository cannot make a status check fetch or run a command (622eea2).
+- Just before a worktree is removed, Picard refuses it if anything inside it or its submodules changed since the run started (622eea2).
+- A worktree that holds another git checkout is never removed (d3e1d68).
+
+### Fixed
+
+- A preview started while a clean is running is refused, instead of listing folders about to be deleted (7cf3d4e).
+
+### Build / CI
+
+- The release workflow publishes the release with this changelog as its notes. It refuses tags that are not on `main`, never replaces a published release, and checks the notarisation ticket on signed builds (3e22ac4, 831ccdd).
 
 ## [0.1.0] - 2026-10-20
 
@@ -68,4 +88,5 @@ and removes build output and finished work when a drive runs low.
 - Disk image volume test (a918137).
 - Vitest tests for `api.ts`, Preview and Settings (5eeb28a).
 
+[0.2.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.2.0
 [0.1.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.1.0
