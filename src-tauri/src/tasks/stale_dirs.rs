@@ -446,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_activity_ignore_names_are_skipped_too() {
+    fn a_configured_list_replaces_the_defaults() {
         let fx = Fixture::new(&[]);
         node_project(&fx, "p", 10, 40);
         fx.file("p/.vscode/settings.json", 1);
@@ -454,6 +454,23 @@ mod tests {
         let ctx = fx.ctx().with_activity_ignore(&[".vscode".to_string()]);
         let found = node_modules(30).scan(&ctx).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
+        // AGENTS.md is a default, but not in this list, so it counts again.
+        fx.file("p/AGENTS.md", 1);
+        assert!(node_modules(30).scan(&ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_empty_list_in_the_config_makes_agent_config_count() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 10, 40);
+        fx.file("p/AGENTS.md", 1);
+        let parse = |text: &str| crate::config::parse(text, &fx.root).unwrap();
+        let defaults = parse("min_free_gb = 1\nroots = [\"/a\"]");
+        let ctx = fx.ctx().with_activity_ignore(&defaults.activity_ignore);
+        assert_eq!(node_modules(30).scan(&ctx).unwrap().len(), 1);
+        let empty = parse("min_free_gb = 1\nroots = [\"/a\"]\nactivity_ignore = []");
+        let ctx = fx.ctx().with_activity_ignore(&empty.activity_ignore);
+        assert!(node_modules(30).scan(&ctx).unwrap().is_empty());
     }
 
     #[test]

@@ -31,7 +31,8 @@ pub struct Settings {
     /// As written in the file, so `~/working` stays `~/working`.
     pub roots: Vec<String>,
     pub exclude: Vec<String>,
-    /// Names added to the built-in list whose changes do not count as work.
+    /// Names whose changes do not count as work: the defaults unless the file
+    /// sets its own list.
     pub activity_ignore: Vec<String>,
     pub tasks: Vec<TaskConfig>,
 }
@@ -112,11 +113,14 @@ pub fn apply(text: &str, settings: &Settings, home: &Path) -> Result<String> {
         "exclude",
         Value::Array(strings(&settings.exclude)),
     );
-    // Optional, so an empty list adds no key to a file without one. A key
-    // already there is set to `[]` rather than removed, which would also
-    // remove the comments above it.
-    if settings.activity_ignore.is_empty() && !doc.contains_key("activity_ignore") {
-        // Nothing to write.
+    // A list holding exactly the defaults, in any order, removes the key, so
+    // the file follows any later change to the defaults. That also removes
+    // comments above the key.
+    if same_names(
+        &settings.activity_ignore,
+        &config::default_activity_ignore(),
+    ) {
+        doc.remove("activity_ignore");
     } else {
         set(
             &mut doc,
@@ -129,6 +133,14 @@ pub fn apply(text: &str, settings: &Settings, home: &Path) -> Result<String> {
     let out = doc.to_string();
     config::parse(&out, home).context("these settings are not valid")?;
     Ok(out)
+}
+
+/// True when both lists hold the same names, ignoring order and repeats.
+fn same_names(a: &[String], b: &[String]) -> bool {
+    fn set(names: &[String]) -> std::collections::BTreeSet<&str> {
+        names.iter().map(String::as_str).collect()
+    }
+    set(a) == set(b)
 }
 
 /// The `ignore` entries as written in the file, so `~/…` stays `~/…`.
@@ -472,40 +484,41 @@ mod tests {
     }
 
     #[test]
-    fn activity_ignore_is_read_saved_and_cleared_keeping_its_comment() {
-        let text = DEFAULT_TOML.replacen(
-            "exclude = []",
-            "exclude = []\n# names of my own\nactivity_ignore = [\".vscode\"]",
-            1,
-        );
-        let mut s = read(&text, home()).unwrap();
-        assert_eq!(s.activity_ignore, vec![".vscode"]);
+    fn activity_ignore_shows_the_defaults_and_writes_only_a_changed_list() {
+        let defaults = crate::config::default_activity_ignore();
+        let key = |text: &str| text.lines().any(|l| l.starts_with("activity_ignore"));
 
-        s.activity_ignore.push("NOTES.md".to_string());
-        let out = apply(&text, &s, home()).unwrap();
+        // No key: the form shows the defaults, and saving it adds no key.
+        let mut s = read(DEFAULT_TOML, home()).unwrap();
+        assert_eq!(s.activity_ignore, defaults);
+        let out = apply(DEFAULT_TOML, &s, home()).unwrap();
+        assert!(!key(&out), "{out}");
+
+        // Dropping a default writes the whole list, without it.
+        s.activity_ignore.retain(|n| n != "CLAUDE.md");
+        s.activity_ignore.push(".vscode".to_string());
+        let out = apply(&out, &s, home()).unwrap();
         let parsed = crate::config::parse(&out, home()).unwrap();
-        assert_eq!(parsed.activity_ignore, vec![".vscode", "NOTES.md"]);
-        assert!(
-            out.contains("# names of my own\nactivity_ignore = ["),
-            "{out}"
-        );
+        assert_eq!(parsed.activity_ignore, s.activity_ignore);
+        assert!(!parsed.activity_ignore.contains(&"CLAUDE.md".to_string()));
 
+        // An empty list is kept as `[]`: every change counts.
         s.activity_ignore.clear();
         let out = apply(&out, &s, home()).unwrap();
-        assert!(
-            out.contains("# names of my own\nactivity_ignore = []"),
-            "{out}"
-        );
+        assert!(out.contains("\nactivity_ignore = []"), "{out}");
         assert!(
             crate::config::parse(&out, home())
                 .unwrap()
                 .activity_ignore
                 .is_empty()
         );
-        // Saving an untouched form from a file without the key adds nothing.
-        let plain = read(DEFAULT_TOML, home()).unwrap();
-        let out = apply(DEFAULT_TOML, &plain, home()).unwrap();
-        assert!(!out.contains("\nactivity_ignore"), "{out}");
+
+        // Back to the defaults, even reordered and with a repeat, removes the key.
+        s.activity_ignore = defaults.iter().rev().cloned().collect();
+        s.activity_ignore.push(defaults[0].clone());
+        let out = apply(&out, &s, home()).unwrap();
+        assert!(!key(&out), "{out}");
+        assert_eq!(read(&out, home()).unwrap().activity_ignore, defaults);
     }
 
     #[test]

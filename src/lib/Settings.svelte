@@ -62,15 +62,24 @@
 
   $effect(() => onIgnoreChanged(() => loadIgnored()))
 
-  // Fixed in the app, shown so the user can see what is already left out.
-  let builtInNames = $state<string[]>([])
-  let builtInError = $state<string | null>(null)
+  // The app's default list, for Restore defaults. Saving a list equal to it
+  // removes the key, so the config follows later changes to the defaults.
+  let defaultNames = $state<string[]>([])
+  let defaultsError = $state<string | null>(null)
+  // Order and repeats do not matter, matching the check made when saving.
+  const isDefaultList = $derived.by(() => {
+    if (settings === null) return false
+    // Blank rows are dropped on save, so they do not count here either.
+    const names = new Set(settings.activity_ignore.map((n) => n.trim()).filter(Boolean))
+    const defaults = new Set(defaultNames)
+    return names.size === defaults.size && [...defaults].every((n) => names.has(n))
+  })
 
-  async function loadBuiltInNames() {
+  async function loadDefaultNames() {
     try {
-      builtInNames = await getNotActivity()
+      defaultNames = await getNotActivity()
     } catch (e) {
-      builtInError = `Could not read the built-in names: ${errorText(e)}`
+      defaultsError = `Could not read the default names: ${errorText(e)}`
     }
   }
 
@@ -190,7 +199,7 @@
 
   load()
   loadIgnored()
-  loadBuiltInNames()
+  loadDefaultNames()
 </script>
 
 <main>
@@ -301,12 +310,10 @@
       <p class="muted">
         A project is idle when nothing in it has changed. Changes to files or folders with these
         names never count, at any depth. Git checkouts inside them, such as .claude/worktrees,
-        still do.
+        still do. The list starts with agent config that tools rewrite on their own.
       </p>
-      {#if builtInError}
-        <p class="error">{builtInError}</p>
-      {:else if builtInNames.length > 0}
-        <p class="muted path">Built in: {builtInNames.join(', ')}</p>
+      {#if defaultsError}
+        <p class="error">{defaultsError}</p>
       {/if}
       {#each settings.activity_ignore as _, i}
         <div class="row">
@@ -321,8 +328,16 @@
             aria-label={`Remove ${settings.activity_ignore[i] || 'blank name'}`}>Remove</button
           >
         </div>
+      {:else}
+        <p class="muted">None. Every change counts as work.</p>
       {/each}
-      <button onclick={() => settings!.activity_ignore.push('')}>Add name</button>
+      <div class="row">
+        <button onclick={() => settings!.activity_ignore.push('')}>Add name</button>
+        <button
+          onclick={() => (settings!.activity_ignore = [...defaultNames])}
+          disabled={defaultNames.length === 0 || isDefaultList}>Restore defaults</button
+        >
+      </div>
 
       <h2 class="sub">Ignored folders</h2>
       <p class="muted">

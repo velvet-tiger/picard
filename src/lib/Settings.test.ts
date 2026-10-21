@@ -15,7 +15,8 @@ function config(): Settings {
     daily_scan: '05:30',
     roots: ['~/working'],
     exclude: [],
-    activity_ignore: [],
+    // The backend fills in the defaults when the file has no list.
+    activity_ignore: ['.claude', 'AGENTS.md'],
     tasks: [{ type: 'node_modules', enabled: true, stale_days: 30, prune_package_caches: false }],
   }
 }
@@ -91,11 +92,29 @@ describe('Settings', () => {
     expect(view.hasUnsavedChanges()).toBe(false)
   })
 
-  it('shows the built-in names that never count as work', async () => {
+  it('lists the default names as rows that can be removed', async () => {
     backend()
     await renderLoaded()
 
-    expect(await screen.findByText('Built in: .claude, AGENTS.md')).toBeInTheDocument()
+    expect(screen.getByDisplayValue('.claude')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Remove AGENTS.md' })).toBeInTheDocument()
+  })
+
+  it('treats the defaults in another order as the defaults', async () => {
+    backend()
+    await renderLoaded()
+    const restore = () => screen.getByRole('button', { name: 'Restore defaults' })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove .claude' }))
+    // Enabled only once the defaults have loaded and the list differs.
+    await waitFor(() => expect(restore()).toBeEnabled())
+    await fireEvent.click(screen.getByRole('button', { name: 'Add name' }))
+    const rows = screen.getAllByPlaceholderText('.vscode')
+    await fireEvent.input(rows[rows.length - 1], { target: { value: '.claude' } })
+    expect(restore()).toBeDisabled()
+    // A blank row is dropped on save, so the list still holds the defaults.
+    await fireEvent.click(screen.getByRole('button', { name: 'Add name' }))
+    expect(restore()).toBeDisabled()
   })
 
   it('saves added names, trimmed, and drops blank ones', async () => {
@@ -104,8 +123,8 @@ describe('Settings', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: 'Add name' }))
     await fireEvent.click(screen.getByRole('button', { name: 'Add name' }))
-    const [first] = screen.getAllByPlaceholderText('.vscode')
-    await fireEvent.input(first, { target: { value: '  .vscode  ' } })
+    const rows = screen.getAllByPlaceholderText('.vscode')
+    await fireEvent.input(rows[rows.length - 2], { target: { value: '  .vscode  ' } })
     expect(view.hasUnsavedChanges()).toBe(true)
     await fireEvent.click(saveButton())
 
@@ -113,12 +132,30 @@ describe('Settings', () => {
       await screen.findByText('Saved. Picard has reloaded the settings.'),
     ).toBeInTheDocument()
     expect(sent('save_settings')).toEqual([
-      { settings: expect.objectContaining({ activity_ignore: ['.vscode'] }) },
+      {
+        settings: expect.objectContaining({ activity_ignore: ['.claude', 'AGENTS.md', '.vscode'] }),
+      },
     ])
     expect(view.hasUnsavedChanges()).toBe(false)
   })
 
-  it('still loads when the built-in names cannot be read', async () => {
+  it('removes a default and restores the defaults', async () => {
+    backend()
+    const view = await renderLoaded()
+    const restore = () => screen.getByRole('button', { name: 'Restore defaults' })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove AGENTS.md' }))
+    expect(screen.queryByDisplayValue('AGENTS.md')).not.toBeInTheDocument()
+    expect(view.hasUnsavedChanges()).toBe(true)
+    await waitFor(() => expect(restore()).toBeEnabled())
+
+    await fireEvent.click(restore())
+    expect(screen.getByDisplayValue('AGENTS.md')).toBeInTheDocument()
+    expect(view.hasUnsavedChanges()).toBe(false)
+    expect(restore()).toBeDisabled()
+  })
+
+  it('still loads when the default names cannot be read', async () => {
     backend({
       get_not_activity: () => {
         throw 'not allowed'
@@ -127,9 +164,10 @@ describe('Settings', () => {
     await renderLoaded()
 
     expect(
-      await screen.findByText('Could not read the built-in names: not allowed'),
+      await screen.findByText('Could not read the default names: not allowed'),
     ).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Add name' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Restore defaults' })).toBeDisabled()
   })
 
   it('sends an emptied list after Remove', async () => {
@@ -139,6 +177,7 @@ describe('Settings', () => {
     await renderLoaded()
 
     await fireEvent.click(screen.getByRole('button', { name: 'Remove .vscode' }))
+    expect(screen.getByText('None. Every change counts as work.')).toBeInTheDocument()
     await fireEvent.click(saveButton())
 
     await screen.findByText('Saved. Picard has reloaded the settings.')
@@ -158,9 +197,8 @@ describe('Settings', () => {
     const view = await renderLoaded()
 
     await fireEvent.click(screen.getByRole('button', { name: 'Add name' }))
-    await fireEvent.input(screen.getByPlaceholderText('.vscode'), {
-      target: { value: 'src/lib' },
-    })
+    const rows = screen.getAllByPlaceholderText('.vscode')
+    await fireEvent.input(rows[rows.length - 1], { target: { value: 'src/lib' } })
     await fireEvent.click(saveButton())
 
     expect(await screen.findByText(message)).toBeInTheDocument()

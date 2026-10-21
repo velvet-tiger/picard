@@ -28,7 +28,7 @@ These rules always hold:
 - Every removal is logged to `history.jsonl`.
 - Only one cleanup runs at a time.
 
-A project "has not changed" when no file in it has a newer modification time. Build output does not count. Neither does agent config that tools such as Automatic rewrite on every sync: `.agents`, `.automatic`, `.automatic.json`, `.claude`, `.codex`, `.cursor`, `.gemini`, `.junie`, `.mcp.json`, `.opencode`, `.windsurf`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` and `opencode.json`. Edits you make to those by hand do not count either. Git checkouts inside them, such as `.claude/worktrees/*`, still count. Add more names with `activity_ignore`.
+A project "has not changed" when no file in it has a newer modification time. Build output does not count. Neither does agent config that tools such as Automatic rewrite on every sync: `.agents`, `.automatic`, `.automatic.json`, `.claude`, `.codex`, `.cursor`, `.gemini`, `.junie`, `.mcp.json`, `.opencode`, `.windsurf`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` and `opencode.json`. Edits you make to those by hand do not count either. Git checkouts inside them, such as `.claude/worktrees/*`, still count. Those are the defaults. Change the list in **Settings…** under "Changes that don't count as work", or set `activity_ignore` in the config. A list you set replaces the defaults, so it must name every default you want to keep. An empty list makes every change count. **Restore defaults** puts the default list back. When you save a list that holds exactly the defaults, Picard takes the key out of the config, with any comment above it, so later releases can update the defaults. This happens on any save from **Settings…**.
 
 One thing to know: removing a worktree also deletes files git ignores inside it, such as a local `.env`. Git's own `git worktree remove` behaves the same way. The same goes for `build_output`: it trusts your `.gitignore`. If you keep files you cannot rebuild in an ignored `build` folder, add that folder to `exclude`. Picard keeps a worktree that holds another checkout by finding its `.git`. A checkout made with `--separate-git-dir`, or one whose git folder lives elsewhere, has no `.git` inside the worktree, so exclude it yourself.
 
@@ -93,7 +93,7 @@ daily_scan = "03:00"      # also scan once a day at this local time; leave out t
 roots = ["~/working"]     # Picard only removes things inside these folders
 exclude = ["**/keep-*/**"] # glob patterns Picard never touches or lists
 ignore = ["~/working/site/node_modules"] # folders listed but never cleaned; set with Ignore
-activity_ignore = [".vscode"] # file or folder names whose changes never count as work
+# activity_ignore = [...] # names whose changes never count as work; replaces the whole default list, so edit it in Settings
 
 [[task]]                  # tasks run in this order
 type = "git_worktrees"

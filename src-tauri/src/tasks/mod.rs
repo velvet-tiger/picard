@@ -162,6 +162,7 @@ impl IgnoreList {
 /// Agent config that tools such as Automatic rewrite on every sync. A change
 /// to these is not someone working on the project, so it never resets a
 /// project's idle time. Matched against each file and folder name at any depth.
+/// The default for the config's `activity_ignore`, which can replace it.
 pub const NOT_ACTIVITY: &[&str] = &[
     ".agents",
     ".automatic",
@@ -194,7 +195,7 @@ pub struct Ctx<'a> {
     pub now: SystemTime,
     pub sizes: &'a SizeCache,
     /// File and folder names whose changes do not make a project look in use.
-    /// `NOT_ACTIVITY` plus the config's `activity_ignore`.
+    /// `NOT_ACTIVITY` unless replaced by the config's `activity_ignore`.
     pub not_activity: Vec<String>,
     /// Ignored folders, checked again on the resolved path just before each
     /// removal. Not part of `check_target`, because scans must still list them.
@@ -232,9 +233,10 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// Adds the config's `activity_ignore` names to the built-in list.
+    /// Uses the config's `activity_ignore` list in place of the defaults. The
+    /// config has already put the defaults there when the key is missing.
     pub fn with_activity_ignore(mut self, names: &[String]) -> Self {
-        self.not_activity.extend(names.iter().cloned());
+        self.not_activity = names.to_vec();
         self
     }
 

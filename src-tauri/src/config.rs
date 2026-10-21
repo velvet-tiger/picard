@@ -26,9 +26,10 @@ mode = "ask"              # auto | ask | off
 # daily_scan = "03:00"    # also scan once a day at this local time (24-hour)
 roots = ["~/working"]
 exclude = []
-# Files and folders whose changes never make a project look in use, on top of
-# the built-in agent config list (.claude, AGENTS.md, .mcp.json and others).
-# activity_ignore = [".vscode"]
+# File and folder names whose changes never make a project look in use. Left
+# out, Picard uses its defaults (.claude, AGENTS.md, .mcp.json and other agent
+# config). Set, the list replaces those defaults, so it must name every default
+# you want to keep. Easiest to edit in Settings, which starts from the defaults.
 
 [[task]]
 type = "git_worktrees"
@@ -391,7 +392,8 @@ pub struct Config {
     /// ignored, but no cleanup removes them.
     pub ignore: Vec<PathBuf>,
     /// File and folder names whose changes do not count as work when deciding
-    /// whether a project is idle. Added to `tasks::NOT_ACTIVITY`.
+    /// whether a project is idle. The whole list: `tasks::NOT_ACTIVITY` when
+    /// the key is missing, and exactly what the file says when it is set.
     pub activity_ignore: Vec<String>,
     pub volumes: Vec<VolumeOverride>,
     pub tasks: Vec<TaskConfig>,
@@ -430,8 +432,7 @@ struct RawConfig {
     exclude: Vec<String>,
     #[serde(default)]
     ignore: Vec<String>,
-    #[serde(default)]
-    activity_ignore: Vec<String>,
+    activity_ignore: Option<Vec<String>>,
     #[serde(default)]
     volume: Vec<RawVolume>,
     #[serde(default)]
@@ -502,9 +503,15 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
         .map(|p| expand_path(p, home).with_context(|| format!("ignore entry {p:?}")))
         .collect::<Result<Vec<_>>>()?;
 
-    for name in &raw.activity_ignore {
-        validate_activity_ignore(name)?;
-    }
+    let activity_ignore = match raw.activity_ignore {
+        Some(names) => {
+            for name in &names {
+                validate_activity_ignore(name)?;
+            }
+            names
+        }
+        None => default_activity_ignore(),
+    };
 
     for task in &raw.task {
         validate_task(task)?;
@@ -530,7 +537,7 @@ pub fn parse(text: &str, home: &Path) -> Result<Config> {
         roots,
         exclude: raw.exclude,
         ignore,
-        activity_ignore: raw.activity_ignore,
+        activity_ignore,
         volumes,
         tasks: raw.task,
         tools: parse_tools(&raw.tools, home)?,
@@ -544,6 +551,14 @@ pub const DAILY_SCAN_FORMAT: &str = "%H:%M";
 fn parse_daily_time(raw: &str) -> Result<NaiveTime> {
     NaiveTime::parse_from_str(raw.trim(), DAILY_SCAN_FORMAT)
         .with_context(|| format!("daily_scan must be a 24-hour time like \"03:00\", got {raw:?}"))
+}
+
+/// The names used when the config has no `activity_ignore` key.
+pub fn default_activity_ignore() -> Vec<String> {
+    crate::tasks::NOT_ACTIVITY
+        .iter()
+        .map(|name| name.to_string())
+        .collect()
 }
 
 /// An `activity_ignore` entry is matched against single file and folder
@@ -850,16 +865,18 @@ mod tests {
     }
 
     #[test]
-    fn activity_ignore_defaults_to_empty_and_keeps_names() {
-        assert!(
-            parse_ok("min_free_gb = 1\nroots = [\"/a\"]")
-                .activity_ignore
-                .is_empty()
+    fn activity_ignore_defaults_to_the_built_in_list_and_a_set_list_replaces_it() {
+        assert_eq!(
+            parse_ok("min_free_gb = 1\nroots = [\"/a\"]").activity_ignore,
+            default_activity_ignore()
         );
         let c = parse_ok(
             "min_free_gb = 1\nroots = [\"/a\"]\nactivity_ignore = [\".vscode\", \"NOTES.md\"]",
         );
         assert_eq!(c.activity_ignore, vec![".vscode", "NOTES.md"]);
+        // Empty means every change counts, not "use the defaults".
+        let c = parse_ok("min_free_gb = 1\nroots = [\"/a\"]\nactivity_ignore = []");
+        assert!(c.activity_ignore.is_empty());
     }
 
     #[test]
