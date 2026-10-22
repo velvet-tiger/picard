@@ -6,6 +6,17 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-23
+
+### Fixed
+
+- Clicking a cleanup notification, such as "35 GB can be cleaned", opens the Clean tab on the scan behind that number. The tab used to open empty. It also shows when each volume was scanned.
+- A newer background scan appears behind a **Show it** banner. It does not replace the list, so the ticks you changed stay.
+- Picard refuses a scan that started before the volume's last clean, so folders it removed do not come back.
+- Clean and Rescan wait until a stored scan is checked against the ignore list.
+- **Show it** reads the stored scan again, so it shows the latest results.
+- When a background clean removes folders on a volume, the open Clean tab says its list may be out of date.
+
 ## [0.4.0] - 2026-10-22
 
 ### Added
@@ -123,6 +134,7 @@ and removes build output and finished work when a drive runs low.
 - Disk image volume test (a918137).
 - Vitest tests for `api.ts`, Preview and Settings (5eeb28a).
 
+[0.5.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.5.0
 [0.4.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.4.0
 [0.3.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.3.0
 [0.2.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.2.0
