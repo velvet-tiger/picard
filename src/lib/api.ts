@@ -107,6 +107,26 @@ export interface Totals {
   since: string | null
 }
 
+export interface VolumeStatus {
+  name: string
+  mount: string
+  /** For example "112 GB free (23%)". */
+  free_text: string
+  free_bytes: number
+  total_bytes: number
+  /** Free space is below this volume's threshold. */
+  low: boolean
+}
+
+/** Every mounted volume that holds a configured root. Reads free space only; no scan. */
+export interface Status {
+  mode: Mode
+  volumes: VolumeStatus[]
+  /** "Projects: not mounted", one per unavailable root. */
+  unavailable: string[]
+}
+
+export const getStatus = () => invoke<Status>('get_status')
 export const getSettings = () => invoke<Settings>('get_settings')
 /** The config's `appearance`, read without loading the whole form. */
 export const getAppearance = () => invoke<Appearance>('get_appearance')

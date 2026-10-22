@@ -6,6 +6,7 @@
     runSelected,
     getHistory,
     getTotals,
+    getStatus,
     setIgnored,
     getProtection,
     notifyIgnoreChanged,
@@ -24,6 +25,8 @@
     type RunResult,
     type HistoryEntry,
     type Totals,
+    type Status,
+    type VolumeStatus,
   } from './api'
 
   let volumes = $state<VolumePreview[]>([])
@@ -31,6 +34,7 @@
   let checked = $state<Record<string, boolean>>({})
   let history = $state<HistoryEntry[]>([])
   let totals = $state<Totals | null>(null)
+  let status = $state<Status | null>(null)
   let scanning = $state(false)
   // A scan can take half a minute, so the page does not start one itself. It
   // shows the latest stored scan, such as the one behind a notification, or
@@ -232,7 +236,10 @@
   let reloading = false
   let reloadAgain = false
 
-  /** Reloads the total and "Recently removed" list. Never throws; both loaders log their own errors. */
+  /**
+   * Reloads the stats strip and "Recently removed" list. Never throws; each
+   * loader logs its own errors. Free space is read here too, so it follows a clean.
+   */
   async function reloadRecords() {
     if (reloading) {
       reloadAgain = true
@@ -242,7 +249,7 @@
     try {
       do {
         reloadAgain = false
-        await Promise.all([loadHistory(), loadTotals()])
+        await Promise.all([loadHistory(), loadTotals(), loadStatus()])
       } while (reloadAgain)
     } finally {
       reloading = false
@@ -268,12 +275,38 @@
     }
   }
 
+  async function loadStatus() {
+    try {
+      status = await getStatus()
+    } catch (e) {
+      // The disk tiles are a convenience; hide them rather than show stale numbers.
+      status = null
+      console.error('status', e)
+    }
+  }
+
+  /** "11% free", or nothing when the volume reports no capacity. */
+  const freePercent = (v: VolumeStatus) =>
+    v.total_bytes > 0 ? `${Math.round((v.free_bytes / v.total_bytes) * 100)}% free` : ''
+
+  /** "11% free", plus a warning when the volume is below its threshold. */
+  const availableCaption = (v: VolumeStatus) =>
+    [freePercent(v), v.low ? 'below your threshold' : ''].filter(Boolean).join(', ')
+
+  const diskRows = $derived(status?.volumes ?? [])
+
   const sinceText = (time: string) =>
     new Date(time).toLocaleDateString(undefined, {
       day: 'numeric',
       month: 'short',
       year: 'numeric',
     })
+
+  /** "235 items since 17 Oct 2026". */
+  function freedCaption(t: Totals): string {
+    const items = `${t.items} ${t.items === 1 ? 'item' : 'items'}`
+    return t.since ? `${items} since ${sinceText(t.since)}` : items
+  }
 
   async function clean() {
     cleaning = true
@@ -414,11 +447,40 @@
     Nothing is removed until you press Clean. Picard re-checks every item just before removing it.
   </p>
 
-  {#if totals && totals.items > 0 && totals.since}
-    <p class="totals">
-      Picard has freed <strong>{formatBytes(totals.bytes)}</strong> across {totals.items}
-      {totals.items === 1 ? 'item' : 'items'} since {sinceText(totals.since)}.
-    </p>
+  {#if diskRows.length > 0 || totals}
+    <!-- One row of disk tiles per volume; the freed tile spans them, since it covers every volume. -->
+    <section aria-label="Disk summary">
+      <dl class="stats">
+        {#each diskRows as v, row}
+          <div class="stat disk" style="grid-row: {row + 1}">
+            <dt>Disk size</dt>
+            <dd class="value">{formatBytes(v.total_bytes)}</dd>
+            <dd class="sub" title={v.mount}>{v.name}</dd>
+          </div>
+          <div class="stat available" class:low={v.low} style="grid-row: {row + 1}">
+            <dt>Available</dt>
+            <dd class="value">{formatBytes(v.free_bytes)}</dd>
+            <dd class="sub">{availableCaption(v)}</dd>
+          </div>
+        {/each}
+        {#if totals}
+          <div
+            class="stat freed"
+            class:solo={diskRows.length === 0}
+            style="grid-row: 1 / span {Math.max(diskRows.length, 1)}"
+          >
+            <dt>Freed by Picard</dt>
+            {#if totals.items > 0}
+              <dd class="value">{formatBytes(totals.bytes)}</dd>
+              <dd class="sub">{freedCaption(totals)}</dd>
+            {:else}
+              <dd class="value">0 MB</dd>
+              <dd class="sub">Nothing removed yet</dd>
+            {/if}
+          </div>
+        {/if}
+      </dl>
+    </section>
   {/if}
 
   {#if error}
@@ -841,8 +903,64 @@
   .history li {
     font-size: 12px;
   }
-  .totals {
+  /* size | available | freed, with freed spanning every volume's row. */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+    margin: 12px 0 0;
+  }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 14px;
+    min-width: 0;
+  }
+  .stat.disk {
+    grid-column: 1;
+  }
+  .stat.available {
+    grid-column: 2;
+  }
+  .stat.freed {
+    grid-column: 3;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  .stat dt {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
+  .stat dd {
+    margin: 0;
+  }
+  .stat .value {
+    font-size: 22px;
+    font-weight: 600;
     font-variant-numeric: tabular-nums;
+  }
+  .stat .sub {
+    font-size: 12px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The threshold warning must stay readable at the 480px minimum window width. */
+  .stat.available .sub {
+    white-space: normal;
+  }
+  /* With no volume rows, the freed tile takes the whole strip instead of the third column. */
+  .stat.freed.solo {
+    grid-column: 1 / -1;
+  }
+  .stat.low .value,
+  .stat.low .sub {
+    color: var(--danger);
   }
 
   .stale {

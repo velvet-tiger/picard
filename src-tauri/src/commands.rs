@@ -37,6 +37,9 @@ pub struct VolumeStatus {
     pub name: String,
     pub mount: String,
     pub free_text: String,
+    /// Raw capacity, so the Clean tab can show disk size and free space.
+    pub free_bytes: u64,
+    pub total_bytes: u64,
     pub low: bool,
 }
 
@@ -466,6 +469,8 @@ fn status_view(
                 name: v.name.clone(),
                 mount: v.mount.display().to_string(),
                 free_text: disk::format_free(*space),
+                free_bytes: space.free_bytes,
+                total_bytes: space.total_bytes,
                 low: crate::monitor::is_low(config, v, *space),
             })
             .collect(),
@@ -728,6 +733,8 @@ mod tests {
         };
         let status = status_view(&config, &[(volume(), SPACE)], &[un("/V/P/a"), un("/V/P/b")]);
         assert!(status.volumes[0].low);
+        assert_eq!(status.volumes[0].free_bytes, SPACE.free_bytes);
+        assert_eq!(status.volumes[0].total_bytes, SPACE.total_bytes);
         assert_eq!(status.unavailable, vec!["Projects: not mounted"]);
         assert_eq!(status.mode, Mode::Ask);
     }
