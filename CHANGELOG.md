@@ -6,6 +6,12 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-23
+
+### Added
+
+- The top of the Clean tab shows the disk size, the space available and the total freed.
+
 ## [0.5.0] - 2026-10-23
 
 ### Fixed
@@ -134,6 +140,7 @@ and removes build output and finished work when a drive runs low.
 - Disk image volume test (a918137).
 - Vitest tests for `api.ts`, Preview and Settings (5eeb28a).
 
+[0.6.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.6.0
 [0.5.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.5.0
 [0.4.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.4.0
 [0.3.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.3.0
