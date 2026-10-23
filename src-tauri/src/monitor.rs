@@ -182,9 +182,15 @@ pub fn states_after_reload(states: States, old_mode: Option<Mode>, new_mode: Mod
 
 /// Evaluates every reading against the config.
 ///
-/// Returns the new states and the alerts to send. Volumes missing from
-/// `readings` are dropped, so a drive that is unplugged and plugged back in
-/// starts armed. `routine` is passed to `step`.
+/// Returns the new states and the alerts to send. `routine` is passed to
+/// `step`.
+///
+/// A routine check drops volumes missing from `readings`, so a drive that is
+/// unplugged and plugged back in starts armed. Any other check keeps their
+/// states. A network or external drive can miss one read without being
+/// unplugged. Dropped on a refresh, it would start armed at the next good
+/// check and alert, or clean, without waiting for its cooldown or a routine
+/// re-arm.
 pub fn evaluate(
     states: &States,
     readings: &[(Volume, DiskSpace)],
@@ -192,7 +198,11 @@ pub fn evaluate(
     now: Instant,
     routine: bool,
 ) -> (States, Vec<Alert>) {
-    let mut next = States::new();
+    let mut next = if routine {
+        States::new()
+    } else {
+        states.clone()
+    };
     let mut alerts = Vec::new();
     for (volume, space) in readings {
         let policy = Policy::for_volume(config, volume, *space);
@@ -604,6 +614,30 @@ mod tests {
         );
         let (next, _) = evaluate(&states, &[], &config, Instant::now(), true);
         assert!(next.is_empty());
+    }
+
+    #[test]
+    fn a_missed_read_on_a_refresh_keeps_the_state() {
+        let config = parse("min_free_gb = 30\nroots = [\"/a\"]", Path::new("/Users/t")).unwrap();
+        let t0 = Instant::now();
+        let fired = State::Fired { at: t0 };
+        let mut states = States::new();
+        states.insert(PathBuf::from("/Volumes/Net"), fired);
+
+        // The drive misses one read on a refresh.
+        let (kept, alerts) = evaluate(&states, &[], &config, t0, false);
+        assert_eq!(kept[Path::new("/Volumes/Net")], fired);
+        assert!(alerts.is_empty());
+
+        // Back and still low on the next refresh: no new alert.
+        let low = vec![(volume("/Volumes/Net", "Net"), space(20, 500))];
+        let (after, alerts) = evaluate(&kept, &low, &config, t0, false);
+        assert_eq!(after[Path::new("/Volumes/Net")], fired);
+        assert!(alerts.is_empty(), "{alerts:?}");
+
+        // A routine check that misses it drops it, as an unplugged drive.
+        let (dropped, _) = evaluate(&kept, &[], &config, t0, true);
+        assert!(dropped.is_empty());
     }
 
     fn at(hour: u32, minute: u32) -> NaiveTime {
