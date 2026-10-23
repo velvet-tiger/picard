@@ -114,13 +114,19 @@ fn drain(rx: &mut mpsc::Receiver<Wake>, wakes: &mut Vec<Wake>) {
 
 /// Collects one batch of wakes: `first`, everything already queued and,
 /// when the batch needs the debounce, everything that arrives during it.
-async fn collect_wakes(first: Wake, rx: &mut mpsc::Receiver<Wake>) -> Vec<Wake> {
+/// Then tells `refresh` whether the batch took its queued refresh.
+async fn collect_wakes(
+    first: Wake,
+    rx: &mut mpsc::Receiver<Wake>,
+    refresh: &RefreshSender,
+) -> Vec<Wake> {
     let mut wakes = vec![first];
     drain(rx, &mut wakes);
     if needs_debounce(&wakes) {
         tokio::time::sleep(DEBOUNCE).await;
         drain(rx, &mut wakes);
     }
+    refresh.mark_taken(&wakes);
     wakes
 }
 
@@ -131,9 +137,13 @@ async fn collect_wakes(first: Wake, rx: &mut mpsc::Receiver<Wake>) -> Vec<Wake> 
 /// Requests are merged: while one `Wake::Refresh` waits in the queue, more
 /// requests add nothing. Hovers, scans and history appends can come fast.
 /// Unmerged, they could fill the queue and crowd out a config change.
+///
+/// Clones share one queue and one flag. Setup manages one clone and hands
+/// another to `Poller`, so the loop clears the flag the requests set.
+#[derive(Clone)]
 pub struct RefreshSender {
     wake: mpsc::WeakSender<Wake>,
-    /// Set while a `Wake::Refresh` is queued. See `mark_refresh_taken`.
+    /// Set while a `Wake::Refresh` is queued. See `mark_taken`.
     pending: Arc<AtomicBool>,
 }
 
@@ -157,12 +167,6 @@ impl RefreshSender {
         }
     }
 
-    /// The flag the poll loop clears once it takes a refresh. Pass it to
-    /// `Poller::new`.
-    pub fn pending(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.pending)
-    }
-
     /// Queues a `Wake::Refresh` unless one is already queued.
     fn request(&self) -> Requested {
         let Some(tx) = self.wake.upgrade() else {
@@ -183,15 +187,15 @@ impl RefreshSender {
             Err(TrySendError::Closed(_)) => Requested::LoopStopped,
         }
     }
-}
 
-/// Clears the pending flag once the loop has taken the queued refresh, so a
-/// request made during the check that follows queues a new one. A batch
-/// without a refresh leaves the flag alone: a refresh queued just after the
-/// drain is still waiting.
-fn mark_refresh_taken(pending: &AtomicBool, wakes: &[Wake]) {
-    if wakes.contains(&Wake::Refresh) {
-        pending.store(false, Ordering::SeqCst);
+    /// Clears the pending flag once the loop has taken the queued refresh,
+    /// so a request made during the check that follows queues a new one. A
+    /// batch without a refresh leaves the flag alone: a refresh queued just
+    /// after the drain is still waiting.
+    fn mark_taken(&self, wakes: &[Wake]) {
+        if wakes.contains(&Wake::Refresh) {
+            self.pending.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -226,10 +230,50 @@ const FALLBACK_POLL: Duration = Duration::from_secs(5 * 60);
 /// space on the Clean tab, in the menu and in the icon stays current.
 const WINDOW_OPEN_POLL: Duration = Duration::from_secs(30);
 
-/// True if a pass starting at `now` is routine: the first one, or the first
-/// one at least `poll` after the last routine pass.
-fn is_routine(last_routine: Option<Instant>, poll: Duration, now: Instant) -> bool {
-    last_routine.is_none_or(|at| now.saturating_duration_since(at) >= poll)
+/// When the last routine pass started. See the module notes.
+#[derive(Debug, Default)]
+struct RoutineClock {
+    last: Option<Instant>,
+}
+
+impl RoutineClock {
+    /// Starts a pass at `now` and says whether it is routine: the first
+    /// pass, or the first one at least `poll` after the last routine pass.
+    /// A routine pass moves the clock to `now`; any other pass leaves it.
+    fn start_pass(&mut self, now: Instant, poll: Duration) -> bool {
+        let routine = self
+            .last
+            .is_none_or(|at| now.saturating_duration_since(at) >= poll);
+        if routine {
+            self.last = Some(now);
+        }
+        routine
+    }
+
+    fn last(&self) -> Option<Instant> {
+        self.last
+    }
+}
+
+/// What the daily scan does on one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DailyPass {
+    /// The scan is due: run it, on any pass.
+    Scan,
+    /// Not due, on a routine pass: retry any clean that found the lock busy.
+    Retry,
+    /// Not due, on a refresh. A retry starts a clean, which shows in the
+    /// icon and the Clean tab even when the lock is still busy. Refreshes
+    /// come every 30 seconds and on every hover, so they leave it.
+    Nothing,
+}
+
+fn daily_pass(due: bool, routine: bool) -> DailyPass {
+    match (due, routine) {
+        (true, _) => DailyPass::Scan,
+        (false, true) => DailyPass::Retry,
+        (false, false) => DailyPass::Nothing,
+    }
 }
 
 /// How long the loop sleeps before its next pass: until the next routine
@@ -263,12 +307,16 @@ fn wait_until_due(
     }
 }
 
-/// What to log after a check: the status line, and one warning per root
-/// that could not be read.
+/// What to log after a check. The loop can check every 30 seconds and reads
+/// every root each time, so each part is logged only when it changed. They
+/// are compared apart: a small disk's free space changes its line often,
+/// and that is no reason to repeat a root's warning.
 #[derive(Debug, PartialEq, Eq)]
 struct StatusLog {
-    line: String,
-    root_errors: Vec<String>,
+    /// The status line, when the menu's lines changed.
+    line: Option<String>,
+    /// The root errors that the last view did not have, one message each.
+    new_root_errors: Vec<String>,
 }
 
 /// The read errors behind the unavailable roots in `view`, as log messages.
@@ -283,21 +331,18 @@ fn root_errors(view: &MenuView) -> Vec<String> {
         .collect()
 }
 
-/// What to log for `view`, or `None` when its status lines and root errors
-/// match `last`. The loop can check every 30 seconds and reads every root
-/// each time, so an unchanged state is not logged again.
-fn status_log(last: Option<&MenuView>, view: &MenuView) -> Option<StatusLog> {
+/// What to log for `view`, after `last` was shown.
+fn status_log(last: Option<&MenuView>, view: &MenuView) -> StatusLog {
     let lines = crate::tray::status_lines(view);
-    let errors = root_errors(view);
-    let unchanged =
-        last.is_some_and(|l| crate::tray::status_lines(l) == lines && root_errors(l) == errors);
-    if unchanged {
-        return None;
+    let line_changed = last.map(crate::tray::status_lines).as_ref() != Some(&lines);
+    let old_errors = last.map(root_errors).unwrap_or_default();
+    StatusLog {
+        line: line_changed.then(|| lines.join("; ")),
+        new_root_errors: root_errors(view)
+            .into_iter()
+            .filter(|e| !old_errors.contains(e))
+            .collect(),
     }
-    Some(StatusLog {
-        line: lines.join("; "),
-        root_errors: errors,
-    })
 }
 
 const DAILY_STAMP_FORMAT: &str = "%Y-%m-%d";
@@ -594,10 +639,9 @@ pub struct Poller<R: Runtime> {
     /// Volumes whose daily clean found the run lock busy, with the scan's
     /// date. Retried at each routine pass that same day.
     daily_retry: Option<(NaiveDate, Vec<PathBuf>)>,
-    /// When the last routine pass started. See the module notes.
-    last_routine: Option<Instant>,
-    /// Shared with `RefreshSender`; see `mark_refresh_taken`.
-    refresh_pending: Arc<AtomicBool>,
+    routine: RoutineClock,
+    /// A clone of the managed sender, for `collect_wakes`.
+    refresh: RefreshSender,
     /// What the menu last showed, so an installed update can be added to it
     /// without scanning the drives again.
     last_view: Option<MenuView>,
@@ -704,12 +748,12 @@ fn notify<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
 }
 
 impl<R: Runtime> Poller<R> {
-    /// `refresh_pending` comes from `RefreshSender::pending`.
+    /// `refresh` is a clone of the `RefreshSender` that setup manages.
     pub fn new(
         app: AppHandle<R>,
         tray: Tray<R>,
         shared: Arc<Shared>,
-        refresh_pending: Arc<AtomicBool>,
+        refresh: RefreshSender,
     ) -> Self {
         Self {
             app,
@@ -721,8 +765,8 @@ impl<R: Runtime> Poller<R> {
             last_daily_scan: None,
             recorded_daily_time: None,
             daily_retry: None,
-            last_routine: None,
-            refresh_pending,
+            routine: RoutineClock::default(),
+            refresh,
             last_view: None,
             estimates: Arc::default(),
         }
@@ -748,11 +792,8 @@ impl<R: Runtime> Poller<R> {
                 self.show_update_in_menu();
                 redraw_only = false;
             } else {
-                let now = Instant::now();
-                let routine = is_routine(self.last_routine, self.poll_interval(), now);
-                if routine {
-                    self.last_routine = Some(now);
-                }
+                let poll = self.poll_interval();
+                let routine = self.routine.start_pass(Instant::now(), poll);
                 self.check(routine).await;
                 self.daily_scan_if_due(Local::now().naive_local(), routine)
                     .await;
@@ -765,8 +806,7 @@ impl<R: Runtime> Poller<R> {
                     return;
                 }
                 Ok(Some(first)) => {
-                    let wakes = collect_wakes(first, &mut rx).await;
-                    mark_refresh_taken(&self.refresh_pending, &wakes);
+                    let wakes = collect_wakes(first, &mut rx, &self.refresh).await;
                     let config_changed = wakes.contains(&Wake::ConfigChanged);
                     redraw_only = is_redraw_only(&wakes);
                     // Hovering over the icon asks for a refresh, so these
@@ -800,7 +840,7 @@ impl<R: Runtime> Poller<R> {
     fn next_wait(&self, wall: NaiveDateTime, now: Instant) -> Duration {
         wait_until_due(
             self.poll_interval(),
-            self.last_routine,
+            self.routine.last(),
             now,
             self.config.as_ref().and_then(|c| c.daily_scan),
             wall,
@@ -830,14 +870,14 @@ impl<R: Runtime> Poller<R> {
         let Some(at) = config.daily_scan else {
             return;
         };
-        if !monitor::daily_scan_due(at, now, self.last_daily_scan) {
-            // A retry starts a clean, which shows in the icon and the Clean
-            // tab even when the lock is still busy. Refreshes come every 30
-            // seconds and on every hover, so only routine passes retry.
-            if routine {
+        let due = monitor::daily_scan_due(at, now, self.last_daily_scan);
+        match daily_pass(due, routine) {
+            DailyPass::Scan => {}
+            DailyPass::Retry => {
                 self.retry_daily_cleans(&config, now.date()).await;
+                return;
             }
-            return;
+            DailyPass::Nothing => return,
         }
         // Recorded before the scan runs, so a scan that fails or panics waits
         // until tomorrow instead of retrying on every poll. Off mode records it
@@ -1196,11 +1236,12 @@ impl<R: Runtime> Poller<R> {
     /// Shows `view` in the menu and tells the open window to reload its disk
     /// tiles. The status and root errors are logged only when they change.
     fn show(&mut self, view: MenuView) {
-        if let Some(changed) = status_log(self.last_view.as_ref(), &view) {
-            log::info!("status: {}", changed.line);
-            for error in &changed.root_errors {
-                log::warn!("{error}");
-            }
+        let changed = status_log(self.last_view.as_ref(), &view);
+        if let Some(line) = &changed.line {
+            log::info!("status: {line}");
+        }
+        for error in &changed.new_root_errors {
+            log::warn!("{error}");
         }
         if let Err(e) = self.tray.show(&view) {
             log::error!("could not update tray menu: {e}");
@@ -1257,12 +1298,18 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// Collects the batch the loop would, starting from `first`.
+    fn collect(first: Wake, rx: &mut mpsc::Receiver<Wake>, refresh: &RefreshSender) -> Vec<Wake> {
+        tauri::async_runtime::block_on(collect_wakes(first, rx, refresh))
+    }
+
     #[test]
     fn a_refresh_batch_skips_the_debounce() {
         let (tx, mut rx) = mpsc::channel(4);
+        let sender = RefreshSender::new(tx.downgrade());
         tx.try_send(Wake::Refresh).unwrap();
         let started = Instant::now();
-        let wakes = tauri::async_runtime::block_on(collect_wakes(Wake::Refresh, &mut rx));
+        let wakes = collect(Wake::Refresh, &mut rx, &sender);
         assert!(started.elapsed() < DEBOUNCE / 2, "{:?}", started.elapsed());
         assert_eq!(wakes, vec![Wake::Refresh, Wake::Refresh]);
     }
@@ -1270,12 +1317,13 @@ mod tests {
     #[test]
     fn a_file_batch_waits_out_the_debounce_and_takes_what_arrives() {
         let (tx, mut rx) = mpsc::channel(4);
+        let sender = RefreshSender::new(tx.downgrade());
         let started = Instant::now();
         let late = std::thread::spawn(move || {
             std::thread::sleep(DEBOUNCE / 5);
             tx.try_send(Wake::VolumesChanged).unwrap();
         });
-        let wakes = tauri::async_runtime::block_on(collect_wakes(Wake::ConfigChanged, &mut rx));
+        let wakes = collect(Wake::ConfigChanged, &mut rx, &sender);
         late.join().unwrap();
         assert!(started.elapsed() >= DEBOUNCE, "{:?}", started.elapsed());
         assert_eq!(wakes, vec![Wake::ConfigChanged, Wake::VolumesChanged]);
@@ -1289,21 +1337,35 @@ mod tests {
         assert_eq!(sender.request(), Requested::Merged);
         assert_eq!(rx.try_recv(), Ok(Wake::Refresh));
         assert!(rx.try_recv().is_err(), "only one refresh was queued");
-
-        // Still pending until the loop marks it taken.
+        // Taken off the queue, but not yet collected by the loop.
         assert_eq!(sender.request(), Requested::Merged);
-        mark_refresh_taken(&sender.pending(), &[Wake::Refresh]);
+    }
+
+    #[test]
+    fn collecting_a_refresh_lets_the_next_request_queue() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let sender = RefreshSender::new(tx.downgrade());
+        // The loop's clone, as setup hands it over.
+        let loops = sender.clone();
+        assert_eq!(sender.request(), Requested::Queued);
+        assert_eq!(sender.request(), Requested::Merged);
+        let first = rx.try_recv().unwrap();
+        assert_eq!(collect(first, &mut rx, &loops), vec![Wake::Refresh]);
         assert_eq!(sender.request(), Requested::Queued);
         assert_eq!(rx.try_recv(), Ok(Wake::Refresh));
     }
 
     #[test]
-    fn a_batch_without_a_refresh_keeps_the_flag() {
-        let pending = AtomicBool::new(true);
-        mark_refresh_taken(&pending, &[Wake::VolumesChanged]);
-        assert!(pending.load(Ordering::SeqCst));
-        mark_refresh_taken(&pending, &[Wake::VolumesChanged, Wake::Refresh]);
-        assert!(!pending.load(Ordering::SeqCst));
+    fn collecting_a_batch_without_a_refresh_keeps_the_flag() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let sender = RefreshSender::new(tx.downgrade());
+        // As if a refresh were queued just after the loop's drain.
+        sender.pending.store(true, Ordering::SeqCst);
+        assert_eq!(
+            collect(Wake::VolumesChanged, &mut rx, &sender.clone()),
+            vec![Wake::VolumesChanged]
+        );
+        assert_eq!(sender.request(), Requested::Merged);
     }
 
     #[test]
@@ -1348,10 +1410,25 @@ mod tests {
     fn a_pass_is_routine_once_poll_has_passed_since_the_last_one() {
         let t0 = Instant::now();
         let poll = Duration::from_secs(300);
-        assert!(is_routine(None, poll, t0), "the first pass");
-        assert!(!is_routine(Some(t0), poll, t0 + Duration::from_secs(299)));
-        assert!(is_routine(Some(t0), poll, t0 + poll));
-        assert!(is_routine(Some(t0), poll, t0 + Duration::from_secs(900)));
+        let secs = |n| t0 + Duration::from_secs(n);
+        let mut clock = RoutineClock::default();
+        assert!(clock.start_pass(t0, poll), "the first pass");
+        assert_eq!(clock.last(), Some(t0));
+        assert!(!clock.start_pass(secs(299), poll));
+        assert_eq!(clock.last(), Some(t0), "a refresh does not move the clock");
+        assert!(clock.start_pass(secs(300), poll));
+        assert_eq!(clock.last(), Some(secs(300)));
+        assert!(!clock.start_pass(secs(310), poll));
+        assert!(clock.start_pass(secs(1000), poll), "late is still routine");
+        assert_eq!(clock.last(), Some(secs(1000)));
+    }
+
+    #[test]
+    fn only_a_routine_pass_retries_a_busy_daily_clean() {
+        assert_eq!(daily_pass(true, true), DailyPass::Scan);
+        assert_eq!(daily_pass(true, false), DailyPass::Scan);
+        assert_eq!(daily_pass(false, true), DailyPass::Retry);
+        assert_eq!(daily_pass(false, false), DailyPass::Nothing);
     }
 
     fn wall(hour: u32, minute: u32) -> NaiveDateTime {
@@ -1440,34 +1517,56 @@ mod tests {
         }
     }
 
+    const QUIET: StatusLog = StatusLog {
+        line: None,
+        new_root_errors: Vec::new(),
+    };
+
     #[test]
     fn the_status_is_logged_only_when_it_changes() {
         let first = view(20, vec![]);
-        let logged = status_log(None, &first).expect("first check is logged");
-        assert_eq!(logged.line, "Startup disk: 20 GB free (4%)");
-        assert!(logged.root_errors.is_empty());
-        assert_eq!(status_log(Some(&first), &view(20, vec![])), None);
-        assert!(status_log(Some(&first), &view(19, vec![])).is_some());
+        let logged = status_log(None, &first);
+        assert_eq!(
+            logged.line.as_deref(),
+            Some("Startup disk: 20 GB free (4%)")
+        );
+        assert!(logged.new_root_errors.is_empty());
+        assert_eq!(status_log(Some(&first), &view(20, vec![])), QUIET);
+        assert_eq!(
+            status_log(Some(&first), &view(19, vec![])).line.as_deref(),
+            Some("Startup disk: 19 GB free (4%)")
+        );
     }
 
     #[test]
-    fn root_errors_are_logged_when_they_change() {
+    fn root_errors_are_logged_when_they_first_appear() {
         let denied = view(20, vec![unreadable("denied")]);
-        let logged = status_log(None, &denied).unwrap();
         assert_eq!(
-            logged.root_errors,
+            status_log(None, &denied).new_root_errors,
             vec!["cannot read root /secret/code: denied"]
         );
         assert_eq!(
             status_log(Some(&denied), &view(20, vec![unreadable("denied")])),
-            None
+            QUIET
         );
         // Same menu line, new error.
         let timed_out = view(20, vec![unreadable("timed out")]);
         assert_eq!(
-            status_log(Some(&denied), &timed_out).unwrap().root_errors,
-            vec!["cannot read root /secret/code: timed out"]
+            status_log(Some(&denied), &timed_out),
+            StatusLog {
+                line: None,
+                new_root_errors: vec!["cannot read root /secret/code: timed out".into()],
+            }
         );
+    }
+
+    #[test]
+    fn a_new_status_line_does_not_repeat_a_root_error() {
+        let before = view(20, vec![unreadable("denied")]);
+        let after = view(19, vec![unreadable("denied")]);
+        let logged = status_log(Some(&before), &after);
+        assert!(logged.line.is_some(), "the free space changed");
+        assert!(logged.new_root_errors.is_empty(), "{logged:?}");
     }
 
     #[test]

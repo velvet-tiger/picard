@@ -90,8 +90,7 @@ pub fn run() {
             // Capacity 16 is plenty: the loop drains the queue on every wake.
             let (tx, rx) = mpsc::channel(16);
             let refresh = poll::RefreshSender::new(tx.downgrade());
-            let refresh_pending = refresh.pending();
-            app.manage(refresh);
+            app.manage(refresh.clone());
             let handle = app.handle().clone();
             let on_history = move || {
                 if let Err(e) = windows::history_changed(&handle) {
@@ -118,7 +117,7 @@ pub fn run() {
                 app.handle().clone(),
                 tray,
                 Arc::clone(&shared),
-                refresh_pending,
+                refresh,
             );
             // Nothing that cleans or updates runs until the first-run warning is
             // accepted. Quit in the dialog exits before any of it starts.
