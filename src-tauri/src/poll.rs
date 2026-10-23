@@ -5,11 +5,12 @@
 //! on their own thread and send `Wake` messages into the loop. When
 //! `daily_scan` is set it also wakes at that time and runs the daily scan.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -363,6 +364,49 @@ pub struct Poller<R: Runtime> {
     /// What the menu last showed, so an installed update can be added to it
     /// without scanning the drives again.
     last_view: Option<MenuView>,
+    /// Volumes with a notification estimate still running. See `PendingEstimates`.
+    estimates: Arc<PendingEstimates>,
+}
+
+/// Mounts with a notification estimate still running, so the poll loop starts
+/// at most one per volume. An estimate can wait minutes for a clean, and each
+/// waiting one holds a blocking thread; with a short cooldown the loop would
+/// otherwise start another on every poll.
+#[derive(Debug, Default)]
+struct PendingEstimates {
+    mounts: Mutex<HashSet<String>>,
+}
+
+impl PendingEstimates {
+    /// Claims `mount` for a new estimate. `None` if one is already running
+    /// there. The claim ends when the returned guard is dropped, however the
+    /// estimate ends: done, failed, cancelled or panicked.
+    fn claim(self: &Arc<Self>, mount: &str) -> Option<EstimateClaim> {
+        if !self.lock().insert(mount.to_string()) {
+            return None;
+        }
+        Some(EstimateClaim {
+            pending: Arc::clone(self),
+            mount: mount.to_string(),
+        })
+    }
+
+    /// The set holds plain strings, so a poisoned lock is still usable.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.mounts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One running estimate's hold on its mount. See `PendingEstimates::claim`.
+struct EstimateClaim {
+    pending: Arc<PendingEstimates>,
+    mount: String,
+}
+
+impl Drop for EstimateClaim {
+    fn drop(&mut self) {
+        self.pending.lock().remove(&self.mount);
+    }
 }
 
 /// Runs the shared preview scan of the volume mounted at `mount` on a
@@ -435,6 +479,7 @@ impl<R: Runtime> Poller<R> {
             recorded_daily_time: None,
             daily_retry: None,
             last_view: None,
+            estimates: Arc::default(),
         }
     }
 
@@ -758,10 +803,16 @@ impl<R: Runtime> Poller<R> {
         volume: &Volume,
         message: impl FnOnce(Option<u64>) -> Option<(String, String)> + Send + 'static,
     ) {
+        let mount = volume.mount.display().to_string();
+        let Some(claim) = self.estimates.claim(&mount) else {
+            log::info!("an estimate for {mount} is still running; not starting another");
+            return;
+        };
         let (app, shared) = (self.app.clone(), Arc::clone(&self.shared));
-        let (config, mount) = (config.clone(), volume.mount.display().to_string());
+        let config = config.clone();
         let mark = shared.scans.mark();
         tauri::async_runtime::spawn(async move {
+            let _claim = claim;
             let found = scan_one(app.clone(), shared, config, mount, mark).await;
             let cleanable = found.and_then(|f| f.first().map(|v| v.total_bytes));
             if let Some((title, body)) = message(cleanable) {
@@ -883,6 +934,33 @@ impl<R: Runtime> Poller<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_estimate_runs_per_mount_until_it_ends() {
+        let pending = Arc::new(PendingEstimates::default());
+        let first = pending.claim("/").expect("nothing pending yet");
+        assert!(pending.claim("/").is_none(), "a second estimate of / waits");
+        let other = pending.claim("/Volumes/Work");
+        assert!(other.is_some(), "another volume is not held up");
+        drop(first);
+        assert!(
+            pending.claim("/").is_some(),
+            "the claim ends with its estimate"
+        );
+    }
+
+    #[test]
+    fn an_estimate_that_panics_still_frees_its_mount() {
+        let pending = Arc::new(PendingEstimates::default());
+        let claim = pending.claim("/").unwrap();
+        let ended = std::thread::spawn(move || {
+            let _claim = claim;
+            panic!("estimate failed");
+        })
+        .join();
+        assert!(ended.is_err());
+        assert!(pending.claim("/").is_some());
+    }
 
     #[test]
     fn classify_sorts_config_history_and_volume_events() {

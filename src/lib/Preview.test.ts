@@ -599,6 +599,47 @@ describe('Preview', () => {
     expect(sent('get_scan_state').length).toBeGreaterThanOrEqual(2)
   })
 
+  it('keeps reading the phase after Cancel until the scan has stopped', async () => {
+    const scanning: ScanPhase = { state: 'scanning', since: new Date().toISOString(), ticket: null }
+    let reads = 0
+    let stopped = false
+    // The scan reports scanning for two more reads after Cancel, then idle.
+    const { sent } = backend({
+      get_scan_state: () => (stopped && ++reads > 2 ? { state: 'idle' } : scanning),
+      cancel_scan: () => {
+        stopped = true
+        return null
+      },
+    })
+    render(Preview)
+    await screen.findByText('Scanning your folders…')
+
+    // No idle event ever arrives.
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel scan' }))
+    await waitFor(
+      () => expect(screen.queryByText('Scanning your folders…')).not.toBeInTheDocument(),
+      { timeout: 2000 },
+    )
+    expect(reads).toBe(3)
+    await new Promise((r) => setTimeout(r, 600))
+    expect(sent('get_scan_state')).toHaveLength(4)
+  })
+
+  it('stops reading the phase after Cancel once an event arrives', async () => {
+    const scanning: ScanPhase = { state: 'scanning', since: new Date().toISOString(), ticket: null }
+    const { sent } = backend({ get_scan_state: () => scanning })
+    render(Preview)
+    await screen.findByText('Scanning your folders…')
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel scan' }))
+    await emit('scan-changed', { state: 'idle' })
+    await new Promise((r) => setTimeout(r, 600))
+
+    expect(screen.queryByText('Scanning your folders…')).not.toBeInTheDocument()
+    // The read on load, and at most the one after Cancel that was already in flight.
+    expect(sent('get_scan_state').length).toBeLessThanOrEqual(2)
+  })
+
   it('does not call its own clean a background one once it ends', async () => {
     const run = deferred<RunResult[]>()
     backend({ run_selected: () => run.promise })

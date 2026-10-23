@@ -199,18 +199,28 @@
     afterBusy()
   }
 
+  // A cancelled scan takes up to about a second to stop, so after Cancel the
+  // phase is read this many times, this far apart, until it says idle.
+  const CANCEL_CHECKS = 8
+  const CANCEL_CHECK_MS = 250
+
   /**
-   * Cancels the running scan, whoever started it. Then reads the phase again,
-   * so a missed `scan-changed` cannot leave the panel up with nothing running.
+   * Cancels the running scan, whoever started it. Then reads the phase until
+   * it says idle or an event arrives, so a missed `scan-changed` cannot leave
+   * the panel up with nothing running.
    */
   async function cancel() {
+    const seen = scanEvents
     try {
       await cancelScan()
     } catch (e) {
       error = errorText(e)
       return
     }
-    await readScanState()
+    for (let check = 0; check < CANCEL_CHECKS && seen === scanEvents; check++) {
+      if (check > 0) await new Promise((r) => setTimeout(r, CANCEL_CHECK_MS))
+      if ((await readScanState())?.state === 'idle') return
+    }
   }
 
   function phaseChanged(next: ScanPhase) {
@@ -218,17 +228,23 @@
     applyPhase(next)
   }
 
-  /** Reads the phase, for a window opened mid-scan and as a backstop for a missed event. */
-  async function readScanState() {
+  /**
+   * Reads the phase, for a window opened mid-scan and as a backstop for a
+   * missed event. Returns what it applied, or null if the read failed or an
+   * event overtook it.
+   */
+  async function readScanState(): Promise<ScanPhase | null> {
     const seen = scanEvents
     let now: ScanPhase
     try {
       now = await getScanState()
     } catch (e) {
       console.error('scan state', e)
-      return
+      return null
     }
-    if (seen === scanEvents) applyPhase(now)
+    if (seen !== scanEvents) return null
+    applyPhase(now)
+    return now
   }
 
   /**
@@ -562,7 +578,7 @@
   // the two cannot leave the page showing it.
   $effect(() => {
     const unlisten = onScanChanged(phaseChanged)
-    unlisten.then(readScanState)
+    unlisten.then(() => readScanState())
     return () => {
       unlisten.then((stop) => stop())
     }
