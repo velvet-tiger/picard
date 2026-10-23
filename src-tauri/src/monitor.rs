@@ -180,25 +180,35 @@ pub fn states_after_reload(states: States, old_mode: Option<Mode>, new_mode: Mod
     }
 }
 
+/// What kind of check this is, as far as volume states go.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pass {
+    /// On the `poll_minutes` beat. See the module notes.
+    pub routine: bool,
+    /// Woken by a mount or unmount under `/Volumes`. A volume missing now
+    /// was unplugged, not just unreadable for a moment.
+    pub mounts_changed: bool,
+}
+
 /// Evaluates every reading against the config.
 ///
-/// Returns the new states and the alerts to send. `routine` is passed to
-/// `step`.
+/// Returns the new states and the alerts to send. `pass.routine` is passed
+/// to `step`.
 ///
-/// A routine check drops volumes missing from `readings`, so a drive that is
-/// unplugged and plugged back in starts armed. Any other check keeps their
-/// states. A network or external drive can miss one read without being
-/// unplugged. Dropped on a refresh, it would start armed at the next good
-/// check and alert, or clean, without waiting for its cooldown or a routine
-/// re-arm.
+/// A routine check, or one woken by a mount change, drops volumes missing
+/// from `readings`, so a drive that is unplugged and plugged back in starts
+/// armed. Any other check keeps their states. A network or external drive
+/// can miss one read without being unplugged. Dropped on a refresh, it
+/// would start armed at the next good check and alert, or clean, without
+/// waiting for its cooldown or a routine re-arm.
 pub fn evaluate(
     states: &States,
     readings: &[(Volume, DiskSpace)],
     config: &Config,
     now: Instant,
-    routine: bool,
+    pass: Pass,
 ) -> (States, Vec<Alert>) {
-    let mut next = if routine {
+    let mut next = if pass.routine || pass.mounts_changed {
         States::new()
     } else {
         states.clone()
@@ -207,7 +217,7 @@ pub fn evaluate(
     for (volume, space) in readings {
         let policy = Policy::for_volume(config, volume, *space);
         let prev = states.get(&volume.mount).copied().unwrap_or(State::Armed);
-        let (state, decision) = step(prev, space.free_bytes, &policy, now, routine);
+        let (state, decision) = step(prev, space.free_bytes, &policy, now, pass.routine);
         next.insert(volume.mount.clone(), state);
         if decision == Decision::Fire {
             alerts.push(Alert {
@@ -320,6 +330,19 @@ mod tests {
     use std::path::Path;
 
     const GB: u64 = 1_000_000_000;
+
+    const ROUTINE: Pass = Pass {
+        routine: true,
+        mounts_changed: false,
+    };
+    const REFRESH: Pass = Pass {
+        routine: false,
+        mounts_changed: false,
+    };
+    const MOUNTS_CHANGED: Pass = Pass {
+        routine: false,
+        mounts_changed: true,
+    };
 
     fn policy(mode: Mode) -> Policy {
         Policy {
@@ -501,7 +524,7 @@ mod tests {
             (volume("/Volumes/Big", "Big"), space(60, 1000)),
         ];
         let now = Instant::now();
-        let (states, alerts) = evaluate(&States::new(), &readings, &config, now, false);
+        let (states, alerts) = evaluate(&States::new(), &readings, &config, now, REFRESH);
         let names: Vec<_> = alerts.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["Startup disk", "P"]);
         assert_eq!(states[Path::new("/Volumes/Big")], State::Armed);
@@ -512,7 +535,7 @@ mod tests {
             &readings,
             &config,
             now + Duration::from_secs(300),
-            true,
+            ROUTINE,
         );
         assert!(alerts.is_empty());
     }
@@ -526,12 +549,12 @@ mod tests {
         .unwrap();
         let readings = vec![(volume("/", "Startup disk"), space(20, 500))];
         let now = Instant::now();
-        let (states, alerts) = evaluate(&States::new(), &readings, &config, now, true);
+        let (states, alerts) = evaluate(&States::new(), &readings, &config, now, ROUTINE);
         assert_eq!(alerts.len(), 1);
         let later = now + Duration::from_secs(1);
-        let (states, alerts) = evaluate(&states, &readings, &config, later, false);
+        let (states, alerts) = evaluate(&states, &readings, &config, later, REFRESH);
         assert!(alerts.is_empty(), "a refresh does not repeat the alert");
-        let (_, alerts) = evaluate(&states, &readings, &config, later, true);
+        let (_, alerts) = evaluate(&states, &readings, &config, later, ROUTINE);
         assert_eq!(alerts.len(), 1, "the routine check does");
     }
 
@@ -543,9 +566,9 @@ mod tests {
         states.insert(PathBuf::from("/"), fired);
         // 40 GB free: past the 30 GB threshold and the default 10 GB margin.
         let readings = vec![(volume("/", "Startup disk"), space(40, 500))];
-        let (kept, _) = evaluate(&states, &readings, &config, Instant::now(), false);
+        let (kept, _) = evaluate(&states, &readings, &config, Instant::now(), REFRESH);
         assert_eq!(kept[Path::new("/")], fired);
-        let (rearmed, _) = evaluate(&states, &readings, &config, Instant::now(), true);
+        let (rearmed, _) = evaluate(&states, &readings, &config, Instant::now(), ROUTINE);
         assert_eq!(rearmed[Path::new("/")], State::Armed);
     }
 
@@ -612,7 +635,7 @@ mod tests {
             PathBuf::from("/Volumes/Gone"),
             State::Fired { at: Instant::now() },
         );
-        let (next, _) = evaluate(&states, &[], &config, Instant::now(), true);
+        let (next, _) = evaluate(&states, &[], &config, Instant::now(), ROUTINE);
         assert!(next.is_empty());
     }
 
@@ -625,19 +648,36 @@ mod tests {
         states.insert(PathBuf::from("/Volumes/Net"), fired);
 
         // The drive misses one read on a refresh.
-        let (kept, alerts) = evaluate(&states, &[], &config, t0, false);
+        let (kept, alerts) = evaluate(&states, &[], &config, t0, REFRESH);
         assert_eq!(kept[Path::new("/Volumes/Net")], fired);
         assert!(alerts.is_empty());
 
         // Back and still low on the next refresh: no new alert.
         let low = vec![(volume("/Volumes/Net", "Net"), space(20, 500))];
-        let (after, alerts) = evaluate(&kept, &low, &config, t0, false);
+        let (after, alerts) = evaluate(&kept, &low, &config, t0, REFRESH);
         assert_eq!(after[Path::new("/Volumes/Net")], fired);
         assert!(alerts.is_empty(), "{alerts:?}");
 
         // A routine check that misses it drops it, as an unplugged drive.
-        let (dropped, _) = evaluate(&kept, &[], &config, t0, true);
+        let (dropped, _) = evaluate(&kept, &[], &config, t0, ROUTINE);
         assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn a_mount_change_drops_a_missing_volume() {
+        let config = parse("min_free_gb = 30\nroots = [\"/a\"]", Path::new("/Users/t")).unwrap();
+        let t0 = Instant::now();
+        let mut states = States::new();
+        states.insert(PathBuf::from("/Volumes/Backup"), State::Fired { at: t0 });
+
+        // Unplugged: the check woken by the unmount drops it.
+        let (dropped, _) = evaluate(&states, &[], &config, t0, MOUNTS_CHANGED);
+        assert!(dropped.is_empty());
+
+        // A different low disk mounted with the same name is alerted on.
+        let swapped = vec![(volume("/Volumes/Backup", "Backup"), space(20, 500))];
+        let (_, alerts) = evaluate(&dropped, &swapped, &config, t0, MOUNTS_CHANGED);
+        assert_eq!(alerts.len(), 1);
     }
 
     fn at(hour: u32, minute: u32) -> NaiveTime {

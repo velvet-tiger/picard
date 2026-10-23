@@ -35,7 +35,7 @@ use crate::commands::VolumePreview;
 use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::env::ToolEnv;
-use crate::monitor::{self, DailyAction, States};
+use crate::monitor::{self, DailyAction, Pass, States};
 use crate::preview_scans::{self, CancelMark, Request, Scope};
 use crate::runner::{self, CleanRequest, LockBusy, VolumeRun};
 use crate::state::Shared;
@@ -98,6 +98,12 @@ impl Wake {
 /// True if any of `wakes` should wait out `DEBOUNCE` before the check.
 fn needs_debounce(wakes: &[Wake]) -> bool {
     wakes.iter().any(|w| w.debounced())
+}
+
+/// True if `wakes` holds a mount or unmount under `/Volumes`. The next
+/// check then drops volumes it cannot find; see `monitor::evaluate`.
+fn reports_mount_change(wakes: &[Wake]) -> bool {
+    wakes.contains(&Wake::VolumesChanged)
 }
 
 /// True if every one of `wakes` only reports an installed update. That adds
@@ -788,17 +794,23 @@ impl<R: Runtime> Poller<R> {
         self.recorded_daily_time = stamp.and_then(|s| s.at);
         self.reload_config();
         let mut redraw_only = false;
+        // Whether the batch that woke this pass held a mount change.
+        let mut mounts_changed = false;
         loop {
             if redraw_only {
                 self.show_update_in_menu();
                 redraw_only = false;
             } else {
                 let poll = self.poll_interval();
-                let routine = self.routine.start_pass(Instant::now(), poll);
-                self.check(routine).await;
-                self.daily_scan_if_due(Local::now().naive_local(), routine)
+                let pass = Pass {
+                    routine: self.routine.start_pass(Instant::now(), poll),
+                    mounts_changed,
+                };
+                self.check(pass).await;
+                self.daily_scan_if_due(Local::now().naive_local(), pass.routine)
                     .await;
             }
+            mounts_changed = false;
             let wait = self.next_wait(Local::now().naive_local(), Instant::now());
             match tokio::time::timeout(wait, rx.recv()).await {
                 Err(_elapsed) => {}
@@ -808,6 +820,7 @@ impl<R: Runtime> Poller<R> {
                 }
                 Ok(Some(first)) => {
                     let wakes = collect_wakes(first, &mut rx, &self.refresh).await;
+                    mounts_changed = reports_mount_change(&wakes);
                     let config_changed = wakes.contains(&Wake::ConfigChanged);
                     redraw_only = is_redraw_only(&wakes);
                     // Hovering over the icon asks for a refresh, so these
@@ -964,9 +977,10 @@ impl<R: Runtime> Poller<R> {
         }
         // Refresh the menu with the space the cleanup freed. That check can
         // clean too, so the rescans wait until it is done. It is not routine,
-        // so it cannot repeat an alert the pass's own check just sent.
+        // so it cannot repeat an alert the pass's own check just sent. The
+        // pass's own check has already handled any mount change.
         if !rescan.is_empty() {
-            self.check(false).await;
+            self.check(Pass::default()).await;
         }
         self.rescan_if_open(config, rescan);
     }
@@ -1031,9 +1045,9 @@ impl<R: Runtime> Poller<R> {
     }
 
     /// One check: scan, decide, alert (or clean, in auto mode), redraw.
-    /// Only a `routine` check repeats an alert after its cooldown or re-arms
-    /// a recovered volume; see `monitor::step`.
-    async fn check(&mut self, routine: bool) {
+    /// Only a routine check repeats an alert after its cooldown or re-arms
+    /// a recovered volume; see `monitor::step` and `monitor::evaluate`.
+    async fn check(&mut self, pass: Pass) {
         let Some(config) = self.config.clone() else {
             self.show(MenuView {
                 config_error: true,
@@ -1045,13 +1059,8 @@ impl<R: Runtime> Poller<R> {
         let Some(mut found) = self.scan_volumes(&config).await else {
             return;
         };
-        let (states, alerts) = monitor::evaluate(
-            &self.states,
-            &found.readings,
-            &config,
-            Instant::now(),
-            routine,
-        );
+        let (states, alerts) =
+            monitor::evaluate(&self.states, &found.readings, &config, Instant::now(), pass);
         self.states = states;
         let mut cleaned = false;
         let mut rescan = Vec::new();
@@ -1274,6 +1283,16 @@ mod tests {
         for wake in [Wake::ConfigChanged, Wake::VolumesChanged, Wake::UpdateReady] {
             assert!(needs_debounce(&[wake]), "{wake:?}");
             assert!(needs_debounce(&[Wake::Refresh, wake]), "{wake:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_volume_wake_reports_a_mount_change() {
+        assert!(reports_mount_change(&[Wake::VolumesChanged]));
+        assert!(reports_mount_change(&[Wake::Refresh, Wake::VolumesChanged]));
+        assert!(!reports_mount_change(&[]));
+        for wake in [Wake::Refresh, Wake::ConfigChanged, Wake::UpdateReady] {
+            assert!(!reports_mount_change(&[wake]), "{wake:?}");
         }
     }
 
