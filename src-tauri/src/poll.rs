@@ -8,8 +8,9 @@
 //! `request_refresh` wakes it at once when the menu opens or a scan ends.
 //!
 //! A pass is routine when it comes on the `poll_minutes` beat. Only routine
-//! passes repeat an alert after its cooldown or retry a busy daily clean, so
-//! the extra passes cannot chain into repeated alerts or cleans.
+//! passes repeat an alert after its cooldown, re-arm a recovered volume or
+//! retry a busy daily clean, so the extra passes cannot chain into repeated
+//! alerts or cleans.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -894,7 +895,8 @@ impl<R: Runtime> Poller<R> {
         let mut to_clean = Vec::new();
         for (volume, space) in found.readings {
             let state = self.states.get(&volume.mount).copied();
-            match monitor::daily_action(config.mode, state) {
+            let recovered = monitor::has_recovered(&config, &volume, space);
+            match monitor::daily_action(config.mode, state, recovered) {
                 DailyAction::Clean => to_clean.push(volume),
                 DailyAction::Skip => log::info!("daily scan: skipping {}", volume.name),
                 DailyAction::Offer => {
@@ -1029,8 +1031,8 @@ impl<R: Runtime> Poller<R> {
     }
 
     /// One check: scan, decide, alert (or clean, in auto mode), redraw.
-    /// Only a `routine` check repeats an alert after its cooldown; see
-    /// `monitor::step`.
+    /// Only a `routine` check repeats an alert after its cooldown or re-arms
+    /// a recovered volume; see `monitor::step`.
     async fn check(&mut self, routine: bool) {
         let Some(config) = self.config.clone() else {
             self.show(MenuView {

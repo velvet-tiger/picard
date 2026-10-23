@@ -5,12 +5,17 @@
 //! `threshold + recover_margin`, or after `cooldown` while still low. Without
 //! this, a cleanup that cannot free enough space would alert on every poll.
 //!
-//! The repeat after `cooldown` waits for a routine check, one that comes on
-//! the `poll_minutes` beat. Picard also checks when the menu opens, when a
-//! scan ends and every 30 seconds while its window is open. Those checks
-//! catch a volume that newly drops below its threshold, but a repeat on them
-//! could chain: an alert's own estimate scan ends, which asks for a check,
-//! which repeats the alert once a short cooldown has passed.
+//! The repeat after `cooldown`, and the re-arm after recovery, wait for a
+//! routine check, one that comes on the `poll_minutes` beat. Picard also
+//! checks when the menu opens, when a scan ends and every 30 seconds while
+//! its window is open. Those checks catch a volume that newly drops below
+//! its threshold, so extra checks can raise an alert sooner. They never let
+//! one repeat sooner. A repeat on them could chain: an alert's own estimate
+//! scan ends, which asks for a check, which repeats the alert once a short
+//! cooldown has passed. A re-arm on them lets a filling disk alert again on
+//! the next 30 second check. With `recover_margin_gb = 0` in auto mode, a
+//! clean reaches only the threshold, so that would mean a clean and a
+//! notification every 30 seconds.
 //!
 //! Everything here is pure. The poll loop owns the clock and the I/O.
 
@@ -45,10 +50,31 @@ pub struct Policy {
     pub mode: Mode,
 }
 
+impl Policy {
+    /// The config's rules for `volume`, whose capacity is in `space`.
+    fn for_volume(config: &Config, volume: &Volume, space: DiskSpace) -> Self {
+        Self {
+            threshold_bytes: config
+                .threshold_for(&volume.mount, volume.uuid.as_deref())
+                .bytes(space.total_bytes),
+            margin_bytes: config.recover_margin_bytes,
+            cooldown: Duration::from_secs(config.cooldown_minutes.saturating_mul(60)),
+            mode: config.mode,
+        }
+    }
+
+    /// True once `free_bytes` is back at or above the threshold plus the
+    /// recovery margin, where a fired volume may re-arm.
+    fn recovered(&self, free_bytes: u64) -> bool {
+        free_bytes >= self.threshold_bytes.saturating_add(self.margin_bytes)
+    }
+}
+
 /// Advances one volume's state given a new free-space reading.
 ///
-/// `routine` is true on a routine check; only those may repeat an alert
-/// after the cooldown. See the module notes.
+/// `routine` is true on a routine check. Only those may repeat an alert
+/// after the cooldown, or re-arm a volume that has recovered. See the
+/// module notes.
 pub fn step(
     state: State,
     free_bytes: u64,
@@ -65,9 +91,7 @@ pub fn step(
     match state {
         State::Armed if low => (State::Fired { at: now }, Decision::Fire),
         State::Armed => (State::Armed, Decision::Quiet),
-        State::Fired { .. }
-            if free_bytes >= policy.threshold_bytes.saturating_add(policy.margin_bytes) =>
-        {
+        State::Fired { .. } if routine && policy.recovered(free_bytes) => {
             (State::Armed, Decision::Quiet)
         }
         State::Fired { at } if routine && low && now.duration_since(at) >= policy.cooldown => {
@@ -125,6 +149,12 @@ pub fn daily_scan_message(
     ))
 }
 
+/// True if `space` on `volume` is back at or above its threshold plus the
+/// recovery margin. See `daily_action`.
+pub fn has_recovered(config: &Config, volume: &Volume, space: DiskSpace) -> bool {
+    Policy::for_volume(config, volume, space).recovered(space.free_bytes)
+}
+
 /// True if `space` on `volume` is below that volume's threshold.
 pub fn is_low(config: &Config, volume: &Volume, space: DiskSpace) -> bool {
     space.free_bytes
@@ -165,14 +195,7 @@ pub fn evaluate(
     let mut next = States::new();
     let mut alerts = Vec::new();
     for (volume, space) in readings {
-        let policy = Policy {
-            threshold_bytes: config
-                .threshold_for(&volume.mount, volume.uuid.as_deref())
-                .bytes(space.total_bytes),
-            margin_bytes: config.recover_margin_bytes,
-            cooldown: Duration::from_secs(config.cooldown_minutes.saturating_mul(60)),
-            mode: config.mode,
-        };
+        let policy = Policy::for_volume(config, volume, *space);
         let prev = states.get(&volume.mount).copied().unwrap_or(State::Armed);
         let (state, decision) = step(prev, space.free_bytes, &policy, now, routine);
         next.insert(volume.mount.clone(), state);
@@ -247,11 +270,17 @@ pub enum DailyAction {
 }
 
 /// Chooses the daily scan's action for a volume in `state` under `mode`.
-pub fn daily_action(mode: Mode, state: Option<State>) -> DailyAction {
+///
+/// `recovered` is `has_recovered` for the volume now. A fired volume that
+/// has recovered is offered the scan. It re-arms only at the next routine
+/// check, and the daily scan wakes on its own time, so it seldom falls on
+/// one. Without this, a volume freed in the minutes before the scan would
+/// miss that day's offer.
+pub fn daily_action(mode: Mode, state: Option<State>, recovered: bool) -> DailyAction {
     match (mode, state) {
         (Mode::Off, _) => DailyAction::Skip,
         (Mode::Auto, _) => DailyAction::Clean,
-        (Mode::Ask, Some(State::Fired { .. })) => DailyAction::Skip,
+        (Mode::Ask, Some(State::Fired { .. })) if !recovered => DailyAction::Skip,
         (Mode::Ask, _) => DailyAction::Offer,
     }
 }
@@ -373,17 +402,53 @@ mod tests {
     }
 
     #[test]
-    fn any_check_catches_a_new_drop_and_a_recovery() {
+    fn any_check_catches_a_new_drop() {
         let t0 = Instant::now();
         let p = policy(Mode::Ask);
         assert_eq!(
             step(State::Armed, 25 * GB, &p, t0, false),
             (State::Fired { at: t0 }, Decision::Fire)
         );
+    }
+
+    #[test]
+    fn only_a_routine_check_re_arms_a_recovered_volume() {
+        let t0 = Instant::now();
+        let p = policy(Mode::Ask);
+        let fired = State::Fired { at: t0 };
+        // 40 GB is the 30 GB threshold plus the 10 GB margin.
         assert_eq!(
-            step(State::Fired { at: t0 }, 40 * GB, &p, t0, false),
+            step(fired, 40 * GB, &p, t0, false),
+            (fired, Decision::Quiet)
+        );
+        assert_eq!(
+            step(fired, 40 * GB, &p, t0, true),
             (State::Armed, Decision::Quiet)
         );
+    }
+
+    #[test]
+    fn with_no_margin_extra_checks_do_not_restart_a_clean() {
+        // Auto mode, margin 0: a low-space clean stops at the threshold.
+        let p = Policy {
+            margin_bytes: 0,
+            ..policy(Mode::Auto)
+        };
+        let t0 = Instant::now();
+        let secs = |n| t0 + Duration::from_secs(n);
+        let (state, d) = step(State::Armed, 25 * GB, &p, t0, true);
+        assert_eq!(d, Decision::Fire, "the first drop cleans");
+        // The clean brought it to the threshold. A refresh does not re-arm it.
+        let (state, d) = step(state, 30 * GB, &p, secs(30), false);
+        assert_eq!((state, d), (State::Fired { at: t0 }, Decision::Quiet));
+        // It fills again before the next routine check. Still quiet.
+        let (state, d) = step(state, 29 * GB, &p, secs(60), false);
+        assert_eq!((state, d), (State::Fired { at: t0 }, Decision::Quiet));
+        // A routine check at the threshold re-arms it, and a later drop
+        // is caught by any check.
+        let (state, d) = step(state, 30 * GB, &p, secs(300), true);
+        assert_eq!((state, d), (State::Armed, Decision::Quiet));
+        assert_eq!(step(state, 29 * GB, &p, secs(330), false).1, Decision::Fire);
     }
 
     #[test]
@@ -458,6 +523,28 @@ mod tests {
         assert!(alerts.is_empty(), "a refresh does not repeat the alert");
         let (_, alerts) = evaluate(&states, &readings, &config, later, true);
         assert_eq!(alerts.len(), 1, "the routine check does");
+    }
+
+    #[test]
+    fn evaluate_re_arms_only_when_routine() {
+        let config = parse("min_free_gb = 30\nroots = [\"/a\"]", Path::new("/Users/t")).unwrap();
+        let mut states = States::new();
+        let fired = State::Fired { at: Instant::now() };
+        states.insert(PathBuf::from("/"), fired);
+        // 40 GB free: past the 30 GB threshold and the default 10 GB margin.
+        let readings = vec![(volume("/", "Startup disk"), space(40, 500))];
+        let (kept, _) = evaluate(&states, &readings, &config, Instant::now(), false);
+        assert_eq!(kept[Path::new("/")], fired);
+        let (rearmed, _) = evaluate(&states, &readings, &config, Instant::now(), true);
+        assert_eq!(rearmed[Path::new("/")], State::Armed);
+    }
+
+    #[test]
+    fn has_recovered_needs_the_threshold_plus_the_margin() {
+        let config = parse("min_free_gb = 30\nroots = [\"/a\"]", Path::new("/Users/t")).unwrap();
+        let disk = volume("/", "Startup disk");
+        assert!(!has_recovered(&config, &disk, space(35, 500)));
+        assert!(has_recovered(&config, &disk, space(40, 500)));
     }
 
     #[test]
@@ -621,15 +708,17 @@ mod tests {
     #[test]
     fn daily_action_follows_the_mode() {
         let fired = Some(State::Fired { at: Instant::now() });
-        assert_eq!(daily_action(Mode::Off, None), DailyAction::Skip);
-        assert_eq!(daily_action(Mode::Auto, None), DailyAction::Clean);
-        assert_eq!(daily_action(Mode::Auto, fired), DailyAction::Clean);
+        assert_eq!(daily_action(Mode::Off, None, false), DailyAction::Skip);
+        assert_eq!(daily_action(Mode::Auto, None, false), DailyAction::Clean);
+        assert_eq!(daily_action(Mode::Auto, fired, false), DailyAction::Clean);
         assert_eq!(
-            daily_action(Mode::Ask, Some(State::Armed)),
+            daily_action(Mode::Ask, Some(State::Armed), false),
             DailyAction::Offer
         );
-        assert_eq!(daily_action(Mode::Ask, None), DailyAction::Offer);
-        assert_eq!(daily_action(Mode::Ask, fired), DailyAction::Skip);
+        assert_eq!(daily_action(Mode::Ask, None, false), DailyAction::Offer);
+        assert_eq!(daily_action(Mode::Ask, fired, false), DailyAction::Skip);
+        // Recovered since the last routine check, but not yet re-armed.
+        assert_eq!(daily_action(Mode::Ask, fired, true), DailyAction::Offer);
     }
 
     #[test]

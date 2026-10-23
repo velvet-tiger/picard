@@ -8,7 +8,7 @@ All notable changes to Picard are recorded here. The format follows
 
 ### Changed
 
-- Free space is checked more often. Picard checks when you point at or click the menu bar icon, when a scan ends, when a cleanup is recorded (including one from the `picard` command), and every 30 seconds while its window is open. Any of these checks notices a drive that drops below its threshold. A repeat alert for a drive that stays low still waits for the regular `poll_minutes` check after the cooldown.
+- Free space is checked more often. Picard checks when you point at or click the menu bar icon, when a scan ends, when a cleanup is recorded (including one from the `picard` command), and every 30 seconds while its window is open. Any of these checks notices a drive that drops below its threshold. A repeat alert for a drive that stays low still waits for the regular `poll_minutes` check after the cooldown. A drive that recovers is ready to alert again from the next regular `poll_minutes` check.
 - An error reading a folder is logged when it first appears, and again only if the error changes. It used to be logged on every check.
 
 ## [0.6.0] - 2026-10-23

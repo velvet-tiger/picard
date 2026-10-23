@@ -76,7 +76,7 @@ If your Mac is asleep or Picard is closed at that time, the scan runs at the nex
 
 The menu lists each drive with its free space, then **Clean…**, **Settings…** and **Open Log**.
 
-Picard checks free space every `poll_minutes`. It also checks when you point at or click the icon, when a scan ends, and when a cleanup is recorded. While the Picard window is open, it checks every 30 seconds. Each check updates the menu, the icon and the Clean tab. Any check notices a drive that drops below its threshold. While a drive stays low, its alert repeats only on the regular `poll_minutes` check, once `cooldown_minutes` has passed.
+Picard checks free space every `poll_minutes`. It also checks when you point at or click the icon, when a scan ends, and when a cleanup is recorded. While the Picard window is open, it checks every 30 seconds. Each check updates the menu, the icon and the Clean tab. Any check notices a drive that drops below its threshold. While a drive stays low, its alert repeats only on the regular `poll_minutes` check, once `cooldown_minutes` has passed. A drive that recovers past its threshold plus `recover_margin_gb` is ready to alert again from the next regular `poll_minutes` check.
 
 ## About and updates
 
