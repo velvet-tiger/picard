@@ -96,26 +96,24 @@ impl GitCmd {
         }
     }
 
-    fn exec(&self, dir: &Path, args: &[&str], input: Option<&str>) -> Result<Output> {
+    fn exec(&self, dir: &Path, args: &[&str], input: Option<String>) -> Result<Output> {
         let cmd = self.command(dir, args);
         let out = match input {
             None => proc::run(cmd, GIT_TIMEOUT, GIT_OUTPUT_CAP),
-            Some(text) => {
-                proc::run_with_input(cmd, text.as_bytes().to_vec(), GIT_TIMEOUT, GIT_OUTPUT_CAP)
-            }
+            Some(text) => proc::run_with_input(cmd, text.into_bytes(), GIT_TIMEOUT, GIT_OUTPUT_CAP),
         }
         .with_context(|| {
             format!(
                 "running {} {} in {}",
                 self.program.display(),
-                args.join(" "),
+                shown_args(args),
                 dir.display()
             )
         })?;
         if out.timed_out || out.truncated {
             bail!(
                 "git {} in {}: {}",
-                args.join(" "),
+                shown_args(args),
                 dir.display(),
                 if out.timed_out {
                     "timed out"
@@ -135,8 +133,9 @@ impl GitCmd {
 
     /// Like `output`, but writes `input` to git's stdin, as `--stdin` options
     /// read it. A list of revisions passed this way cannot overflow the
-    /// command line, and git never reads one of them as a path.
-    pub fn output_with_input(&self, dir: &Path, args: &[&str], input: &str) -> Result<String> {
+    /// command line, and git never reads one of them as a path. It takes the
+    /// input by value, so a large one is not held twice.
+    pub fn output_with_input(&self, dir: &Path, args: &[&str], input: String) -> Result<String> {
         let out = self.exec(dir, args, Some(input))?;
         stdout_of(out, dir, args)
     }
@@ -150,7 +149,7 @@ impl GitCmd {
             Some(1) => Ok(false),
             _ => bail!(
                 "git {} in {} failed: {}",
-                args.join(" "),
+                shown_args(args),
                 dir.display(),
                 out.stderr.trim()
             ),
@@ -158,12 +157,34 @@ impl GitCmd {
     }
 }
 
+/// About how much of a command's arguments an error message shows.
+const ARGS_SHOWN: usize = 500;
+
+/// `args` joined by spaces for an error message, cut to about `ARGS_SHOWN`
+/// characters. A command with a huge argument list must not put megabytes
+/// into the log when it fails.
+fn shown_args(args: &[&str]) -> String {
+    let mut text = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        let sep = if i == 0 { "" } else { " " };
+        let room = ARGS_SHOWN.saturating_sub(text.len() + sep.len());
+        text.push_str(sep);
+        if arg.len() <= room {
+            text.push_str(arg);
+            continue;
+        }
+        text.extend(arg.chars().take(room));
+        return format!("{text}… ({} more args)", args.len() - i - 1);
+    }
+    text
+}
+
 /// The stdout of a finished git command, or an error with its stderr.
 fn stdout_of(out: Output, dir: &Path, args: &[&str]) -> Result<String> {
     if !out.success() {
         bail!(
             "git {} in {} failed: {}",
-            args.join(" "),
+            shown_args(args),
             dir.display(),
             out.stderr.trim()
         );
@@ -182,6 +203,9 @@ const IN_PROGRESS: &[(&str, &str)] = &[
     ("sequencer", "a cherry-pick or revert of several commits"),
     ("BISECT_LOG", "a bisect"),
     ("BISECT_START", "a bisect"),
+    ("NOTES_MERGE_WORKTREE", "a notes merge"),
+    ("NOTES_MERGE_PARTIAL", "a notes merge"),
+    ("NOTES_MERGE_REF", "a notes merge"),
 ];
 
 impl GitCmd {
@@ -622,6 +646,27 @@ mod tests {
             .output(dir.path(), &["config", "--bool", "core.commitGraph"])
             .unwrap();
         assert_eq!(seen.trim(), "false");
+    }
+
+    #[test]
+    fn error_messages_show_only_the_start_of_a_long_argument_list() {
+        assert_eq!(shown_args(&["rev-parse", "HEAD"]), "rev-parse HEAD");
+        let many: Vec<String> = (0..20_000).map(|i| format!("refs/heads/b{i:05}")).collect();
+        let mut args = vec!["rev-list"];
+        args.extend(many.iter().map(String::as_str));
+        let shown = shown_args(&args);
+        assert!(shown.len() < ARGS_SHOWN + 40, "{} chars", shown.len());
+        assert!(shown.starts_with("rev-list refs/heads/b00000 "), "{shown}");
+        assert!(shown.ends_with(" more args)"), "{shown}");
+        // One huge argument is cut too.
+        let huge = "x".repeat(100_000);
+        assert!(shown_args(&[huge.as_str()]).len() < ARGS_SHOWN + 40);
+
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitCmd::default();
+        git.output(dir.path(), &["init", "-q"]).unwrap();
+        let err = git.output(dir.path(), &args).unwrap_err().to_string();
+        assert!(err.len() < 2_000, "{} chars: {err}", err.len());
     }
 
     #[test]

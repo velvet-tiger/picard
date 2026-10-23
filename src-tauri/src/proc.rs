@@ -66,9 +66,12 @@ pub fn run(cmd: Command, timeout: Duration, cap: usize) -> io::Result<Output> {
 
 /// Like `run`, but writes `input` to the command's stdin and then closes it.
 /// A thread of its own writes, so a command that fills its output pipe before
-/// it reads all its input cannot deadlock against the readers. A command that
-/// exits with success before reading all of `input` is an error: its output
-/// was computed from only part of the input.
+/// it reads all its input cannot deadlock against the readers.
+///
+/// If the command exits with success while part of `input` is still
+/// unwritten, that is an error: its output came from only part of the input.
+/// This can only be seen when the input is larger than the pipe's buffer.
+/// Smaller input fits in the buffer whether or not the command reads it.
 pub fn run_with_input(
     cmd: Command,
     input: Vec<u8>,
@@ -184,8 +187,12 @@ fn spawn_reader<R: Read + Send + 'static>(
                 Err(_) => break,
             }
         }
+        // Valid UTF-8 becomes a String without a copy, so a large output is
+        // not held twice.
+        let text = String::from_utf8(kept)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         // The receiver may have given up waiting; nothing to do then.
-        let _ = tx.send((String::from_utf8_lossy(&kept).into_owned(), cut));
+        let _ = tx.send((text, cut));
     });
     rx
 }

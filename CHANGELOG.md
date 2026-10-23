@@ -20,10 +20,13 @@ All notable changes to Picard are recorded here. The format follows
 
 ### Fixed
 
-- A worktree with a paused rebase, merge, cherry-pick, revert or bisect is never removed. Removing it would delete that operation's state.
+- A worktree with a paused rebase, `git am`, merge, cherry-pick, revert, bisect or notes merge is never removed. Removing it would delete that operation's state.
+- A done worktree whose HEAD reflog shows commits made in it, which no other local branch holds and which have no copy on one, now waits for `stale_days`. Its reason says "has commits on no branch". This covers a detached worktree that made a commit and then checked out `main`. Picard used to remove it after `min_idle_minutes`, which lost that commit. Commits the worktree only checked out or reset to do not count. Without a reflog there is nothing to check.
+- A worktree is kept while one of its own refs, under `refs/worktree/` or `refs/bisect/`, points at a commit that no other local branch holds. Removing the worktree would delete that ref.
 - A copied repo, made with `cp -R` or Finder's Duplicate, still lists the original repo's worktrees, with the HEAD each had when copied. Picard judged those worktrees by that old HEAD and could remove one that held newer work. It now judges a worktree only through its own repo, by the HEAD it has now.
-- Picard tells git not to read commit-graph files. A forged commit-graph could make a commit look as if a branch held it.
-- Every worktree is judged again just before it is removed, with its repo's branches read afresh. A worktree that is no longer done, or whose commits are no longer anywhere else, is kept.
+- Picard tells git not to read commit-graph files. A forged commit-graph could make a commit look as if a branch held it. Without the commit-graph, scans can be slower on very large repos.
+- Every worktree is judged again just before it is removed, with its repo's branches read afresh. A worktree that is no longer done, or whose commits are no longer anywhere else, is kept. Its HEAD is read once more right before removal, and a worktree whose HEAD moved is kept.
+- Picard passes branch lists to git on stdin. A repo with many thousands of branches no longer fails with an argument list that is too long. A failed git command logs only the start of a long argument list.
 - A branch deleted while Picard reads a repo is now an error. Git used to read its name as a path when a file of that name existed.
 
 ## [0.6.0] - 2026-10-23

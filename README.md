@@ -10,7 +10,7 @@ Picard only works inside the folders you list as **roots**, such as `~/working`.
 
 | Task | Removes | Only when |
 |---|---|---|
-| `git_worktrees` | Linked git worktrees | Clean, not locked, not in use by any running process, and with no rebase, merge or bisect paused in them. Done ones go after `min_idle_minutes`: another local branch holds their HEAD, or other local branches hold a cherry-picked copy of each commit that no other branch holds. The copies can be spread over several branches. Ones whose commits are only pushed go after `stale_days`. |
+| `git_worktrees` | Linked git worktrees | Clean, not locked, and not in use by any running process. Nothing is paused in them: no rebase, `git am`, merge, cherry-pick, revert, sequence of cherry-picks or reverts, bisect or notes merge. Done ones go after `min_idle_minutes`: another local branch holds their HEAD, or other local branches hold a cherry-picked copy of each commit that no other branch holds. The copies can be spread over several branches. Ones whose commits are only pushed, and done ones that made commits now on no branch, go after `stale_days`. |
 | `node_modules` | `node_modules` next to a `package.json` | The project has not changed for `stale_days`. |
 | `cargo_clean` | `target/` next to a `Cargo.toml` | The project has not changed for `stale_days`, or every project with `mode = "all"`. |
 | `python_venv` | `.venv` or `venv` holding a `pyvenv.cfg`, next to a `pyproject.toml`, `requirements.txt`, `setup.py`, `setup.cfg` or `Pipfile` | The project has not changed for `stale_days`. |
@@ -23,9 +23,10 @@ These rules always hold:
 - Nothing outside your roots is removed, and symlinks are never followed out of them. Tool caches are the exception: Picard never deletes them itself. It asks each tool to prune its own cache.
 - Git branches are never deleted. Worktrees are removed with `git worktree remove`. A worktree with checked-out submodules needs `--force`, so Picard first checks each submodule itself: it must be clean, and every commit in it must be on a remote branch.
 - A worktree with uncommitted or untracked changes is never removed. Neither is one that holds another git checkout, such as a Claude Code worktree in `.claude/worktrees/`.
-- A worktree with a paused rebase, merge, cherry-pick, revert or bisect is never removed. Removing it would delete that operation's state.
+- A worktree with a paused rebase, `git am`, merge, cherry-pick, revert, bisect or notes merge is never removed. Removing it would delete that operation's state.
+- A worktree's own refs, under `refs/worktree/` and `refs/bisect/`, are deleted with it. A worktree is never removed while one of them points at a commit that no other local branch holds.
 - A copied repo, made with `cp -R` or Finder's Duplicate, still lists the original repo's worktrees. Picard judges a worktree only through the repo it belongs to, and only by the HEAD it has now.
-- Every item is checked again just before it is removed. A worktree is judged again from scratch, with its repo's branches read afresh.
+- Every item is checked again just before it is removed. A worktree is judged again from scratch, with its repo's branches read afresh. Its HEAD is read once more right before removal, and a HEAD that moved keeps it.
 - A folder you ignore is never removed, in any mode. Neither is a folder that holds one, such as a worktree with an ignored `node_modules` inside it.
 - Every removal is logged to `history.jsonl`.
 - Only one cleanup runs at a time.
@@ -41,8 +42,11 @@ A worktree is also done when other local branches hold a cherry-picked copy of e
 - A binary file that `.gitattributes` marks as text is compared as text.
 - A merge commit has no patch id, so a merge among those commits fails this check.
 - One copy matches every commit that makes the same change, such as a change made, reverted and made again. Two such commits fail this check.
+- A copy still counts after its branch reverts it. A commit that reapplies a reverted change also counts as a copy of the original.
 
 A failed check only means the worktree is not done this way. A worktree whose branch is pushed still goes after `stale_days`. The same holds when git cannot run the check, for example in a partial clone that lacks some files' contents.
+
+A worktree can make a commit and then check out another one. That commit is then on no branch. Only the worktree's HEAD reflog reaches it, and removing the worktree deletes that reflog. So Picard reads the HEAD reflog of each done worktree. A commit made in the worktree that no other local branch holds, and that has no copy on one, makes the worktree wait for `stale_days`. The **Clean…** list then says "has commits on no branch". Commits the worktree only checked out or reset to do not count, because they existed already. A draft with a copy on a branch does not count either, such as a commit from before a rebase, or the first version of a commit whose message was amended. A reflog message Picard does not recognise counts as a commit made here, so it can only make a worktree wait. Without a reflog, for example with `core.logAllRefUpdates` off, there is nothing to read, and such commits are lost on removal.
 
 The **Clean…** list says why a worktree is done. When git recorded a merge, it names it, for example "merged into 2.0-dev by 374877e". Otherwise it names the branch, as in "on main", or says "cherry-picked to another branch". A worktree whose commits are only pushed waits for `stale_days`. Any other worktree is kept. A squash merge of several commits is not a copy of any of them, so that worktree waits for `stale_days` if it was pushed, and is kept if not.
 
