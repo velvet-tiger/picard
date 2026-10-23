@@ -773,7 +773,7 @@
               <span class="muted summary">{closedSummary(t)}</span>
             {/if}
           </div>
-          <div id={listId} hidden={!open[tk]}>
+          <div id={listId} class="items" hidden={!open[tk]}>
             {#if t.error}
               <p class="error">Could not scan: {t.error}</p>
             {:else if t.items.length === 0}
@@ -868,26 +868,34 @@
     letter-spacing: 0.04em;
     color: var(--muted);
   }
+  /* Shared by the heading row and the list under it, so the list lines up with the heading's checkbox. */
+  main {
+    --toggle-size: 28px;
+    --task-gap: 6px;
+  }
   /* chevron | checkbox and name | summary when closed */
   .task {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--task-gap);
     margin: 12px 0 4px;
   }
   .task h3 {
     margin: 0;
   }
-  /* 24px is the smallest target WCAG 2.2 (2.5.8) allows. */
+  /* Above the 24px minimum target WCAG 2.2 (2.5.8) allows. */
   .toggle {
-    min-width: 24px;
-    min-height: 24px;
+    min-width: var(--toggle-size);
+    min-height: var(--toggle-size);
     border: none;
     background: none;
     padding: 0;
     color: var(--muted);
-    font-size: 11px;
+    font-size: 16px;
     cursor: pointer;
+  }
+  .items {
+    padding-left: calc(var(--toggle-size) + var(--task-gap));
   }
   .chevron {
     display: inline-block;
