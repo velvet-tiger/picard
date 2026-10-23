@@ -58,9 +58,11 @@
 //! worktree waits. The reflog message decides: `ONLY_MOVED` lists the plain
 //! movements, and any other message, even an unknown one, counts as a
 //! commit made here. An empty message counts as a movement only on the
-//! oldest entry, which `git worktree add` writes. If the search for copies
-//! fails, or would pass `REFLOG_COPY_LIMIT`, the worktree waits. With no
-//! reflog there is nothing to read.
+//! entry that created the worktree (old value all zeros), which `git
+//! worktree add` writes. `log --walk-reflogs` cannot show old values, so
+//! Picard reads them from the reflog file. If the search for copies fails,
+//! or would pass `REFLOG_COPY_LIMIT`, the worktree waits. With no reflog
+//! there is nothing to read.
 //!
 //! A branch holding the commits shows they survive, not that the work was
 //! finished. A branch stacked on top of the worktree's branch counts, and so
@@ -222,6 +224,12 @@ fn err_text(e: anyhow::Error) -> String {
 /// whose merge bases lie much further back. Past the limit the check is
 /// skipped, and the worktree waits for `stale_days`.
 const REFLOG_COPY_LIMIT: usize = 100_000;
+
+/// The largest HEAD reflog file Picard reads to find a worktree's creation.
+/// A line is about 150 bytes, so this is hundreds of thousands of entries.
+/// A larger file is not read, and every empty message in it counts as a
+/// commit made here.
+const REFLOG_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 
 pub struct GitWorktrees {
     git: GitCmd,
@@ -502,7 +510,8 @@ impl GitWorktrees {
                 ],
             )
             .context("reading the worktree's HEAD reflog")?;
-        let made = made_here(&log)?;
+        let created = self.creation_commits(&wt.path)?;
+        let made = made_here(&log, &created)?;
         if made.is_empty() {
             return Ok(None);
         }
@@ -541,6 +550,43 @@ impl GitWorktrees {
             .iter()
             .find(|id| !copied.contains(*id))
             .map(|id| id.to_string()))
+    }
+
+    /// The commits the worktree's HEAD reflog file says it was created at.
+    /// `log --walk-reflogs` cannot show an entry's old value, so the file is
+    /// read directly. That runs nothing the repo configures. A missing file,
+    /// or one that is not a plain file of a sane size, gives no commits, so
+    /// every empty reflog message counts as a commit made here.
+    fn creation_commits(&self, wt: &Path) -> Result<HashSet<String>> {
+        let raw = self.git.output(
+            wt,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "logs/HEAD",
+            ],
+        )?;
+        let path = PathBuf::from(raw.strip_suffix('\n').unwrap_or(&raw));
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        if !meta.is_file() || meta.len() > REFLOG_FILE_LIMIT {
+            log::debug!(
+                "worktree {}: not reading {}: not a plain file of at most {REFLOG_FILE_LIMIT} bytes",
+                wt.display(),
+                path.display()
+            );
+            return Ok(HashSet::new());
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(creation_ids(&text)
+            .into_iter()
+            .map(str::to_string)
+            .collect())
     }
 
     /// Those of `ids` that none of `others` holds, in the same order.
@@ -1212,25 +1258,48 @@ fn non_merge_commits(raw: &str) -> Result<Vec<&str>, &str> {
 /// --format=%H%x09%gs`, newest first. Each entry's commit is the one HEAD
 /// moved to.
 ///
-/// `git worktree add` writes the oldest entry, with an empty message. A
-/// later empty message comes from plumbing, such as `git update-ref HEAD`
-/// without `-m`, which can point HEAD at a commit it just made. So only the
-/// oldest entry's empty message counts as a movement.
-fn made_here(raw: &str) -> Result<Vec<&str>> {
-    let lines: Vec<&str> = raw.lines().collect();
-    let oldest = lines.len().saturating_sub(1);
+/// `git worktree add` writes an entry with an empty message. So does
+/// plumbing such as `git update-ref HEAD` without `-m`, which can point HEAD
+/// at a commit it just made. An empty message counts as a movement only for
+/// a commit in `created`, the commits the worktree was created at.
+fn made_here<'a>(raw: &'a str, created: &HashSet<String>) -> Result<Vec<&'a str>> {
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
+    for line in raw.lines() {
         let Some((id, message)) = line.split_once('\t') else {
             anyhow::bail!("git log --walk-reflogs printed {line:?}");
         };
-        let created = i == oldest && message.is_empty();
-        if !created && !only_moved(message) && seen.insert(id) {
+        let creation = message.is_empty() && created.contains(id);
+        if !creation && !only_moved(message) && seen.insert(id) {
             ids.push(id);
         }
     }
     Ok(ids)
+}
+
+/// The commits that entries of a raw reflog file created the ref at: those
+/// with an old value of all zeros and an empty message, as `git worktree
+/// add` writes them. Plumbing that writes an empty message records the
+/// commit HEAD left as the old value, so it never matches, even after the
+/// creation entry has expired. Each line is `<old> <new> <name> <<email>>
+/// <time> <tz>`, then a tab and the message when there is one. A line that
+/// does not parse is left out, so an empty message on it counts as a commit
+/// made here.
+fn creation_ids(raw: &str) -> HashSet<&str> {
+    let is_id = |s: &str| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit());
+    raw.lines()
+        .filter_map(|line| {
+            let (head, message) = line.split_once('\t').unwrap_or((line, ""));
+            let mut fields = head.split(' ');
+            let (old, new) = (fields.next()?, fields.next()?);
+            let created = message.is_empty()
+                && is_id(old)
+                && old.bytes().all(|b| b == b'0')
+                && is_id(new)
+                && new.len() == old.len();
+            created.then_some(new)
+        })
+        .collect()
 }
 
 /// True if a HEAD reflog message shows HEAD only moved to a commit that
@@ -2603,15 +2672,44 @@ mod tests {
             format!("{d}\trebase -i (start): checkout main"),
             format!("{b}\tcherry-pick: x"),
             format!("{a}\tfrobnicate: something git may add later"),
-            // The oldest entry, as `git worktree add` writes it.
+            // The entry `git worktree add` writes, at the commit in `created`.
             format!("{d}\t"),
         ]
         .join("\n");
+        let created = HashSet::from([d.clone()]);
         assert_eq!(
-            made_here(&raw).unwrap(),
+            made_here(&raw, &created).unwrap(),
             vec![b.as_str(), c.as_str(), h.as_str(), g.as_str(), a.as_str()]
         );
-        assert!(made_here("no tab here\n").is_err());
+        // Without the creation entry, its commit counts as made here too.
+        assert_eq!(made_here(&raw, &HashSet::new()).unwrap().len(), 6);
+        assert!(made_here("no tab here\n", &created).is_err());
+    }
+
+    #[test]
+    fn finds_the_creation_entries_of_a_raw_reflog() {
+        let zero = "0".repeat(40);
+        let [a, b, c] = ["a", "b", "c"].map(|x| x.repeat(40));
+        let who = "T <t@example.com> 1792733465 +1100";
+        let raw = [
+            // Created by `git worktree add`: no tab when the message is empty.
+            format!("{zero} {a} {who}"),
+            // Plumbing without `-m`: empty message, but the old value is real.
+            format!("{a} {b} {who}"),
+            format!("{b} {a} {who}\tcheckout: moving from {b} to main"),
+            // An empty message after a tab, and a SHA-256 repo's zero id.
+            format!("{} {} {who}\t", "0".repeat(64), "c".repeat(64)),
+            // A zero old value with a message is not a creation.
+            format!("{zero} {c} {who}\tbranch: Created from main"),
+            "garbage".to_string(),
+            format!("{zero} not-an-id {who}"),
+        ]
+        .join("\n");
+        let sha256 = "c".repeat(64);
+        assert_eq!(
+            creation_ids(&raw),
+            HashSet::from([a.as_str(), sha256.as_str()])
+        );
     }
 
     /// A detached worktree makes a commit, then checks out main. Only the
@@ -2875,6 +2973,61 @@ mod tests {
         git(&wt, &["update-ref", "HEAD", id.trim()]);
         git(&wt, &["checkout", "-q", "--detach", "main"]);
         waits_for_its_unbranched_commits(&fx, &task(14, vec![]), &wt, "plumbed");
+    }
+
+    /// Once gc has expired the entry `git worktree add` wrote, a plumbing
+    /// entry with an empty message is the oldest one left. Its old value is
+    /// the commit HEAD left, not all zeros, so it still counts as made here.
+    #[test]
+    fn plumbing_commit_after_the_reflog_expired_waits_for_stale_days() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = detached(&r, "expired");
+        git(
+            &wt,
+            &[
+                "reflog",
+                "expire",
+                "--expire=all",
+                "--expire-unreachable=all",
+                "--all",
+            ],
+        );
+        let log = r.join(".git/worktrees/expired/logs/HEAD");
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+        std::fs::write(wt.join("plumbing"), "made by plumbing").unwrap();
+        git(&wt, &["add", "plumbing"]);
+        let tree = git(&wt, &["write-tree"]).trim().to_string();
+        let id = git(&wt, &["commit-tree", &tree, "-p", "HEAD", "-m", "plumbing"]);
+        git(&wt, &["update-ref", "HEAD", id.trim()]);
+        git(&wt, &["checkout", "-q", "--detach", "main"]);
+        waits_for_its_unbranched_commits(&fx, &task(14, vec![]), &wt, "expired");
+    }
+
+    /// A worktree created at a commit that no branch holds. `git worktree
+    /// add` wrote that entry, with an all-zero old value, so the commit was
+    /// only checked out.
+    #[test]
+    fn worktree_created_at_an_unbranched_commit_did_not_make_it() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let start = unbranched_commit(&r);
+        let wt = r.join(".claude/worktrees/started-elsewhere");
+        git(
+            &r,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                wt.to_str().unwrap(),
+                &start,
+            ],
+        );
+        git(&wt, &["checkout", "-q", "--detach", "main"]);
+        age(&fx, &wt, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(reason_of(&found, "started-elsewhere"), "on main, idle 24 h");
     }
 
     /// The copy check for a commit made here fails in a blobless clone. Not
