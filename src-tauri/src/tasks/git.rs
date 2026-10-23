@@ -59,6 +59,13 @@ impl GitCmd {
             "core.hooksPath=/dev/null",
             "-c",
             "log.showSignature=false",
+            // See the note on GIT_NO_REPLACE_OBJECTS below.
+            "-c",
+            "core.commitGraph=false",
+            // `log` re-encodes commit and reflog text to this. Picard parses
+            // that text, so repo config such as UTF-16 must not change it.
+            "-c",
+            "i18n.logOutputEncoding=UTF-8",
         ]);
         cmd.arg("-C").arg(dir).args(args);
         // Picard only reads, apart from `worktree remove`. Skipping optional
@@ -75,7 +82,10 @@ impl GitCmd {
         // A replace ref can make a commit look contained in, or merged into, a
         // branch that does not hold it. Picard decides safety from history, so
         // it reads the real one. Grafts do the same and are refused in
-        // `unsafe_to_inspect`, because no variable turns them off.
+        // `unsafe_to_inspect`, because no variable turns them off. A
+        // commit-graph file caches each commit's parents, and git trusts it
+        // over the commits themselves, so a forged one can do the same.
+        // `core.commitGraph=false` above makes git read the commits.
         cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
         if let Some(path) = &self.path_var {
             cmd.env("PATH", path);
@@ -90,20 +100,24 @@ impl GitCmd {
         }
     }
 
-    fn exec(&self, dir: &Path, args: &[&str]) -> Result<Output> {
-        let out =
-            proc::run(self.command(dir, args), GIT_TIMEOUT, GIT_OUTPUT_CAP).with_context(|| {
-                format!(
-                    "running {} {} in {}",
-                    self.program.display(),
-                    args.join(" "),
-                    dir.display()
-                )
-            })?;
+    fn exec(&self, dir: &Path, args: &[&str], input: Option<String>) -> Result<Output> {
+        let cmd = self.command(dir, args);
+        let out = match input {
+            None => proc::run(cmd, GIT_TIMEOUT, GIT_OUTPUT_CAP),
+            Some(text) => proc::run_with_input(cmd, text.into_bytes(), GIT_TIMEOUT, GIT_OUTPUT_CAP),
+        }
+        .with_context(|| {
+            format!(
+                "running {} {} in {}",
+                self.program.display(),
+                shown_args(args),
+                dir.display()
+            )
+        })?;
         if out.timed_out || out.truncated {
             bail!(
                 "git {} in {}: {}",
-                args.join(" "),
+                shown_args(args),
                 dir.display(),
                 if out.timed_out {
                     "timed out"
@@ -117,32 +131,134 @@ impl GitCmd {
 
     /// Runs git in `dir` and returns stdout. Fails with stderr on a non-zero exit.
     pub fn output(&self, dir: &Path, args: &[&str]) -> Result<String> {
-        let out = self.exec(dir, args)?;
-        if !out.success() {
-            bail!(
-                "git {} in {} failed: {}",
-                args.join(" "),
-                dir.display(),
-                out.stderr.trim()
-            );
-        }
-        Ok(out.stdout)
+        let out = self.exec(dir, args, None)?;
+        stdout_of(out, dir, args)
+    }
+
+    /// Like `output`, but writes `input` to git's stdin, as `--stdin` options
+    /// read it. A list of revisions passed this way cannot overflow the
+    /// command line, and git never reads one of them as a path. It takes the
+    /// input by value, so a large one is not held twice.
+    pub fn output_with_input(&self, dir: &Path, args: &[&str], input: String) -> Result<String> {
+        let out = self.exec(dir, args, Some(input))?;
+        stdout_of(out, dir, args)
     }
 
     /// Runs a git command whose exit status is the answer, like
     /// `merge-base --is-ancestor`: 0 is yes, 1 is no, anything else is an error.
     pub fn check(&self, dir: &Path, args: &[&str]) -> Result<bool> {
-        let out = self.exec(dir, args)?;
+        let out = self.exec(dir, args, None)?;
         match out.code {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
             _ => bail!(
                 "git {} in {} failed: {}",
-                args.join(" "),
+                shown_args(args),
                 dir.display(),
-                out.stderr.trim()
+                shown_stderr(&out.stderr)
             ),
         }
+    }
+}
+
+/// About how many bytes of git's stderr an error message shows.
+const STDERR_SHOWN: usize = 2_000;
+
+/// The end of `stderr`, cut to about `STDERR_SHOWN` bytes, for an error
+/// message. Git writes the fatal line last, and a failure with a huge
+/// stderr must not put megabytes into the log.
+fn shown_stderr(stderr: &str) -> String {
+    let text = stderr.trim();
+    if text.len() <= STDERR_SHOWN {
+        return text.to_string();
+    }
+    let mut start = text.len() - STDERR_SHOWN;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("… ({start} bytes cut) {}", &text[start..])
+}
+
+/// About how much of a command's arguments an error message shows.
+const ARGS_SHOWN: usize = 500;
+
+/// `args` joined by spaces for an error message, cut to about `ARGS_SHOWN`
+/// characters. A command with a huge argument list must not put megabytes
+/// into the log when it fails.
+fn shown_args(args: &[&str]) -> String {
+    let mut text = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        let sep = if i == 0 { "" } else { " " };
+        let room = ARGS_SHOWN.saturating_sub(text.len() + sep.len());
+        text.push_str(sep);
+        if arg.len() <= room {
+            text.push_str(arg);
+            continue;
+        }
+        text.extend(arg.chars().take(room));
+        return format!("{text}… ({} more args)", args.len() - i - 1);
+    }
+    text
+}
+
+/// The stdout of a finished git command, or an error with its stderr.
+fn stdout_of(out: Output, dir: &Path, args: &[&str]) -> Result<String> {
+    if !out.success() {
+        bail!(
+            "git {} in {} failed: {}",
+            shown_args(args),
+            dir.display(),
+            shown_stderr(&out.stderr)
+        );
+    }
+    Ok(out.stdout)
+}
+
+/// What git keeps in a worktree's git dir while an operation is paused, and a
+/// name for each operation.
+const IN_PROGRESS: &[(&str, &str)] = &[
+    ("rebase-merge", "a rebase"),
+    ("rebase-apply", "a rebase or `git am`"),
+    ("MERGE_HEAD", "a merge"),
+    ("CHERRY_PICK_HEAD", "a cherry-pick"),
+    ("REVERT_HEAD", "a revert"),
+    ("sequencer", "a cherry-pick or revert of several commits"),
+    ("BISECT_LOG", "a bisect"),
+    ("BISECT_START", "a bisect"),
+    ("NOTES_MERGE_WORKTREE", "a notes merge"),
+    ("NOTES_MERGE_PARTIAL", "a notes merge"),
+    ("NOTES_MERGE_REF", "a notes merge"),
+];
+
+impl GitCmd {
+    /// The git operation paused in worktree `dir`, such as "a rebase", if any.
+    /// A paused rebase or bisect can leave a clean worktree on a detached HEAD
+    /// that another branch holds, while its state lives in the worktree's git
+    /// dir. Removing the worktree deletes that state. `--git-path` resolves
+    /// each name for this worktree. A path that cannot be checked is an error,
+    /// so the worktree is kept. Reads only; runs nothing the repo names.
+    pub fn operation_in_progress(&self, dir: &Path) -> Result<Option<&'static str>> {
+        let mut args = vec!["rev-parse", "--path-format=absolute"];
+        for (name, _) in IN_PROGRESS {
+            args.extend(["--git-path", name]);
+        }
+        let raw = self.output(dir, &args)?;
+        let paths: Vec<&str> = raw.lines().collect();
+        if paths.len() != IN_PROGRESS.len() {
+            bail!(
+                "git rev-parse --git-path in {}: expected {} paths, got {raw:?}",
+                dir.display(),
+                IN_PROGRESS.len()
+            );
+        }
+        for ((_, what), path) in IN_PROGRESS.iter().zip(paths) {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => return Ok(Some(what)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("checking {path}")),
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -537,6 +653,73 @@ mod tests {
             .output(dir.path(), &["config", "--bool", "log.showSignature"])
             .unwrap();
         assert_eq!(seen.trim(), "false");
+    }
+
+    /// Repo config cannot turn the commit-graph back on, so a forged graph
+    /// cannot change which parents git sees.
+    #[test]
+    fn repo_config_cannot_turn_on_the_commit_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitCmd::default();
+        git.output(dir.path(), &["init", "-q"]).unwrap();
+        git.output(dir.path(), &["config", "core.commitGraph", "true"])
+            .unwrap();
+        let seen = git
+            .output(dir.path(), &["config", "--bool", "core.commitGraph"])
+            .unwrap();
+        assert_eq!(seen.trim(), "false");
+    }
+
+    /// Repo config cannot change the encoding of `log` output, which Picard
+    /// parses.
+    #[test]
+    fn repo_config_cannot_change_the_log_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitCmd::default();
+        git.output(dir.path(), &["init", "-q"]).unwrap();
+        git.output(dir.path(), &["config", "i18n.logOutputEncoding", "UTF-16"])
+            .unwrap();
+        let seen = git
+            .output(dir.path(), &["config", "i18n.logOutputEncoding"])
+            .unwrap();
+        assert_eq!(seen.trim(), "UTF-8");
+    }
+
+    #[test]
+    fn error_messages_show_only_the_end_of_a_long_stderr() {
+        assert_eq!(
+            shown_stderr("  fatal: bad revision\n"),
+            "fatal: bad revision"
+        );
+        let long = format!(
+            "{}fatal: the last line",
+            "warning: noise é\n".repeat(10_000)
+        );
+        let shown = shown_stderr(&long);
+        assert!(shown.len() < STDERR_SHOWN + 40, "{} bytes", shown.len());
+        assert!(shown.starts_with("… ("), "{shown}");
+        assert!(shown.ends_with("fatal: the last line"), "{shown}");
+    }
+
+    #[test]
+    fn error_messages_show_only_the_start_of_a_long_argument_list() {
+        assert_eq!(shown_args(&["rev-parse", "HEAD"]), "rev-parse HEAD");
+        let many: Vec<String> = (0..20_000).map(|i| format!("refs/heads/b{i:05}")).collect();
+        let mut args = vec!["rev-list"];
+        args.extend(many.iter().map(String::as_str));
+        let shown = shown_args(&args);
+        assert!(shown.len() < ARGS_SHOWN + 40, "{} chars", shown.len());
+        assert!(shown.starts_with("rev-list refs/heads/b00000 "), "{shown}");
+        assert!(shown.ends_with(" more args)"), "{shown}");
+        // One huge argument is cut too.
+        let huge = "x".repeat(100_000);
+        assert!(shown_args(&[huge.as_str()]).len() < ARGS_SHOWN + 40);
+
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitCmd::default();
+        git.output(dir.path(), &["init", "-q"]).unwrap();
+        let err = git.output(dir.path(), &args).unwrap_err().to_string();
+        assert!(err.len() < 2_000, "{} chars: {err}", err.len());
     }
 
     #[test]
