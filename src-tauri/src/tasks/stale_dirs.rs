@@ -111,6 +111,9 @@ impl CleanupTask for StaleDirs {
     fn scan(&self, ctx: &Ctx) -> Result<Vec<Candidate>> {
         let mut found = Vec::new();
         for (project, target) in find_pairs(ctx, self.markers, self.dir_names, self.search_depth) {
+            if ctx.stopped() {
+                break;
+            }
             if let Err(why) = check_target(&target, ctx) {
                 log::info!("{}: skipping {}: {why}", self.id, target.display());
                 continue;
@@ -131,7 +134,7 @@ impl CleanupTask for StaleDirs {
             found.push((target, reason));
         }
         let paths: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
-        let sizes = ctx.sizes.measure_all(&paths);
+        let sizes = ctx.measure_all(&paths);
         Ok(found
             .into_iter()
             .zip(sizes)
@@ -180,6 +183,9 @@ pub(super) fn find_pairs(
                         && !ctx.exclude.is_match(e.path()))
             });
         for entry in walker {
+            if ctx.stopped() {
+                break;
+            }
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {

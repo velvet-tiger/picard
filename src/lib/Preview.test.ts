@@ -11,6 +11,7 @@ import {
   type PreviewItem,
   type Protection,
   type RunResult,
+  type ScanPhase,
   type Status,
   type Totals,
   type VolumePreview,
@@ -62,6 +63,7 @@ function status(volumes: Partial<Status['volumes'][number]>[] = [{}]): Status {
   return {
     mode: 'ask',
     unavailable: [],
+    cleaning: false,
     volumes: volumes.map((v) => ({
       name: 'Startup disk',
       mount: '/',
@@ -87,6 +89,8 @@ function backend(handlers: Record<string, Handler> = {}) {
     set_ignored: () => null,
     get_protection: () => [null, null, 'ignored', null] satisfies Protection[],
     run_selected: () => [],
+    get_scan_state: () => ({ state: 'idle' }) satisfies ScanPhase,
+    cancel_scan: () => null,
     ...handlers,
   })
 }
@@ -445,6 +449,110 @@ describe('Preview', () => {
       await screen.findByText('Picard cleaned in the background, so this list may be out of date.'),
     ).toBeInTheDocument()
     expect(box('shop/web')).toBeChecked()
+  })
+
+  describe('scans the page did not start', () => {
+    const since = (secondsAgo: number) => new Date(Date.now() - secondsAgo * 1000).toISOString()
+
+    it('shows a background scan like its own, then its result', async () => {
+      let stored: VolumePreview[] = []
+      const { sent } = backend({ get_last_preview: () => stored })
+      render(Preview)
+      await settle()
+
+      await emit('scan-changed', { state: 'scanning', since: since(0) })
+      expect(await screen.findByText('Scanning your folders…')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Scan' })).toBeDisabled()
+
+      stored = volumes()
+      await emit('preview-changed')
+      await emit('scan-changed', { state: 'idle' })
+
+      expect(await screen.findByText('Macintosh HD')).toBeInTheDocument()
+      expect(box('shop/web')).toBeChecked()
+      expect(screen.queryByText('Scanning your folders…')).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Show it' })).not.toBeInTheDocument()
+      expect(sent('preview')).toHaveLength(0)
+    })
+
+    it('shows a scan already running when the window opens, timed from its start', async () => {
+      backend({ get_scan_state: () => ({ state: 'scanning', since: since(7) }) })
+      render(Preview)
+
+      expect(await screen.findByText('Scanning your folders…')).toBeInTheDocument()
+      expect(screen.getByText(/^[78] s$/)).toBeInTheDocument()
+    })
+
+    it('says when a scan waits for a clean to end', async () => {
+      backend()
+      render(Preview)
+      await settle()
+
+      await emit('scan-changed', { state: 'waiting_for_clean', since: since(0) })
+      expect(await screen.findByText('Waiting for Picard to finish cleaning…')).toBeInTheDocument()
+      await emit('scan-changed', { state: 'scanning', since: since(0) })
+      expect(await screen.findByText('Scanning your folders…')).toBeInTheDocument()
+    })
+
+    it('keeps the list when a background scan is cancelled', async () => {
+      let stored: VolumePreview[] = []
+      const { sent } = backend({ get_last_preview: () => stored })
+      await renderScanned()
+      stored = volumes()
+      await fireEvent.click(box('shop/web'))
+
+      await emit('scan-changed', { state: 'scanning', since: since(0) })
+      await fireEvent.click(await screen.findByRole('button', { name: 'Cancel scan' }))
+      expect(sent('cancel_scan')).toHaveLength(1)
+      await emit('scan-changed', { state: 'idle' })
+
+      expect(await screen.findByText('Macintosh HD')).toBeInTheDocument()
+      expect(box('shop/web')).not.toBeChecked()
+    })
+  })
+
+  it('keeps the list and shows no error when its own scan is cancelled', async () => {
+    const rescan = deferred<VolumePreview[] | null>()
+    let calls = 0
+    const { sent } = backend({ preview: () => (calls++ === 0 ? volumes() : rescan.promise) })
+    await renderScanned()
+    await fireEvent.click(box('shop/web'))
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Rescan' }))
+    await fireEvent.click(await screen.findByRole('button', { name: 'Cancel scan' }))
+    expect(sent('cancel_scan')).toHaveLength(1)
+    rescan.resolve(null)
+
+    expect(await screen.findByText('Macintosh HD')).toBeInTheDocument()
+    expect(box('shop/web')).not.toBeChecked()
+    expect(screen.queryByRole('button', { name: 'Cancel scan' })).not.toBeInTheDocument()
+    expect(document.querySelector('.error')).toBeNull()
+  })
+
+  it('holds Clean while Picard cleans in the background, and says so', async () => {
+    backend()
+    await renderScanned()
+    const clean = screen.getByRole('button', { name: 'Clean selected' })
+    const note = 'Picard is cleaning in the background. You can clean again when it finishes.'
+
+    await emit('cleaning-changed', true)
+    expect(await screen.findByText(note)).toBeInTheDocument()
+    expect(clean).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Rescan' })).toBeEnabled()
+
+    await emit('cleaning-changed', false)
+    await waitFor(() => expect(clean).toBeEnabled())
+    expect(screen.queryByText(note)).not.toBeInTheDocument()
+  })
+
+  it('says a background clean is running when the window opens during one', async () => {
+    backend({ get_status: () => ({ ...status(), cleaning: true }) })
+    render(Preview)
+    expect(
+      await screen.findByText(
+        'Picard is cleaning in the background. You can clean again when it finishes.',
+      ),
+    ).toBeInTheDocument()
   })
 
   it('keeps Clean disabled until a stored scan is checked against the ignore list', async () => {

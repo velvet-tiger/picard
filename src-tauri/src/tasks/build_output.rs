@@ -90,6 +90,9 @@ impl CleanupTask for BuildOutput {
         let names: Vec<&str> = self.dirs.iter().map(String::as_str).collect();
         let mut found = Vec::new();
         for (project, target) in find_pairs(ctx, &[], &names, SEARCH_DEPTH) {
+            if ctx.stopped() {
+                break;
+            }
             if let Err(why) = check_target(&target, ctx) {
                 log::info!("build_output: skipping {}: {why}", target.display());
                 continue;
@@ -110,7 +113,7 @@ impl CleanupTask for BuildOutput {
             found.push((target, format!("ignored by git, untouched for {idle} days")));
         }
         let paths: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
-        let sizes = ctx.sizes.measure_all(&paths);
+        let sizes = ctx.measure_all(&paths);
         Ok(found
             .into_iter()
             .zip(sizes)

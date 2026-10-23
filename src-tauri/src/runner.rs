@@ -19,7 +19,9 @@ use crate::config::Config;
 use crate::disk;
 use crate::env::ToolEnv;
 use crate::history::{self, Entry};
-use crate::tasks::{self, Candidate, CleanupTask, Ctx, IgnoreList, Protected, Removed, SizeCache};
+use crate::tasks::{
+    self, Candidate, CleanupTask, Ctx, IgnoreList, Protected, Removed, SizeCache, Stop,
+};
 use crate::volume::Volume;
 
 /// Files Picard keeps next to its config.
@@ -57,6 +59,19 @@ impl std::fmt::Display for LockBusy {
 }
 
 impl std::error::Error for LockBusy {}
+
+/// A preview scan gave up because its `Stop` said so. A separate type, so
+/// callers can tell a cancelled scan from a failed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanStopped;
+
+impl std::fmt::Display for ScanStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the scan was cancelled")
+    }
+}
+
+impl std::error::Error for ScanStopped {}
 
 /// Exclusive lock held for the whole of a cleanup run. Uses `flock`, so it also
 /// stops the CLI and the menu bar app from cleaning at the same time. The OS
@@ -121,10 +136,12 @@ impl TaskScan {
 }
 
 /// Lists what every task would remove, marking the candidates `ignore`
-/// protects. Changes nothing.
+/// protects. Changes nothing. Once `ctx` is stopped, the remaining tasks are
+/// left out, so the list is short and the caller must not use it.
 pub fn preview(tasks: &[Box<dyn CleanupTask>], ctx: &Ctx, ignore: &IgnoreList) -> Vec<TaskScan> {
     tasks
         .iter()
+        .take_while(|_| !ctx.stopped())
         .map(|t| {
             let result = t.scan(ctx).map_err(|e| format!("{e:#}"));
             let mut ignored = HashSet::new();
@@ -340,18 +357,25 @@ pub fn target_free(config: &Config, volume: &Volume, total_bytes: u64) -> u64 {
 }
 
 /// Lists what every enabled task would remove on one volume. Changes nothing.
+/// Fails with `ScanStopped` once `stop` returns true, within about a second.
 pub fn preview_volume(
     config: &Config,
     volume: &Volume,
     sizes: &SizeCache,
     env: &ToolEnv,
+    stop: Stop,
 ) -> Result<Vec<TaskScan>> {
     let exclude = tasks::build_exclude(&config.exclude)?;
     let ctx = Ctx::for_volume(volume, &exclude, SystemTime::now(), sizes)
         .with_search_roots(&config.roots)
-        .with_activity_ignore(&config.activity_ignore);
+        .with_activity_ignore(&config.activity_ignore)
+        .with_stop(stop);
     let tasks = tasks::from_config(&config.tasks, env, &config.tools);
-    Ok(preview(&tasks, &ctx, &IgnoreList::new(&config.ignore)))
+    let scans = preview(&tasks, &ctx, &IgnoreList::new(&config.ignore));
+    if ctx.stopped() {
+        return Err(ScanStopped.into());
+    }
+    Ok(scans)
 }
 
 /// Re-reads the `ignore` list from the config file during a run.
@@ -560,6 +584,13 @@ mod tests {
             "unselected target must survive"
         );
         assert!(outsider.exists(), "unproposed path must survive");
+    }
+
+    #[test]
+    fn a_stopped_preview_runs_no_more_tasks() {
+        let fx = fixture();
+        let ctx = fx.ctx().with_stop(&|| true);
+        assert!(preview(&two_tasks(), &ctx, &IgnoreList::default()).is_empty());
     }
 
     #[test]

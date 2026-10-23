@@ -379,6 +379,9 @@ impl GitWorktrees {
         };
         let mut found = Vec::new();
         for wt in worktrees.iter().skip(1) {
+            if ctx.stopped() {
+                break;
+            }
             match self.assess(repo, &branches, wt, ctx, in_use) {
                 Ok(Some(reason)) => found.push((wt.path.clone(), reason)),
                 Ok(None) => {}
@@ -476,6 +479,9 @@ impl CleanupTask for GitWorktrees {
         let mut found = Vec::new();
         let repos = find_repos(ctx);
         for repo in &repos {
+            if ctx.stopped() {
+                break;
+            }
             match self.scan_repo(repo, ctx, &in_use) {
                 Ok(mut f) => found.append(&mut f),
                 Err(e) => log::warn!("{}: {e:#}", repo.display()),
@@ -489,7 +495,7 @@ impl CleanupTask for GitWorktrees {
             repos.len()
         );
         let paths: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
-        let sizes = ctx.sizes.measure_all(&paths);
+        let sizes = ctx.measure_all(&paths);
         Ok(found
             .into_iter()
             .zip(sizes)
@@ -553,6 +559,9 @@ fn find_repos(ctx: &Ctx) -> Vec<PathBuf> {
                         && !ctx.exclude.is_match(e.path()))
             });
         for entry in walker.filter_map(|e| e.ok()) {
+            if ctx.stopped() {
+                break;
+            }
             let dot_git = entry.path().join(".git");
             if std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_dir()) {
                 repos.push(entry.path().to_path_buf());

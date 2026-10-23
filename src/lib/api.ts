@@ -124,14 +124,34 @@ export interface Status {
   volumes: VolumeStatus[]
   /** "Projects: not mounted", one per unavailable root. */
   unavailable: string[]
+  /** A cleanup is running, from this window or in the background. */
+  cleaning: boolean
 }
+
+/**
+ * Where the shared preview scan is. Mirrors `ScanPhase` in preview_scans.rs.
+ * `since` is when the phase began, as RFC 3339. A scan asked for during a
+ * clean waits for it to end.
+ */
+export type ScanPhase =
+  | { state: 'idle' }
+  | { state: 'waiting_for_clean'; since: string }
+  | { state: 'scanning'; since: string }
 
 export const getStatus = () => invoke<Status>('get_status')
 export const getSettings = () => invoke<Settings>('get_settings')
 /** The config's `appearance`, read without loading the whole form. */
 export const getAppearance = () => invoke<Appearance>('get_appearance')
 export const saveSettings = (settings: Settings) => invoke<void>('save_settings', { settings })
-export const preview = () => invoke<VolumePreview[]>('preview')
+/**
+ * Scans every volume, waiting first for any running clean to end. Resolves to
+ * null when the scan was cancelled.
+ */
+export const preview = () => invoke<VolumePreview[] | null>('preview')
+/** Where the shared preview scan is, whoever started it. */
+export const getScanState = () => invoke<ScanPhase>('get_scan_state')
+/** Cancels the running preview scan, whoever started it. Harmless when none runs. */
+export const cancelScan = () => invoke<void>('cancel_scan')
 /** The latest scan of each volume, including the one behind a notification. No scan runs. */
 export const getLastPreview = () => invoke<VolumePreview[]>('get_last_preview')
 export const runSelected = (selections: Selection[]) =>
@@ -303,12 +323,28 @@ export const onHistoryChanged = (handler: () => void) =>
   getCurrentWebviewWindow().listen('history-changed', () => handler())
 
 /**
- * Calls `handler` when a background scan stores a new preview, such as the one
- * behind a low-space or daily-scan notification (see `remember_preview` in
- * src-tauri/src/poll.rs). Resolves to an unlisten function.
+ * Calls `handler` when the stored previews change: any preview scan stored
+ * one, or a background clean dropped one (see `scan_with` in
+ * src-tauri/src/preview_scans.rs). Resolves to an unlisten function.
  */
 export const onPreviewChanged = (handler: () => void) =>
   getCurrentWebviewWindow().listen('preview-changed', () => handler())
+
+/**
+ * Calls `handler` each time the shared preview scan changes phase, including
+ * scans the page did not start: a notification's estimate or the rescan after
+ * a background clean (see src-tauri/src/preview_scans.rs). Resolves to an
+ * unlisten function.
+ */
+export const onScanChanged = (handler: (phase: ScanPhase) => void) =>
+  getCurrentWebviewWindow().listen<ScanPhase>('scan-changed', (e) => handler(e.payload))
+
+/**
+ * Calls `handler` when the first cleanup starts and when the last one ends,
+ * wherever it runs. Resolves to an unlisten function.
+ */
+export const onCleaningChanged = (handler: (cleaning: boolean) => void) =>
+  getCurrentWebviewWindow().listen<boolean>('cleaning-changed', (e) => handler(e.payload))
 
 /** Errors from invoke arrive as strings; anything else is shown as-is. */
 export function errorText(e: unknown): string {

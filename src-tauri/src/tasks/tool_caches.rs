@@ -30,7 +30,7 @@ impl CleanupTask for ToolCaches {
     fn scan(&self, ctx: &Ctx) -> Result<Vec<Candidate>> {
         let here = self.prune.steps_here(ctx);
         let dirs: Vec<_> = here.iter().map(|(_, dir)| dir.clone()).collect();
-        let sizes = ctx.sizes.measure_all(&dirs);
+        let sizes = ctx.measure_all(&dirs);
         Ok(here
             .into_iter()
             .zip(sizes)

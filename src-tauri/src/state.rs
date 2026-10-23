@@ -2,14 +2,18 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use tauri::{AppHandle, Runtime};
 
 use crate::commands::VolumePreview;
+use crate::preview_scans::PreviewScans;
+use crate::tasks::Stop;
 use crate::tray::{self, TrayState};
+use crate::windows;
 
 use crate::env::ToolEnv;
 use crate::runner::DataPaths;
@@ -27,8 +31,10 @@ pub struct Shared {
     /// Set once, shortly after launch: asking the login shell takes about a second.
     tools: OnceLock<Arc<ToolEnv>>,
     /// Cleanups in progress (auto mode and the Preview window can overlap
-    /// briefly before the run lock refuses one).
-    cleaning: AtomicUsize,
+    /// briefly before the run lock refuses one). `cleaning_done` is signalled
+    /// each time one ends, so a preview scan can wait for them.
+    cleaning: Mutex<usize>,
+    cleaning_done: Condvar,
     /// Whether the last check found any volume below its threshold.
     low: AtomicBool,
     /// Held across every read, edit and write of the config file from the
@@ -41,6 +47,8 @@ pub struct Shared {
     /// clean from the CLI, which runs in another process, does not reach it;
     /// the Clean button re-checks every item, so that costs only stale numbers.
     previews: Mutex<PreviewStore>,
+    /// The preview scan that the Clean tab and notifications share.
+    pub scans: PreviewScans,
 }
 
 impl Shared {
@@ -52,10 +60,12 @@ impl Shared {
             sizes: Arc::new(SizeCache::default()),
             uuids: Arc::new(UuidCache::default()),
             tools: OnceLock::new(),
-            cleaning: AtomicUsize::new(0),
+            cleaning: Mutex::new(0),
+            cleaning_done: Condvar::new(),
             low: AtomicBool::new(false),
             config_write: Mutex::new(()),
             previews: Mutex::new(PreviewStore::default()),
+            scans: PreviewScans::default(),
         }
     }
 
@@ -75,8 +85,11 @@ impl Shared {
 
     /// Marks a cleanup as running until the returned guard is dropped, which
     /// also happens if the cleanup panics, so the icon cannot stay stuck.
+    /// An open window is told when the first cleanup starts.
     pub fn start_cleaning<R: Runtime>(self: &Arc<Self>, app: &AppHandle<R>) -> CleaningGuard<R> {
-        self.cleaning.fetch_add(1, Ordering::SeqCst);
+        if self.enter_cleaning() {
+            tell_window_cleaning(app, true);
+        }
         self.refresh_tray(app);
         CleaningGuard {
             shared: Arc::clone(self),
@@ -84,9 +97,48 @@ impl Shared {
         }
     }
 
+    /// Counts one more cleanup. True if none was running before.
+    pub(crate) fn enter_cleaning(&self) -> bool {
+        let mut count = self.lock_cleaning();
+        *count += 1;
+        *count == 1
+    }
+
+    /// Counts one cleanup as ended and wakes `wait_for_cleans`. True if none
+    /// is left running.
+    pub(crate) fn leave_cleaning(&self) -> bool {
+        let mut count = self.lock_cleaning();
+        *count = count.saturating_sub(1);
+        self.cleaning_done.notify_all();
+        *count == 0
+    }
+
     /// True while any cleanup started with `start_cleaning` is running.
     pub fn is_cleaning(&self) -> bool {
-        self.cleaning.load(Ordering::SeqCst) > 0
+        *self.lock_cleaning() > 0
+    }
+
+    /// Blocks until no cleanup is running. False if `stop` returned true
+    /// first. `stop` is asked about every 200 ms, since nothing signals it.
+    pub fn wait_for_cleans(&self, stop: Stop) -> bool {
+        let mut count = self.lock_cleaning();
+        while *count > 0 {
+            if stop() {
+                return false;
+            }
+            count = self
+                .cleaning_done
+                .wait_timeout(count, Duration::from_millis(200))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        !stop()
+    }
+
+    /// The count is a plain integer, so a panic elsewhere cannot leave it
+    /// half-written and a poisoned lock is still usable.
+    fn lock_cleaning(&self) -> MutexGuard<'_, usize> {
+        self.cleaning.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn refresh_tray<R: Runtime>(&self, app: &AppHandle<R>) {
@@ -200,8 +252,18 @@ pub struct CleaningGuard<R: Runtime> {
 
 impl<R: Runtime> Drop for CleaningGuard<R> {
     fn drop(&mut self) {
-        self.shared.cleaning.fetch_sub(1, Ordering::SeqCst);
+        if self.shared.leave_cleaning() {
+            tell_window_cleaning(&self.app, false);
+        }
         self.shared.refresh_tray(&self.app);
+    }
+}
+
+/// Tells an open window whether a cleanup is running. A failure only leaves
+/// the Clean tab's note out of date, so it is logged.
+fn tell_window_cleaning<R: Runtime>(app: &AppHandle<R>, cleaning: bool) {
+    if let Err(e) = windows::cleaning_changed(app, cleaning) {
+        log::warn!("could not tell the window that cleaning changed: {e}");
     }
 }
 
@@ -302,6 +364,34 @@ mod tests {
         s.mark_cleaned("/", at(3));
         s.record(preview("/", 4));
         assert_eq!(mounts_and_times(&s), vec![("/", at(4))]);
+    }
+
+    #[test]
+    fn waiting_for_cleans_returns_when_the_last_one_ends() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/u"),
+            PathBuf::from("/u/config.toml"),
+        ));
+        assert!(shared.enter_cleaning());
+        assert!(!shared.enter_cleaning(), "a second clean is not the first");
+        let waiter = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || shared.wait_for_cleans(&|| false))
+        };
+        assert!(!shared.leave_cleaning(), "one clean is still running");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "must wait for the second clean too");
+        assert!(shared.leave_cleaning());
+        assert!(waiter.join().unwrap());
+        assert!(!shared.is_cleaning());
+    }
+
+    #[test]
+    fn waiting_for_cleans_gives_up_when_stopped() {
+        let shared = Shared::new(PathBuf::from("/u"), PathBuf::from("/u/config.toml"));
+        shared.enter_cleaning();
+        assert!(!shared.wait_for_cleans(&|| true));
+        assert!(shared.is_cleaning());
     }
 
     #[test]

@@ -12,6 +12,8 @@
     "allow-save-settings",
     "allow-preview",
     "allow-get-last-preview",
+    "allow-get-scan-state",
+    "allow-cancel-scan",
     "allow-run-selected",
     "allow-get-history",
     "allow-get-totals",

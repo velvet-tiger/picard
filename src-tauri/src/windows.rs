@@ -10,6 +10,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime, Theme, WebviewUrl, WebviewWindowBuilder};
 
 use crate::config::{self, Appearance};
+use crate::preview_scans::{ScanEvents, ScanPhase};
 use crate::state::Shared;
 
 /// Must match the window label granted in capabilities/default.json.
@@ -23,6 +24,12 @@ const HISTORY_CHANGED_EVENT: &str = "history-changed";
 
 /// Must match the event name `onPreviewChanged` in api.ts listens for.
 const PREVIEW_CHANGED_EVENT: &str = "preview-changed";
+
+/// Must match the event name `onCleaningChanged` in api.ts listens for.
+const CLEANING_CHANGED_EVENT: &str = "cleaning-changed";
+
+/// Must match the event name `onScanChanged` in api.ts listens for.
+const SCAN_CHANGED_EVENT: &str = "scan-changed";
 
 /// Must match the event name `onUpdateStatus` in api.ts listens for.
 const UPDATE_STATUS_EVENT: &str = "update-status";
@@ -109,6 +116,45 @@ pub fn preview_changed<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         return Ok(());
     }
     app.emit_to(WINDOW_LABEL, PREVIEW_CHANGED_EVENT, ())
+}
+
+/// True while the Picard window exists, shown or not.
+pub fn is_open<R: Runtime>(app: &AppHandle<R>) -> bool {
+    app.get_webview_window(WINDOW_LABEL).is_some()
+}
+
+/// Tells the open window whether a cleanup is running, so the Clean tab can
+/// say so and hold its Clean button. Does nothing when no window is open.
+pub fn cleaning_changed<R: Runtime>(app: &AppHandle<R>, cleaning: bool) -> tauri::Result<()> {
+    if !is_open(app) {
+        return Ok(());
+    }
+    app.emit_to(WINDOW_LABEL, CLEANING_CHANGED_EVENT, cleaning)
+}
+
+/// Tells the open window where the preview scan is, so the Clean tab shows
+/// any scan, whoever started it. Does nothing when no window is open.
+pub fn scan_changed<R: Runtime>(app: &AppHandle<R>, phase: &ScanPhase) -> tauri::Result<()> {
+    if !is_open(app) {
+        return Ok(());
+    }
+    app.emit_to(WINDOW_LABEL, SCAN_CHANGED_EVENT, phase)
+}
+
+/// Sends the shared preview scan's events to the open window. A failed send
+/// only leaves the Clean tab out of date until its next read, so it is logged.
+impl<R: Runtime> ScanEvents for AppHandle<R> {
+    fn phase_changed(&self, phase: &ScanPhase) {
+        if let Err(e) = scan_changed(self, phase) {
+            log::warn!("could not tell the window about the scan: {e}");
+        }
+    }
+
+    fn previews_changed(&self) {
+        if let Err(e) = preview_changed(self) {
+            log::warn!("could not tell the window about the new scan: {e}");
+        }
+    }
 }
 
 /// Tells the open window how the update is going, so the About tab can follow

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_notification::{Action, ActionType, NotificationExt};
@@ -21,12 +21,13 @@ use tauri_plugin_notification::{Action, ActionType, NotificationExt};
 use crate::windows::{self, Tab};
 use tokio::sync::mpsc;
 
-use crate::commands::{self, VolumePreview};
+use crate::commands::VolumePreview;
 use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::env::ToolEnv;
 use crate::monitor::{self, DailyAction, States};
-use crate::runner::{self, CleanRequest, LockBusy, TaskScan, VolumeRun};
+use crate::preview_scans::{self, Scope};
+use crate::runner::{self, CleanRequest, LockBusy, VolumeRun};
 use crate::state::Shared;
 use crate::tray::{MenuView, Tray};
 use crate::updater;
@@ -364,6 +365,41 @@ pub struct Poller<R: Runtime> {
     last_view: Option<MenuView>,
 }
 
+/// Runs the shared preview scan of the volume mounted at `mount` on a
+/// blocking thread. `None` if it cannot run, fails or is cancelled; the reason
+/// is logged.
+async fn scan_one<R: Runtime>(
+    app: AppHandle<R>,
+    shared: Arc<Shared>,
+    config: Config,
+    mount: String,
+) -> Option<Vec<VolumePreview>> {
+    let Some(tools) = shared.tools() else {
+        log::warn!("preview scan of {mount} skipped: tool paths are not resolved");
+        return None;
+    };
+    let scope_mount = mount.clone();
+    let scanned = tauri::async_runtime::spawn_blocking(move || {
+        preview_scans::scan(&shared, &config, &tools, Scope::Volume(&scope_mount), &app)
+    })
+    .await;
+    match scanned {
+        Ok(Ok(Some(found))) => Some(found),
+        Ok(Ok(None)) => {
+            log::info!("preview scan of {mount} was cancelled");
+            None
+        }
+        Ok(Err(e)) => {
+            log::warn!("preview scan of {mount} failed: {e}");
+            None
+        }
+        Err(e) => {
+            log::warn!("preview scan task for {mount} failed: {e}");
+            None
+        }
+    }
+}
+
 impl<R: Runtime> Poller<R> {
     pub fn new(app: AppHandle<R>, tray: Tray<R>, shared: Arc<Shared>) -> Self {
         Self {
@@ -485,7 +521,7 @@ impl<R: Runtime> Poller<R> {
                 DailyAction::Skip => log::info!("daily scan: skipping {}", volume.name),
                 DailyAction::Offer => {
                     let name = volume.name.clone();
-                    let cleanable = self.estimate(&config, volume, space).await;
+                    let cleanable = self.estimate(&config, volume).await;
                     match monitor::daily_scan_message(&name, space, cleanable) {
                         Some((title, body)) => self.notify(&title, &body),
                         None => log::info!("daily scan: nothing to offer on {name}"),
@@ -637,7 +673,7 @@ impl<R: Runtime> Poller<R> {
             }
             let volume = found.readings.iter().find(|(v, _)| v.mount == alert.mount);
             let cleanable = match volume {
-                Some((v, space)) => self.estimate(&config, v.clone(), *space).await,
+                Some((v, _)) => self.estimate(&config, v.clone()).await,
                 None => None,
             };
             let (title, body) = alert.message(cleanable);
@@ -673,49 +709,19 @@ impl<R: Runtime> Poller<R> {
     }
 
     /// How much can be cleaned on `volume`, for an ask-mode notification.
-    /// The scan behind the number is stored for the Clean tab, which the
-    /// notification opens, so the tab can list what the number counted.
-    /// `None` if the scan cannot run yet or fails; the reason is logged.
-    async fn estimate(&self, config: &Config, volume: Volume, space: DiskSpace) -> Option<u64> {
-        let started = Utc::now();
-        let scans = self.preview_scan(config, volume.clone()).await?;
-        self.remember_preview(commands::preview_view(&volume, space, &scans, started));
-        Some(scans.iter().map(TaskScan::cleanable_bytes).sum())
-    }
-
-    /// Stores `preview` for the Clean tab and tells an open window about it.
-    fn remember_preview(&self, preview: VolumePreview) {
-        self.shared.record_preview(preview);
-        if let Err(e) = windows::preview_changed(&self.app) {
-            log::warn!("could not tell the window about the new scan: {e}");
-        }
-    }
-
-    /// A preview scan of `volume`. `None` if the scan cannot run yet or
-    /// fails; the reason is logged.
-    async fn preview_scan(&self, config: &Config, volume: Volume) -> Option<Vec<TaskScan>> {
-        let name = volume.name.clone();
-        let Some(tools) = self.shared.tools() else {
-            log::warn!("cleanup estimate for {name} skipped: tool paths are not resolved");
-            return None;
-        };
-        let config = config.clone();
-        let sizes = Arc::clone(&self.shared.sizes);
-        let scanned = tauri::async_runtime::spawn_blocking(move || {
-            runner::preview_volume(&config, &volume, &sizes, &tools)
-        })
-        .await;
-        match scanned {
-            Ok(Ok(scans)) => Some(scans),
-            Ok(Err(e)) => {
-                log::warn!("cleanup estimate for {name} failed: {e:#}");
-                None
-            }
-            Err(e) => {
-                log::warn!("cleanup estimate task for {name} failed: {e}");
-                None
-            }
-        }
+    /// The scan behind the number is the shared preview scan, so it is stored
+    /// for the Clean tab, which the notification opens, and an open tab shows
+    /// it running. `None` if the scan cannot run, fails or is cancelled.
+    async fn estimate(&self, config: &Config, volume: Volume) -> Option<u64> {
+        let mount = volume.mount.display().to_string();
+        let found = scan_one(
+            self.app.clone(),
+            Arc::clone(&self.shared),
+            config.clone(),
+            mount,
+        )
+        .await?;
+        found.first().map(|v| v.total_bytes)
     }
 
     /// Runs the cleanup tasks on one volume and reports the result.
@@ -733,6 +739,7 @@ impl<R: Runtime> Poller<R> {
             return Cleaned::NothingRemoved;
         };
         let _cleaning = self.shared.start_cleaning(&self.app);
+        let rescan_config = config.clone();
         let config = config.clone();
         let sizes = Arc::clone(&self.shared.sizes);
         let paths = self.shared.paths.clone();
@@ -785,6 +792,17 @@ impl<R: Runtime> Poller<R> {
             self.shared.mark_cleaned(&mount);
             if let Err(e) = windows::preview_changed(&self.app) {
                 log::warn!("could not tell the window about the clean: {e}");
+            }
+            // An open Clean tab gets a fresh list, not only a note that its
+            // list is out of date. The scan waits for this clean to end, and
+            // runs apart from the loop so the next check is not held up.
+            if windows::is_open(&self.app) {
+                tauri::async_runtime::spawn(scan_one(
+                    self.app.clone(),
+                    Arc::clone(&self.shared),
+                    rescan_config,
+                    mount,
+                ));
             }
             Cleaned::Removed
         } else {

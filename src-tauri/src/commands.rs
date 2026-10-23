@@ -19,6 +19,7 @@ use crate::config::{self, Appearance, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::history::{self, Entry, Totals};
 use crate::poll;
+use crate::preview_scans::{self, ScanPhase, Scope};
 use crate::runner::{self, CleanRequest, TaskScan, VolumeRun};
 use crate::settings::{self, Settings};
 use crate::state::Shared;
@@ -30,7 +31,6 @@ use crate::windows;
 type SharedState<'a> = State<'a, Arc<Shared>>;
 
 const STILL_STARTING: &str = "Picard is still starting up. Try again in a moment.";
-const CLEAN_RUNNING: &str = "A clean is running. Rescan when it finishes.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VolumeStatus {
@@ -49,6 +49,8 @@ pub struct Status {
     pub volumes: Vec<VolumeStatus>,
     /// "Projects: not mounted", one per unavailable root.
     pub unavailable: Vec<String>,
+    /// A cleanup is running, from this window or in the background.
+    pub cleaning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -140,7 +142,12 @@ pub async fn get_status(state: SharedState<'_>) -> Result<Status, String> {
     blocking(move || {
         let config = load_config(&shared)?;
         let found = poll::scan(&config.roots, &shared.uuids);
-        Ok(status_view(&config, &found.readings, &found.unavailable))
+        Ok(status_view(
+            &config,
+            &found.readings,
+            &found.unavailable,
+            shared.is_cleaning(),
+        ))
     })
     .await
 }
@@ -264,37 +271,35 @@ fn protection_view(ignore: &IgnoreList, paths: &[String]) -> Vec<Option<&'static
         .collect()
 }
 
-/// A preview during a clean repeats the clean's work and lists folders it may
-/// be about to delete, so it is refused. The check is advisory: a clean that
-/// starts a moment later still re-checks every folder before removing it.
-fn refuse_while_cleaning(cleaning: bool) -> Result<(), String> {
-    if cleaning {
-        Err(CLEAN_RUNNING.to_string())
-    } else {
-        Ok(())
-    }
-}
-
+/// Scans every volume through the shared preview scan, waiting first for any
+/// running clean to end. `None` if the scan was cancelled; the page then keeps
+/// the list it had. See `preview_scans`.
 #[tauri::command]
-pub async fn preview(state: SharedState<'_>) -> Result<Vec<VolumePreview>, String> {
+pub async fn preview<R: Runtime>(
+    app: AppHandle<R>,
+    state: SharedState<'_>,
+) -> Result<Option<Vec<VolumePreview>>, String> {
     let shared = Arc::clone(&state);
     blocking(move || {
-        refuse_while_cleaning(shared.is_cleaning())?;
         let config = load_config(&shared)?;
         let tools = shared.tools().ok_or(STILL_STARTING)?;
-        log::info!("preview scan started");
-        let started = Utc::now();
-        let found = poll::scan(&config.roots, &shared.uuids);
-        let mut out = Vec::new();
-        for (volume, space) in &found.readings {
-            let scans = runner::preview_volume(&config, volume, &shared.sizes, &tools)
-                .map_err(|e| format!("{}: {e:#}", volume.name))?;
-            out.push(preview_view(volume, *space, &scans, started));
-        }
-        shared.replace_previews(out.clone());
-        Ok(out)
+        preview_scans::scan(&shared, &config, &tools, Scope::Every, &app)
     })
     .await
+}
+
+/// Where the shared preview scan is, so a window that opens mid-scan shows it.
+#[tauri::command]
+pub fn get_scan_state(state: SharedState<'_>) -> ScanPhase {
+    state.scans.phase()
+}
+
+/// Cancels the running preview scan, whoever started it, and any waiting
+/// their turn. Harmless when none runs.
+#[tauri::command]
+pub fn cancel_scan(state: SharedState<'_>) {
+    log::info!("preview scan cancel asked for");
+    state.scans.cancel();
 }
 
 /// The latest scan of each volume, from a Scan in the Clean tab or from the
@@ -460,6 +465,7 @@ fn status_view(
     config: &Config,
     readings: &[(Volume, DiskSpace)],
     unavailable: &[crate::volume::UnavailableRoot],
+    cleaning: bool,
 ) -> Status {
     Status {
         mode: config.mode,
@@ -480,6 +486,7 @@ fn status_view(
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect(),
+        cleaning,
     }
 }
 
@@ -585,12 +592,6 @@ mod tests {
         assert_eq!(names, config::default_activity_ignore());
         assert!(names.contains(&"AGENTS.md".to_string()));
         assert!(names.contains(&".claude".to_string()));
-    }
-
-    #[test]
-    fn preview_is_refused_only_while_a_clean_runs() {
-        assert_eq!(refuse_while_cleaning(true), Err(CLEAN_RUNNING.to_string()));
-        assert_eq!(refuse_while_cleaning(false), Ok(()));
     }
 
     fn volume() -> Volume {
@@ -731,11 +732,17 @@ mod tests {
             name: "Projects".into(),
             reason: "not mounted".into(),
         };
-        let status = status_view(&config, &[(volume(), SPACE)], &[un("/V/P/a"), un("/V/P/b")]);
+        let status = status_view(
+            &config,
+            &[(volume(), SPACE)],
+            &[un("/V/P/a"), un("/V/P/b")],
+            true,
+        );
         assert!(status.volumes[0].low);
         assert_eq!(status.volumes[0].free_bytes, SPACE.free_bytes);
         assert_eq!(status.volumes[0].total_bytes, SPACE.total_bytes);
         assert_eq!(status.unavailable, vec!["Projects: not mounted"]);
         assert_eq!(status.mode, Mode::Ask);
+        assert!(status.cleaning);
     }
 }

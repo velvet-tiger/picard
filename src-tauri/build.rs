@@ -8,6 +8,8 @@ const COMMANDS: &[&str] = &[
     "save_settings",
     "preview",
     "get_last_preview",
+    "get_scan_state",
+    "cancel_scan",
     "run_selected",
     "get_history",
     "get_totals",

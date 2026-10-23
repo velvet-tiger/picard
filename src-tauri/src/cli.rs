@@ -131,7 +131,7 @@ fn scan(config: &Config, env: &ToolEnv) -> i32 {
     let sizes = SizeCache::default();
     let mut code = 0;
     for (volume, space) in mounted_volumes(config) {
-        match runner::preview_volume(config, &volume, &sizes, env) {
+        match runner::preview_volume(config, &volume, &sizes, env, &|| false) {
             Ok(scans) => print!("{}", format_scan(&volume.name, space, &scans)),
             Err(e) => {
                 eprintln!("picard: {}: {e:#}", volume.name);

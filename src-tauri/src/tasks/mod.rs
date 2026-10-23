@@ -181,6 +181,13 @@ pub const NOT_ACTIVITY: &[&str] = &[
     "opencode.json",
 ];
 
+/// Asked during a scan; true once the scan should give up, for example
+/// because the user pressed Cancel. Cheap, so walks call it on every entry.
+pub type Stop<'a> = &'a (dyn Fn() -> bool + Sync);
+
+/// The `Stop` of a run, or of a scan nobody can cancel.
+const NEVER_STOP: Stop<'static> = &|| false;
+
 /// What a task may touch on one volume.
 pub struct Ctx<'a> {
     /// Canonical roots on this volume. Roots that cannot be resolved are left out.
@@ -201,6 +208,8 @@ pub struct Ctx<'a> {
     /// removal. Not part of `check_target`, because scans must still list them.
     /// Behind a lock so a run can refresh it between tasks.
     keep: RwLock<IgnoreList>,
+    /// See `Stop`. Scans check it; removals never do, so a run is never cut short.
+    stop: Stop<'a>,
 }
 
 impl<'a> Ctx<'a> {
@@ -230,7 +239,26 @@ impl<'a> Ctx<'a> {
             sizes,
             not_activity: NOT_ACTIVITY.iter().map(|n| n.to_string()).collect(),
             keep: RwLock::default(),
+            stop: NEVER_STOP,
         }
+    }
+
+    /// Lets the scan give up early once `stop` returns true. A stopped scan
+    /// returns what it found so far; the caller throws that away.
+    pub fn with_stop(mut self, stop: Stop<'a>) -> Self {
+        self.stop = stop;
+        self
+    }
+
+    /// True once the scan should give up. See `with_stop`.
+    pub fn stopped(&self) -> bool {
+        (self.stop)()
+    }
+
+    /// Sizes of `dirs`, in order, from `sizes`. A size left unfinished
+    /// because the scan stopped reads as zero.
+    pub fn measure_all(&self, dirs: &[PathBuf]) -> Vec<u64> {
+        self.sizes.measure_all(dirs, self.stop)
     }
 
     /// Uses the config's `activity_ignore` list in place of the defaults. The

@@ -7,6 +7,7 @@ mod env;
 mod history;
 mod monitor;
 mod poll;
+mod preview_scans;
 mod proc;
 mod runner;
 mod settings;
@@ -50,6 +51,8 @@ pub fn run() {
             commands::save_settings,
             commands::preview,
             commands::get_last_preview,
+            commands::get_scan_state,
+            commands::cancel_scan,
             commands::run_selected,
             commands::get_history,
             commands::get_totals,

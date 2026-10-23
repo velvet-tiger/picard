@@ -9,6 +9,10 @@
     getStatus,
     setIgnored,
     getProtection,
+    getScanState,
+    cancelScan,
+    onScanChanged,
+    onCleaningChanged,
     notifyIgnoreChanged,
     onIgnoreChanged,
     onHistoryChanged,
@@ -27,6 +31,7 @@
     type Totals,
     type Status,
     type VolumeStatus,
+    type ScanPhase,
   } from './api'
 
   let volumes = $state<VolumePreview[]>([])
@@ -35,23 +40,50 @@
   let history = $state<HistoryEntry[]>([])
   let totals = $state<Totals | null>(null)
   let status = $state<Status | null>(null)
-  let scanning = $state(false)
+  // The page's own Scan, from the click until its reply, and when it was clicked.
+  let asked = $state(false)
+  let askedAt = $state(0)
+  // The shared scan as the backend reports it, whoever started it: a click
+  // here, a notification's estimate, or the rescan after a background clean.
+  // The page shows them all the same way.
+  let phase = $state<ScanPhase>({ state: 'idle' })
+  const scanning = $derived(asked || phase.state !== 'idle')
+  const waitingForClean = $derived(phase.state === 'waiting_for_clean')
+  /** When the shown phase began, in ms since the epoch. */
+  const scanSince = $derived(
+    phase.state === 'idle' ? askedAt : Date.parse(phase.since) || askedAt,
+  )
+  // Set while the page follows a scan it did not start, so the result is
+  // shown when it ends, as the page's own would be.
+  let following = false
   // A scan can take half a minute, so the page does not start one itself. It
   // shows the latest stored scan, such as the one behind a notification, or
   // waits for a click.
   let scanned = $state(false)
   let elapsed = $state(0)
 
-  // Counts seconds while a scan runs. The scan reports no progress of its own,
-  // so elapsed time is the honest thing to show.
+  // Counts seconds while a scan runs or waits. The scan reports no progress of
+  // its own, so elapsed time is the honest thing to show. It counts from when
+  // the backend started, so a window opened mid-scan shows the real time.
   $effect(() => {
     if (!scanning) return
-    elapsed = 0
-    const started = Date.now()
-    const timer = setInterval(() => (elapsed = Math.floor((Date.now() - started) / 1000)), 250)
+    const since = scanSince
+    const tick = () => (elapsed = Math.max(0, Math.floor((Date.now() - since) / 1000)))
+    tick()
+    const timer = setInterval(tick, 250)
     return () => clearInterval(timer)
   })
   let cleaning = $state(false)
+  // A cleanup running anywhere, this window's included, as last reported.
+  let cleaningAnywhere = $state(false)
+  // Counts `cleaning-changed` events, so a status read that was in flight
+  // when one arrived does not overwrite it with an older answer.
+  let cleaningEvents = 0
+
+  function cleaningChanged(now: boolean) {
+    cleaningEvents++
+    cleaningAnywhere = now
+  }
   let error = $state<string | null>(null)
   let results = $state<RunResult[] | null>(null)
 
@@ -133,17 +165,71 @@
   }
 
   async function scan() {
-    scanning = true
+    asked = true
+    askedAt = Date.now()
     error = null
     try {
-      show(await preview())
+      // Null means the scan was cancelled; the list stays as it was.
+      const found = await preview()
+      if (found) show(found)
     } catch (e) {
       error = errorText(e)
     } finally {
-      scanning = false
+      asked = false
     }
     reloadRecords()
     afterBusy()
+  }
+
+  /** Cancels the running scan, whoever started it. */
+  async function cancel() {
+    try {
+      await cancelScan()
+    } catch (e) {
+      error = errorText(e)
+    }
+  }
+
+  /**
+   * Follows the shared scan. One the page did not start is shown when it
+   * ends, as if the page had started it.
+   */
+  function phaseChanged(next: ScanPhase) {
+    phase = next
+    if (next.state !== 'idle') {
+      if (!asked) following = true
+      return
+    }
+    if (following && !asked) {
+      following = false
+      showFollowed()
+    } else {
+      afterBusy()
+    }
+  }
+
+  /**
+   * Shows what a followed scan stored. A cancelled or failed scan stores
+   * nothing newer, so the page keeps its list and only checks the store as usual.
+   */
+  async function showFollowed() {
+    storedPending = false
+    let found: VolumePreview[]
+    try {
+      found = await getLastPreview()
+    } catch (e) {
+      console.error('last preview', e)
+      return
+    }
+    if (busy()) {
+      storedPending = true
+      return
+    }
+    if (found.length > 0 && (!scanned || newest(found) > newest(volumes))) {
+      await showStored(found)
+    } else {
+      loadStored()
+    }
   }
 
   /** The newest scan time in `list`, in ms since the epoch; 0 for an empty list or a bad time. */
@@ -277,7 +363,9 @@
 
   async function loadStatus() {
     try {
+      const seen = cleaningEvents
       status = await getStatus()
+      if (seen === cleaningEvents) cleaningAnywhere = status.cleaning
     } catch (e) {
       // The disk tiles are a convenience; hide them rather than show stale numbers.
       status = null
@@ -425,6 +513,20 @@
     }
   })
 
+  $effect(() => {
+    const unlisten = onScanChanged(phaseChanged)
+    return () => {
+      unlisten.then((stop) => stop())
+    }
+  })
+
+  $effect(() => {
+    const unlisten = onCleaningChanged(cleaningChanged)
+    return () => {
+      unlisten.then((stop) => stop())
+    }
+  })
+
   $effect(() =>
     onIgnoreChanged((change) => {
       if (change.source === 'clean') return
@@ -434,6 +536,12 @@
 
   reloadRecords()
   loadStored()
+  // A window opened mid-scan shows that scan, as if it had started it.
+  getScanState()
+    .then((now) => {
+      if (phase.state === 'idle' && now.state !== 'idle') phaseChanged(now)
+    })
+    .catch((e) => console.error('scan state', e))
 </script>
 
 <main>
@@ -487,6 +595,12 @@
     <p class="error">{error}</p>
   {/if}
 
+  {#if cleaningAnywhere && !cleaning}
+    <p class="muted" role="status">
+      Picard is cleaning in the background. You can clean again when it finishes.
+    </p>
+  {/if}
+
   {#if stale?.kind === 'newer'}
     {@const found = stale.found}
     <p class="panel stale" role="status">
@@ -524,12 +638,20 @@
     <div class="panel scanning" role="status" aria-live="polite">
       <div class="row">
         <span class="spinner" aria-hidden="true"></span>
-        <strong>Scanning your folders…</strong>
+        <strong>
+          {waitingForClean ? 'Waiting for Picard to finish cleaning…' : 'Scanning your folders…'}
+        </strong>
         <span class="muted elapsed">{elapsed} s</span>
+        <span class="spacer"></span>
+        <button onclick={cancel}>Cancel scan</button>
       </div>
       <div class="bar" aria-hidden="true"><span></span></div>
       <p class="muted hint">
-        Measuring build folders and checking worktrees. Large folders can take half a minute.
+        {#if waitingForClean}
+          The scan starts when the clean ends, so it never lists folders being removed.
+        {:else}
+          Measuring build folders and checking worktrees. Large folders can take half a minute.
+        {/if}
       </p>
       {#each [72, 58, 66] as width}
         <div class="skeleton" aria-hidden="true">
@@ -654,7 +776,11 @@
       <button
         class="primary"
         onclick={clean}
-        disabled={cleaning || busyToggling || checkingStored || selectedCount === 0}
+        disabled={cleaning ||
+          cleaningAnywhere ||
+          busyToggling ||
+          checkingStored ||
+          selectedCount === 0}
       >
         {cleaning ? 'Cleaning…' : 'Clean selected'}
       </button>
