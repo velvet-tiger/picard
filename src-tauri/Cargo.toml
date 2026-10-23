@@ -35,7 +35,8 @@ toml_edit = "0.25.17"
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
 # Picard is macOS-only. The default `zip` feature only adds Windows zip and
-# Linux tar.gz unpacking, and pulls in zip 4.x (RUSTSEC-2026-0367/0368/0369).
+# Linux AppImage tar.gz unpacking, and pulls in zip 4.x
+# (RUSTSEC-2026-0367/0368/0369). The macOS path keeps tar and flate2 regardless.
 tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
 
 [dev-dependencies]
