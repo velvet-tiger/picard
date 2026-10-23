@@ -10,7 +10,7 @@ Picard only works inside the folders you list as **roots**, such as `~/working`.
 
 | Task | Removes | Only when |
 |---|---|---|
-| `git_worktrees` | Linked git worktrees | Clean, not locked, and not in use by any running process. Done ones go after `min_idle_minutes`: another local branch holds their HEAD, or holds cherry-picked copies of all their commits. Ones whose commits are only pushed go after `stale_days`. |
+| `git_worktrees` | Linked git worktrees | Clean, not locked, not in use by any running process, and with no rebase, merge or bisect paused in them. Done ones go after `min_idle_minutes`: another local branch holds their HEAD, or other local branches hold a cherry-picked copy of each commit that no other branch holds. The copies can be spread over several branches. Ones whose commits are only pushed go after `stale_days`. |
 | `node_modules` | `node_modules` next to a `package.json` | The project has not changed for `stale_days`. |
 | `cargo_clean` | `target/` next to a `Cargo.toml` | The project has not changed for `stale_days`, or every project with `mode = "all"`. |
 | `python_venv` | `.venv` or `venv` holding a `pyvenv.cfg`, next to a `pyproject.toml`, `requirements.txt`, `setup.py`, `setup.cfg` or `Pipfile` | The project has not changed for `stale_days`. |
@@ -23,18 +23,30 @@ These rules always hold:
 - Nothing outside your roots is removed, and symlinks are never followed out of them. Tool caches are the exception: Picard never deletes them itself. It asks each tool to prune its own cache.
 - Git branches are never deleted. Worktrees are removed with `git worktree remove`. A worktree with checked-out submodules needs `--force`, so Picard first checks each submodule itself: it must be clean, and every commit in it must be on a remote branch.
 - A worktree with uncommitted or untracked changes is never removed. Neither is one that holds another git checkout, such as a Claude Code worktree in `.claude/worktrees/`.
-- Every item is checked again just before it is removed.
+- A worktree with a paused rebase, merge, cherry-pick, revert or bisect is never removed. Removing it would delete that operation's state.
+- A copied repo, made with `cp -R` or Finder's Duplicate, still lists the original repo's worktrees. Picard judges a worktree only through the repo it belongs to, and only by the HEAD it has now.
+- Every item is checked again just before it is removed. A worktree is judged again from scratch, with its repo's branches read afresh.
 - A folder you ignore is never removed, in any mode. Neither is a folder that holds one, such as a worktree with an ignored `node_modules` inside it.
 - Every removal is logged to `history.jsonl`.
 - Only one cleanup runs at a time.
 
 A project "has not changed" when no file in it has a newer modification time. Build output does not count. Neither does agent config that tools such as Automatic rewrite on every sync: `.agents`, `.automatic`, `.automatic.json`, `.claude`, `.codex`, `.cursor`, `.gemini`, `.junie`, `.mcp.json`, `.opencode`, `.windsurf`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` and `opencode.json`. Edits you make to those by hand do not count either. Git checkouts inside them, such as `.claude/worktrees/*`, still count. Those are the defaults. Change the list in **Settings…** under "Changes that don't count as work", or set `activity_ignore` in the config. A list you set replaces the defaults, so it must name every default you want to keep. An empty list makes every change count. **Restore defaults** puts the default list back. When you save a list that holds exactly the defaults, Picard takes the key out of the config, with any comment above it, so later releases can update the defaults. This happens on any save from **Settings…**.
 
-A worktree is done when another local branch holds its HEAD. Any branch counts except the worktree's own, even one checked out in another worktree. Remote-tracking branches do not count. A worktree is also done when other local branches hold a cherry-picked copy of every commit that no other branch holds. Git's patch ids decide what is a copy, as when `git rebase` drops commits that are already upstream. They ignore whitespace, and an empty commit matches any other empty commit. They skip merge commits, so a merge among those commits keeps the worktree. Picard needs no default branch. A repo that integrates into `develop`, `2.0-dev` or `trunk` works without any setting.
+A worktree is done when another local branch holds its HEAD. Any branch counts except the worktree's own, even one checked out in another worktree. Remote-tracking branches do not count. Neither does a symbolic ref under `refs/heads`, because it is only another name for some other ref. Picard needs no default branch. A repo that integrates into `develop`, `2.0-dev` or `trunk` works without any setting.
+
+A worktree is also done when other local branches hold a cherry-picked copy of each commit that no other branch holds. Commits that another branch already holds are not checked. The copies can be spread over several branches. Git's patch ids decide what is a copy, as when `git rebase` drops commits that are already upstream. Patch ids have limits:
+
+- Only the change is compared. Commit messages, authors and dates are not.
+- Whitespace is ignored everywhere, including indentation and the inside of string literals. An empty commit matches any other empty commit.
+- A binary file that `.gitattributes` marks as text is compared as text.
+- A merge commit has no patch id, so a merge among those commits fails this check.
+- One copy matches every commit that makes the same change, such as a change made, reverted and made again. Two such commits fail this check.
+
+A failed check only means the worktree is not done this way. A worktree whose branch is pushed still goes after `stale_days`. The same holds when git cannot run the check, for example in a partial clone that lacks some files' contents.
 
 The **Clean…** list says why a worktree is done. When git recorded a merge, it names it, for example "merged into 2.0-dev by 374877e". Otherwise it names the branch, as in "on main", or says "cherry-picked to another branch". A worktree whose commits are only pushed waits for `stale_days`. Any other worktree is kept. A squash merge of several commits is not a copy of any of them, so that worktree waits for `stale_days` if it was pushed, and is kept if not.
 
-A branch that holds the commits does not prove the work is finished. A branch stacked on top of the worktree's branch counts. So does a branch that merged it in only to sync. For example, if feature branch B merges in unfinished work from feature branch A, A's worktree is done. A worktree's own branch is kept, so no commit is lost. A detached worktree has no branch, so only the copies of its cherry-picked commits remain. Ignored files in the worktree, such as a local `.env`, are lost. In **Ask** mode you can untick or **Ignore** it.
+A branch that holds the commits does not prove the work is finished. A branch stacked on top of the worktree's branch counts. So does a branch that merged it in only to sync. For example, if feature branch B merges in unfinished work from feature branch A, A's worktree is done. A worktree's own branch is kept, so no commit is lost. A detached worktree has no branch. Once it is removed, its own commits are unreachable, and the next `git gc` can delete them. Only the copies remain. Picard logs the HEAD of each detached worktree it removes, so `git fsck --lost-found` can find that commit until then. Ignored files in the worktree, such as a local `.env`, are lost. In **Ask** mode you can untick or **Ignore** it.
 
 One thing to know: removing a worktree also deletes files git ignores inside it, such as a local `.env`. Git's own `git worktree remove` behaves the same way. The same goes for `build_output`: it trusts your `.gitignore`. If you keep files you cannot rebuild in an ignored `build` folder, add that folder to `exclude`. Picard keeps a worktree that holds another checkout by finding its `.git`. A checkout made with `--separate-git-dir`, or one whose git folder lives elsewhere, has no `.git` inside the worktree, so exclude it yourself.
 

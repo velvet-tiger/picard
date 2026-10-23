@@ -6,12 +6,25 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- When Picard removes a worktree with a detached HEAD, it logs that commit's id. No branch holds the commit, so `git gc` can delete it later. Until then, `git fsck --lost-found` can find it.
+
 ### Changed
 
-- A worktree is done when another local branch holds its HEAD, even with no record of a merge. It is cleaned after `min_idle_minutes`, and the reason names the branch, for example "on main". It used to wait for `stale_days`.
-- A worktree is also done when other local branches hold cherry-picked copies of all its commits, and none of them is a merge commit. The reason says "cherry-picked to another branch". A detached worktree whose commit was cherry-picked into `main` used to be kept forever.
-- Picard no longer looks for a default branch. A repo with neither `main` nor `master`, such as one whose only branch is `trunk`, used to be skipped. Its worktrees are now checked.
+- A worktree is done when another local branch holds its HEAD, even with no record of a merge. It is cleaned after `min_idle_minutes`, and the reason names the branch, for example "on dev". When that branch was not the default branch and git had no record of a merge, the worktree used to wait for `stale_days`. Symbolic refs under `refs/heads` do not count as branches.
+- A worktree is also done when other local branches hold a cherry-picked copy of each commit that no other branch holds. The copies can be spread over several branches. The reason says "cherry-picked to another branch". A merge commit among those commits fails this check. So do two commits that make the same change, such as a change made, reverted and made again. A detached worktree whose commit was cherry-picked into `main` used to be kept forever.
+- When git cannot run the cherry-pick check, for example in a partial clone that lacks some files' contents, Picard logs a warning. A pushed worktree then still goes after `stale_days`.
+- Picard no longer looks for a default branch. A repo used to be skipped when `origin/HEAD` named no local branch and the repo had neither `main` nor `master`, such as a repo whose only branch is `trunk`. Its worktrees are now checked.
 - A worktree whose HEAD is in `main` used to show "merged into main". It now names the merge when git recorded one, as in "merged into main (reflog)", and shows "on main" otherwise.
+
+### Fixed
+
+- A worktree with a paused rebase, merge, cherry-pick, revert or bisect is never removed. Removing it would delete that operation's state.
+- A copied repo, made with `cp -R` or Finder's Duplicate, still lists the original repo's worktrees, with the HEAD each had when copied. Picard judged those worktrees by that old HEAD and could remove one that held newer work. It now judges a worktree only through its own repo, by the HEAD it has now.
+- Picard tells git not to read commit-graph files. A forged commit-graph could make a commit look as if a branch held it.
+- Every worktree is judged again just before it is removed, with its repo's branches read afresh. A worktree that is no longer done, or whose commits are no longer anywhere else, is kept.
+- A branch deleted while Picard reads a repo is now an error. Git used to read its name as a path when a file of that name existed.
 
 ## [0.6.0] - 2026-10-23
 

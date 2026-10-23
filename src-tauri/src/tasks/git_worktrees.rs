@@ -4,6 +4,10 @@
 //! - it is a linked worktree (not the main one), not locked, not prunable
 //! - it sits inside a root on this volume and is not excluded (`check_target`)
 //! - no running process is working inside it (`lsof`)
+//! - it points back at the repo that lists it, and its HEAD is the one that
+//!   repo lists. A copied repo, made with `cp -R` or Finder's Duplicate, still
+//!   lists the original's worktrees, with the HEAD each had when copied.
+//! - no rebase, merge, cherry-pick, revert or bisect is paused in it
 //! - `git status --porcelain` is empty, so nothing uncommitted or untracked
 //! - any checked-out submodule is clean and holds no commit missing from its
 //!   remote branches (`GitCmd::unsafe_to_inspect`)
@@ -13,22 +17,35 @@
 //!
 //! A worktree is done when another local branch holds its HEAD. Any branch in
 //! `refs/heads` counts except the worktree's own, even one checked out in
-//! another linked worktree. Remote-tracking branches never count. No default
+//! another linked worktree. A symbolic ref there is only another name for a
+//! ref, so it never counts. Neither do remote-tracking branches. No default
 //! branch is needed, so a repo whose only branch is `trunk` is checked too.
 //!
 //! A worktree is also done when no other branch holds HEAD, but other local
-//! branches hold a cherry-picked copy of every commit no other branch holds.
-//! Git's patch ids decide what is a copy, as they do when `git rebase` drops
-//! commits that are already upstream. They ignore whitespace, and an empty
-//! commit matches any other empty commit. They skip merge commits, so a merge
-//! among those commits keeps the worktree: it could hold a conflict
-//! resolution that no copy has.
+//! branches hold a cherry-picked copy of each commit that no other branch
+//! holds. The copies can be spread over several branches. Git's patch ids
+//! decide what is a copy, as they do when `git rebase` drops commits that are
+//! already upstream. They have limits:
+//! - Only the change is compared. Commit messages, authors and dates are not.
+//! - Whitespace is ignored everywhere, including indentation and string
+//!   literals. An empty commit matches any other empty commit.
+//! - A binary file that `.gitattributes` marks as text is compared as text.
+//! - A merge commit has no patch id. A merge among the commits fails this
+//!   rule, because it could hold a conflict resolution that no copy has.
+//! - One copy matches every commit that makes the same change, such as a
+//!   change made, reverted and made again. Two such commits fail this rule.
+//!
+//! A failed match only fails this rule. A pushed branch still waits for
+//! `stale_days`. An error here, such as a blob missing from a partial clone,
+//! counts as no match, and the pushed check still runs.
 //!
 //! A branch holding the commits shows they survive, not that the work was
 //! finished. A branch stacked on top of the worktree's branch counts, and so
 //! does a branch that merged it in only to sync. The worktree's own branch is
-//! kept, so no commit is lost. A detached worktree has no branch, so only the
-//! copies of its cherry-picked commits remain. Ignored files in the worktree
+//! kept, so no commit is lost. A detached worktree has no branch. Once it is
+//! removed, its own commits are unreachable, and the next `git gc` can delete
+//! them. Picard logs the HEAD of each detached worktree it removes, so `git
+//! fsck --lost-found` can find it before then. Ignored files in the worktree
 //! are lost either way.
 //!
 //! The candidate reason says why a worktree is done. When a merge commit, or a
@@ -37,17 +54,20 @@
 //! (reflog)". Otherwise it names the branch, as in "on main", or says
 //! "cherry-picked to another branch". Only the wording depends on this.
 //!
+//! Each candidate is judged again just before removal, with the repo's
+//! worktrees and branches read afresh. One found done must still be done.
+//!
 //! Removal is `git worktree remove` without `--force`, so git refuses anything
 //! dirty or locked as a second guard. The exception is a worktree with
 //! checked-out submodules, which git removes only with `--force`. One `--force`
 //! still refuses a locked worktree. Branches are never deleted.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use walkdir::WalkDir;
 
 use super::git::{GitCmd, SAFETY_STATUS, WorktreeEntry, parse_worktree_list};
@@ -66,10 +86,11 @@ pub type InUseSource = Arc<dyn Fn() -> Result<InUse> + Send + Sync>;
 /// Where a worktree's commits are, which decides whether and when it can go.
 #[derive(Debug, PartialEq)]
 enum Standing {
-    /// Another local branch holds its commits, as they are or as
-    /// cherry-picked copies. It can go once idle for `min_idle`. Holds the
-    /// start of the candidate reason, such as "on main".
-    Merged(String),
+    /// It is done: another local branch holds its HEAD, or holds a
+    /// cherry-picked copy of each commit that no other branch holds. It can
+    /// go once idle for `min_idle`. Holds the start of the candidate reason,
+    /// such as "on main".
+    Done(String),
     /// Only its upstream holds its commits. It can go once idle for
     /// `stale_days`.
     Elsewhere,
@@ -77,19 +98,40 @@ enum Standing {
     Unsafe,
 }
 
+/// Whether other local branches hold a copy of each commit that no other
+/// branch holds.
+#[derive(Debug, PartialEq)]
+enum Copies {
+    All,
+    /// They do not. Holds why, for the debug log.
+    Missing(String),
+}
+
 /// The candidate reason for a worktree whose commits were all cherry-picked.
 const CHERRY_PICKED: &str = "cherry-picked to another branch";
 
-/// The branches of one repo that every worktree in it is judged against.
-struct RepoBranches {
+/// Starts the reason of a worktree found only because it is stale. A done
+/// worktree's reason starts with how it is done, such as "on main", so the
+/// two kinds can be told apart when a candidate is judged again.
+const STALE_PREFIX: &str = "idle ";
+
+/// Lists refs with whether each is symbolic. Ref names cannot hold a tab.
+const REF_FORMAT: &str = "--format=%(refname)%09%(symref)";
+
+/// What every worktree of one repo is judged against.
+struct RepoState {
+    /// The repo's git common dir, canonical. A worktree whose own common dir
+    /// differs belongs to another repo.
+    common_dir: PathBuf,
     /// Every local branch, as a full ref name such as `refs/heads/main`.
+    /// Symbolic refs are left out.
     local: Vec<String>,
     /// The branch checked out in the main worktree, if any. It proves nothing
     /// about merges. It only goes first when a reason names a branch.
     main_checkout: Option<String>,
 }
 
-impl RepoBranches {
+impl RepoState {
     /// Every local branch but `own`, as full ref names. A full name can never
     /// be read as an option or as a commit id.
     fn others(&self, own: Option<&str>) -> Vec<&str> {
@@ -99,6 +141,11 @@ impl RepoBranches {
             .filter(|r| own.is_none_or(|b| r.strip_prefix("refs/heads/") != Some(b)))
             .collect()
     }
+}
+
+/// An error as one line, for a removal's failure reason.
+fn err_text(e: anyhow::Error) -> String {
+    format!("{e:#}")
 }
 
 pub struct GitWorktrees {
@@ -122,78 +169,131 @@ impl GitWorktrees {
     fn assess(
         &self,
         repo: &Path,
-        branches: &RepoBranches,
+        state: &RepoState,
         wt: &WorktreeEntry,
         ctx: &Ctx,
         in_use: &InUse,
     ) -> Result<Option<String>> {
-        if wt.locked || wt.prunable || wt.bare {
+        if !self.inspectable(state, wt, ctx, in_use)? {
             return Ok(None);
+        }
+        let standing = self.standing(repo, state, wt)?;
+        if standing == Standing::Unsafe {
+            log::debug!(
+                "worktree {}: kept: no other local branch holds its HEAD or a copy of each of its commits, and it has no fully pushed branch",
+                wt.path.display()
+            );
+            return Ok(None);
+        }
+        Ok(self.reason(&standing, wt, ctx))
+    }
+
+    /// True if nothing about the worktree itself rules it out, before its
+    /// commits are judged. Logs why it is ruled out.
+    fn inspectable(
+        &self,
+        state: &RepoState,
+        wt: &WorktreeEntry,
+        ctx: &Ctx,
+        in_use: &InUse,
+    ) -> Result<bool> {
+        if wt.locked || wt.prunable || wt.bare {
+            return Ok(false);
         }
         if let Err(why) = check_target(&wt.path, ctx) {
             log::debug!("worktree {}: {why}", wt.path.display());
-            return Ok(None);
+            return Ok(false);
         }
         if in_use.contains(&wt.path) {
             log::debug!(
                 "worktree {}: in use by a running process",
                 wt.path.display()
             );
-            return Ok(None);
+            return Ok(false);
+        }
+        if let Some(why) = self.identity_problem(state, wt)? {
+            log::warn!("worktree {}: skipped: {why}", wt.path.display());
+            return Ok(false);
+        }
+        if let Some(op) = self.git.operation_in_progress(&wt.path)? {
+            log::debug!("worktree {}: has {op} in progress", wt.path.display());
+            return Ok(false);
         }
         if let Some(why) = self.git.unsafe_to_inspect(&wt.path)? {
             log::warn!("worktree {}: skipped: {why}", wt.path.display());
-            return Ok(None);
+            return Ok(false);
         }
         if !self.git.output(&wt.path, SAFETY_STATUS)?.trim().is_empty() {
             log::debug!("worktree {}: has uncommitted changes", wt.path.display());
-            return Ok(None);
+            return Ok(false);
         }
-        let standing = self.standing(repo, branches, wt)?;
-        if standing == Standing::Unsafe {
-            log::debug!(
-                "worktree {}: has commits that no other local branch holds, even as cherry-picked copies, and that are not pushed",
-                wt.path.display()
-            );
-            return Ok(None);
-        }
-        let Some(newest) = newest_mtime(&wt.path, &ctx.not_activity) else {
-            return Ok(None);
-        };
-        let Ok(idle) = ctx.now.duration_since(newest) else {
-            return Ok(None);
-        };
+        Ok(true)
+    }
+
+    /// The candidate reason for a worktree with `standing`, or None while it
+    /// has not been idle long enough.
+    fn reason(&self, standing: &Standing, wt: &WorktreeEntry, ctx: &Ctx) -> Option<String> {
+        let newest = newest_mtime(&wt.path, &ctx.not_activity)?;
+        let idle = ctx.now.duration_since(newest).ok()?;
         let stale = Duration::from_secs(u64::from(self.stale_days) * SECS_PER_DAY);
-        if let Standing::Merged(how) = &standing
+        if let Standing::Done(how) = standing
             && idle >= self.min_idle
         {
-            return Ok(Some(format!("{how}, idle {}", format_idle(idle))));
+            return Some(format!("{how}, idle {}", format_idle(idle)));
         }
-        if idle >= stale {
-            return Ok(Some(format!("idle {}", format_idle(idle))));
+        (idle >= stale).then(|| format!("{STALE_PREFIX}{}", format_idle(idle)))
+    }
+
+    /// Why `wt` cannot be judged as a worktree of the repo `state` describes,
+    /// if it cannot. A copied repo lists the original's worktrees, each with
+    /// the HEAD it had when copied, and judging one by that HEAD could remove
+    /// newer work. Only the repo the worktree points back to counts, and only
+    /// the HEAD it has now.
+    fn identity_problem(&self, state: &RepoState, wt: &WorktreeEntry) -> Result<Option<String>> {
+        let raw = self.git.output(
+            &wt.path,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                "--verify",
+                "HEAD",
+            ],
+        )?;
+        let mut lines = raw.lines();
+        let (Some(common), Some(head), None) = (lines.next(), lines.next(), lines.next()) else {
+            anyhow::bail!(
+                "git rev-parse in {}: unexpected output {raw:?}",
+                wt.path.display()
+            );
+        };
+        let common = Path::new(common)
+            .canonicalize()
+            .with_context(|| format!("resolving git common dir {common}"))?;
+        if common != state.common_dir {
+            return Ok(Some(format!(
+                "belongs to the repo at {}, not the one that lists it",
+                common.display()
+            )));
+        }
+        if head != wt.head {
+            return Ok(Some(format!(
+                "HEAD is {head}, but its repo lists {}",
+                wt.head
+            )));
         }
         Ok(None)
     }
 
     /// Decides where a worktree's commits are. Reads only; runs no program a
     /// repo can configure.
-    fn standing(
-        &self,
-        repo: &Path,
-        branches: &RepoBranches,
-        wt: &WorktreeEntry,
-    ) -> Result<Standing> {
-        let others = self.other_branches_containing(repo, branches, wt)?;
+    fn standing(&self, repo: &Path, state: &RepoState, wt: &WorktreeEntry) -> Result<Standing> {
+        let others = self.other_branches_containing(repo, state, wt)?;
         if let Some(first) = others.first() {
-            // A recorded merge only changes the wording, never the timing.
-            let how = match self.merge_evidence(repo, &wt.head, &others)? {
-                Some(how) => how,
-                None => format!("on {first}"),
-            };
-            return Ok(Standing::Merged(how));
+            return Ok(Standing::Done(self.held_wording(repo, wt, &others, first)));
         }
-        if self.cherry_picked(repo, branches, wt)? {
-            return Ok(Standing::Merged(CHERRY_PICKED.to_string()));
+        if self.cherry_picked(repo, state, wt) {
+            return Ok(Standing::Done(CHERRY_PICKED.to_string()));
         }
         let pushed = match &wt.branch {
             Some(branch) => self.fully_pushed(repo, branch)?,
@@ -206,13 +306,37 @@ impl GitWorktrees {
         })
     }
 
+    /// The start of the reason for a worktree whose HEAD `others` hold. A
+    /// recorded merge only changes the wording, so a failure to read merge
+    /// records falls back to naming `first`.
+    fn held_wording(
+        &self,
+        repo: &Path,
+        wt: &WorktreeEntry,
+        others: &[String],
+        first: &str,
+    ) -> String {
+        match self.merge_evidence(repo, &wt.head, others) {
+            Ok(Some(how)) => how,
+            Ok(None) => format!("on {first}"),
+            Err(e) => {
+                log::warn!(
+                    "worktree {}: cannot read merge records, so the reason names the branch: {e:#}",
+                    wt.path.display()
+                );
+                format!("on {first}")
+            }
+        }
+    }
+
     /// Local branches that contain the worktree's HEAD, apart from its own.
-    /// The branch checked out in the main worktree comes first, then the rest
-    /// by name. The order only decides which branch a reason names.
+    /// Symbolic refs are left out. The branch checked out in the main worktree
+    /// comes first, then the rest by name. The order only decides which
+    /// branch a reason names.
     fn other_branches_containing(
         &self,
         repo: &Path,
-        branches: &RepoBranches,
+        state: &RepoState,
         wt: &WorktreeEntry,
     ) -> Result<Vec<String>> {
         let raw = self.git.output(
@@ -221,17 +345,17 @@ impl GitWorktrees {
                 "for-each-ref",
                 "--contains",
                 &wt.head,
-                "--format=%(refname)",
+                REF_FORMAT,
                 "refs/heads/",
             ],
         )?;
-        let mut others: Vec<String> = raw
-            .lines()
+        let mut others: Vec<String> = branch_refs(&raw)?
+            .into_iter()
             .filter_map(|r| r.strip_prefix("refs/heads/"))
             .filter(|b| wt.branch.as_deref() != Some(*b))
             .map(str::to_string)
             .collect();
-        if let Some(main) = &branches.main_checkout
+        if let Some(main) = &state.main_checkout
             && let Some(i) = others.iter().position(|b| b == main)
         {
             let b = others.remove(i);
@@ -270,6 +394,8 @@ impl GitWorktrees {
 
     /// A merge commit in `branches` that has `head` as a non-first parent.
     /// Refs are passed in full, so a branch name can never read as an option.
+    /// The closing `--` makes a ref that no longer exists an error, rather
+    /// than a path to limit the history to.
     fn merge_commit_of(
         &self,
         repo: &Path,
@@ -286,6 +412,7 @@ impl GitWorktrees {
             exclude.as_str(),
         ];
         args.extend(tips.iter().map(String::as_str));
+        args.push("--");
         let raw = self.git.output(repo, &args)?;
         Ok(raw.lines().find_map(|line| {
             let mut ids = line.split_whitespace();
@@ -315,6 +442,7 @@ impl GitWorktrees {
             "--format=%H%x09%gD%x09%gs",
         ];
         args.extend(refs.iter().map(String::as_str));
+        args.push("--");
         let raw = self.git.output(repo, &args)?;
         let merged: Vec<&str> = raw
             .lines()
@@ -326,43 +454,122 @@ impl GitWorktrees {
             .cloned())
     }
 
-    /// True if other local branches hold a cherry-picked copy of every commit
-    /// that no other branch holds, and none of those commits is a merge. Run
-    /// only when no other branch holds HEAD itself.
+    /// True if other local branches hold a copy of each commit that no other
+    /// branch holds. This rule only adds a way to be done, so an error counts
+    /// as no, and the pushed check still runs. Logs why not.
+    fn cherry_picked(&self, repo: &Path, state: &RepoState, wt: &WorktreeEntry) -> bool {
+        match self.copies(repo, state, wt) {
+            Ok(Copies::All) => true,
+            Ok(Copies::Missing(why)) => {
+                log::debug!("worktree {}: not cherry-picked: {why}", wt.path.display());
+                false
+            }
+            Err(e) => {
+                log::warn!(
+                    "worktree {}: cannot check for cherry-picked copies: {e:#}",
+                    wt.path.display()
+                );
+                false
+            }
+        }
+    }
+
+    /// Whether other local branches hold a cherry-picked copy of each commit
+    /// that no other branch holds. Run only when no other branch holds HEAD.
     ///
-    /// The first call lists those commits with their parents, which shows any
-    /// merge. The second marks each one that has a patch-equivalent copy on
-    /// the right of some `HEAD...branch`. A commit that some branch holds
-    /// drops out of the left side, so the marked set must equal the listed
-    /// one exactly. A ref name cannot contain `..`, so each range parses as
-    /// one. Computing patch ids runs no diff driver or textconv the repo names.
-    fn cherry_picked(
-        &self,
-        repo: &Path,
-        branches: &RepoBranches,
-        wt: &WorktreeEntry,
-    ) -> Result<bool> {
-        let others = branches.others(wt.branch.as_deref());
+    /// It lists those commits, and fails on a merge among them. It fails when
+    /// two of them make the same change, because git would match both to one
+    /// copy. Then it asks git which of them have a patch-equivalent copy on
+    /// another branch, and requires all of them. Computing patch ids runs no
+    /// external diff or textconv that the repo names.
+    fn copies(&self, repo: &Path, state: &RepoState, wt: &WorktreeEntry) -> Result<Copies> {
+        let others = state.others(wt.branch.as_deref());
         if others.is_empty() {
-            return Ok(false);
+            return Ok(Copies::Missing("there is no other local branch".into()));
         }
-        let mut args = vec!["rev-list", "--parents", wt.head.as_str(), "--not"];
-        args.extend(others.iter().copied());
-        let listed = self.git.output(repo, &args)?;
-        let Some(unique) = non_merge_commits(&listed) else {
-            return Ok(false);
+        let listed = self.unique_commits(repo, &wt.head, &others)?;
+        let ids = match non_merge_commits(&listed) {
+            Ok(ids) if ids.is_empty() => {
+                return Ok(Copies::Missing(
+                    "every commit it has is on another branch".into(),
+                ));
+            }
+            Ok(ids) => ids,
+            Err(merge) => return Ok(Copies::Missing(format!("commit {merge} is a merge"))),
         };
-        if unique.is_empty() {
-            return Ok(false);
+        if let Some(why) = self.repeated_change(repo, &ids)? {
+            return Ok(Copies::Missing(why));
         }
-        let ranges: Vec<String> = others
-            .iter()
-            .map(|r| format!("{}...{r}", wt.head))
-            .collect();
-        let mut args = vec!["rev-list", "--left-only", "--cherry-mark", "--no-merges"];
-        args.extend(ranges.iter().map(String::as_str));
-        let marked = self.git.output(repo, &args)?;
-        Ok(patch_equivalent(&marked) == unique)
+        let marked = self.copied_commits(repo, &wt.head, &others)?;
+        let copied = patch_equivalent(&marked);
+        if let Some(id) = ids.iter().find(|id| !copied.contains(*id)) {
+            return Ok(Copies::Missing(format!(
+                "commit {id} has no copy on another branch"
+            )));
+        }
+        if copied.len() != ids.len() {
+            return Ok(Copies::Missing(
+                "git marked commits it was not expected to list".into(),
+            ));
+        }
+        Ok(Copies::All)
+    }
+
+    /// `git rev-list --parents` for the commits `head` holds and none of
+    /// `others` do. Revisions go through stdin, so no number of branches can
+    /// overflow the command line, and git never reads one as a path: a ref
+    /// that no longer exists is an error.
+    fn unique_commits(&self, repo: &Path, head: &str, others: &[&str]) -> Result<String> {
+        let mut input = format!("{head}\n");
+        for r in others {
+            input.push_str(&format!("^{r}\n"));
+        }
+        self.git
+            .output_with_input(repo, &["rev-list", "--parents", "--stdin"], &input)
+    }
+
+    /// Why two of `ids` count as the same change, if any do. Git marks every
+    /// commit whose patch id matches a copy, so one copy would cover a change
+    /// made, reverted and made again, and the net change would be lost.
+    /// `diff-tree` makes the patches, with no external diff or textconv, and
+    /// `patch-id` hashes them as `--cherry-mark` does, ignoring whitespace.
+    fn repeated_change(&self, repo: &Path, ids: &[&str]) -> Result<Option<String>> {
+        let input: String = ids.iter().map(|id| format!("{id}\n")).collect();
+        let patches = self.git.output_with_input(
+            repo,
+            &[
+                "diff-tree",
+                "--stdin",
+                "-p",
+                "--root",
+                "--no-ext-diff",
+                "--no-textconv",
+            ],
+            &input,
+        )?;
+        let hashed = self
+            .git
+            .output_with_input(repo, &["patch-id", "--stable"], &patches)?;
+        Ok(repeated_patch(ids, &hashed))
+    }
+
+    /// `git rev-list --cherry-mark` output for the commits on the left of
+    /// `head...branch`, for each of `others`. A commit that some branch holds
+    /// drops out of the left side, so the left side is the commits no other
+    /// branch holds. Ref names cannot contain `..`, so each line is one range.
+    fn copied_commits(&self, repo: &Path, head: &str, others: &[&str]) -> Result<String> {
+        let input: String = others.iter().map(|r| format!("{head}...{r}\n")).collect();
+        self.git.output_with_input(
+            repo,
+            &[
+                "rev-list",
+                "--left-only",
+                "--cherry-mark",
+                "--no-merges",
+                "--stdin",
+            ],
+            &input,
+        )
     }
 
     /// True if `branch` has an upstream and nothing on it is unpushed.
@@ -389,36 +596,57 @@ impl GitWorktrees {
                 "rev-list",
                 "--count",
                 &format!("{upstream}..refs/heads/{branch}"),
+                "--",
             ],
         )?;
         Ok(ahead.trim() == "0")
     }
 
-    /// Every local branch of `repo`, as full ref names.
+    /// Every local branch of `repo`, as full ref names. Symbolic refs are
+    /// left out.
     fn local_branches(&self, repo: &Path) -> Result<Vec<String>> {
-        let raw = self.git.output(
-            repo,
-            &["for-each-ref", "--format=%(refname)", "refs/heads/"],
-        )?;
-        Ok(raw.lines().map(str::to_string).collect())
+        let raw = self
+            .git
+            .output(repo, &["for-each-ref", REF_FORMAT, "refs/heads/"])?;
+        Ok(branch_refs(&raw)?.into_iter().map(str::to_string).collect())
     }
 
-    fn scan_repo(&self, repo: &Path, ctx: &Ctx, in_use: &InUse) -> Result<Vec<(PathBuf, String)>> {
+    /// The canonical git common dir of the repo or worktree at `dir`.
+    fn common_dir(&self, dir: &Path) -> Result<PathBuf> {
+        let raw = self.git.output(
+            dir,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let path = Path::new(raw.strip_suffix('\n').unwrap_or(&raw));
+        path.canonicalize()
+            .with_context(|| format!("resolving git common dir {}", path.display()))
+    }
+
+    /// The repo's worktrees. The first entry is always the main worktree.
+    fn worktrees(&self, repo: &Path) -> Result<Vec<WorktreeEntry>> {
         let raw = self
             .git
             .output(repo, &["worktree", "list", "--porcelain", "-z"])?;
-        let worktrees = parse_worktree_list(&raw);
-        // The first entry is always the main worktree.
-        let branches = RepoBranches {
+        Ok(parse_worktree_list(&raw))
+    }
+
+    fn repo_state(&self, repo: &Path, worktrees: &[WorktreeEntry]) -> Result<RepoState> {
+        Ok(RepoState {
+            common_dir: self.common_dir(repo)?,
             local: self.local_branches(repo)?,
             main_checkout: worktrees.first().and_then(|w| w.branch.clone()),
-        };
+        })
+    }
+
+    fn scan_repo(&self, repo: &Path, ctx: &Ctx, in_use: &InUse) -> Result<Vec<(PathBuf, String)>> {
+        let worktrees = self.worktrees(repo)?;
+        let state = self.repo_state(repo, &worktrees)?;
         let mut found = Vec::new();
         for wt in worktrees.iter().skip(1) {
             if ctx.stopped() {
                 break;
             }
-            match self.assess(repo, &branches, wt, ctx, in_use) {
+            match self.assess(repo, &state, wt, ctx, in_use) {
                 Ok(Some(reason)) => found.push((wt.path.clone(), reason)),
                 Ok(None) => {}
                 Err(e) => log::warn!("worktree {}: {e:#}", wt.path.display()),
@@ -429,15 +657,59 @@ impl GitWorktrees {
 
     /// The main repo a worktree belongs to, from its common git dir.
     fn repo_of(&self, worktree: &Path) -> Result<PathBuf> {
-        let common = self.git.output(
-            worktree,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )?;
-        let common = PathBuf::from(common.trim());
+        let common = self.common_dir(worktree)?;
         common
             .parent()
             .map(Path::to_path_buf)
             .with_context(|| format!("git common dir {} has no parent", common.display()))
+    }
+
+    /// Judges candidate `c` again, with the repo's worktrees and branches read
+    /// afresh. Returns its entry if it is still a candidate of the same kind.
+    /// One found done must still be done. One found stale must still have its
+    /// commits somewhere. `canon` is the candidate's canonical path. Locks are
+    /// left to `git worktree remove`, which refuses a locked worktree.
+    fn recheck(&self, repo: &Path, c: &Candidate, canon: &Path) -> Result<WorktreeEntry, String> {
+        let worktrees = self.worktrees(repo).map_err(err_text)?;
+        let Some(wt) = worktrees
+            .iter()
+            .skip(1)
+            .find(|w| w.path.canonicalize().is_ok_and(|p| p == canon))
+        else {
+            return Err("is no longer a linked worktree of its repo".to_string());
+        };
+        let state = self.repo_state(repo, &worktrees).map_err(err_text)?;
+        if let Some(why) = self.identity_problem(&state, wt).map_err(err_text)? {
+            return Err(why);
+        }
+        if let Some(op) = self.git.operation_in_progress(&wt.path).map_err(err_text)? {
+            return Err(format!("has {op} in progress"));
+        }
+        match self.standing(repo, &state, wt).map_err(err_text)? {
+            Standing::Done(_) => Ok(wt.clone()),
+            Standing::Elsewhere if c.reason.starts_with(STALE_PREFIX) => Ok(wt.clone()),
+            Standing::Elsewhere => Err("is no longer done, so it waits for stale_days".to_string()),
+            Standing::Unsafe => {
+                Err("its commits are no longer on another branch or pushed".to_string())
+            }
+        }
+    }
+
+    /// True if a file under the worktree was written after the run started.
+    /// The checks before removal take seconds on a large repo, and `--force`
+    /// skips git's own. A file written since the run started, even an ignored
+    /// one that status does not list, means someone is working here. A commit
+    /// in a submodule writes only to its repository, so those are walked too
+    /// when `force` is about to delete them.
+    fn written_during_run(&self, c: &Candidate, ctx: &Ctx, force: bool) -> Result<bool, String> {
+        let mut walked = vec![(c.path.clone(), true)];
+        if force {
+            let modules = self.git.submodule_store_root(&c.path).map_err(err_text)?;
+            walked.push((modules, false));
+        }
+        Ok(walked
+            .iter()
+            .any(|(dir, skip_build)| written_since(dir, ctx.now, *skip_build)))
     }
 
     fn remove_one(&self, ctx: &Ctx, in_use: &InUse, c: &Candidate) -> Result<(), String> {
@@ -450,53 +722,35 @@ impl GitWorktrees {
         // stand in for git's own, which refuses every worktree with submodules.
         // Read before those checks: if submodules appear after it, plain
         // `worktree remove` refuses, so a late change cannot earn `--force`.
-        let force = self
-            .git
-            .has_submodule_stores(&c.path)
-            .map_err(|e| format!("{e:#}"))?;
-        if let Some(why) = self
-            .git
-            .unsafe_to_inspect(&c.path)
-            .map_err(|e| format!("{e:#}"))?
-        {
+        let force = self.git.has_submodule_stores(&c.path).map_err(err_text)?;
+        if let Some(why) = self.git.unsafe_to_inspect(&c.path).map_err(err_text)? {
             return Err(why);
         }
-        let dirty = self
-            .git
-            .output(&c.path, SAFETY_STATUS)
-            .map_err(|e| format!("{e:#}"))?;
+        let dirty = self.git.output(&c.path, SAFETY_STATUS).map_err(err_text)?;
         if !dirty.trim().is_empty() {
             return Err("now has uncommitted changes".to_string());
         }
-        // The checks above take seconds on a large repo, and `--force` skips
-        // git's own. A file written since the run started, even an ignored
-        // one that status does not list, means someone is working here. A
-        // commit in a submodule writes only to its repository, so those are
-        // walked too when they are about to be deleted.
-        let mut walked = vec![(c.path.clone(), true)];
-        if force {
-            let modules = self
-                .git
-                .submodule_store_root(&c.path)
-                .map_err(|e| format!("{e:#}"))?;
-            walked.push((modules, false));
-        }
-        if walked
-            .iter()
-            .any(|(dir, skip_build)| written_since(dir, ctx.now, *skip_build))
-        {
+        let repo = self.repo_of(&c.path).map_err(err_text)?;
+        let wt = self.recheck(&repo, c, &canon)?;
+        if self.written_during_run(c, ctx, force)? {
             return Err("changed since the run started".to_string());
         }
-        let repo = self.repo_of(&c.path).map_err(|e| format!("{e:#}"))?;
         let path = c.path.to_string_lossy();
         let mut args = vec!["worktree", "remove"];
         if force {
             args.push("--force");
         }
         args.push(&path);
-        self.git
-            .output(&repo, &args)
-            .map_err(|e| format!("{e:#}"))?;
+        self.git.output(&repo, &args).map_err(err_text)?;
+        if wt.branch.is_none() {
+            // No branch holds a detached worktree's own commits. Logging HEAD
+            // lets someone find it with `git fsck --lost-found` before gc.
+            log::info!(
+                "worktree {} had a detached HEAD at {}",
+                c.path.display(),
+                wt.head
+            );
+        }
         if let Err(e) = self.git.output(&repo, &["worktree", "prune"]) {
             log::warn!("{}: worktree prune failed: {e:#}", repo.display());
         }
@@ -646,16 +900,20 @@ fn reflog_merge_branch<'a>(line: &'a str, head: &str) -> Option<&'a str> {
     Some(name)
 }
 
-/// The commit ids in `git rev-list --parents` output, or None if any of them
-/// is a merge. Each line is a commit id followed by its parents' ids.
-fn non_merge_commits(raw: &str) -> Option<HashSet<&str>> {
-    raw.lines()
-        .filter_map(|line| {
-            let mut ids = line.split_whitespace();
-            let id = ids.next()?;
-            Some((ids.count() <= 1).then_some(id))
-        })
-        .collect()
+/// The commit ids in `git rev-list --parents` output, newest first, or the
+/// id of a merge among them. Each line is a commit id followed by its
+/// parents' ids.
+fn non_merge_commits(raw: &str) -> Result<Vec<&str>, &str> {
+    let mut ids = Vec::new();
+    for line in raw.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(id) = fields.next() else { continue };
+        if fields.count() > 1 {
+            return Err(id);
+        }
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 /// The commits that `git rev-list --cherry-mark` marks `=`, because the other
@@ -664,6 +922,51 @@ fn non_merge_commits(raw: &str) -> Option<HashSet<&str>> {
 /// match fail.
 fn patch_equivalent(raw: &str) -> HashSet<&str> {
     raw.lines().filter_map(|l| l.strip_prefix('=')).collect()
+}
+
+/// Why two of `ids` share a patch id in `git patch-id` output, if any do.
+/// Each line is a patch id and a commit id. A commit with no line has no
+/// diff, so two such commits make the same, empty, change. Output this does
+/// not expect is a reason too, so it can only make a match fail.
+fn repeated_patch(ids: &[&str], raw: &str) -> Option<String> {
+    let mut by_patch: HashMap<&str, &str> = HashMap::new();
+    for line in raw.lines() {
+        let Some((patch, commit)) = line.split_once(' ') else {
+            return Some(format!("git patch-id printed {line:?}"));
+        };
+        if !ids.contains(&commit) {
+            return Some(format!(
+                "git patch-id printed a commit it was not given: {commit}"
+            ));
+        }
+        if let Some(first) = by_patch.insert(patch, commit) {
+            return Some(format!("commits {first} and {commit} make the same change"));
+        }
+    }
+    let empty: Vec<&&str> = ids
+        .iter()
+        .filter(|id| !by_patch.values().any(|c| c == *id))
+        .collect();
+    match empty[..] {
+        [a, b, ..] => Some(format!("commits {a} and {b} both change nothing")),
+        _ => None,
+    }
+}
+
+/// The full ref names in `for-each-ref` output made with `REF_FORMAT`,
+/// leaving out symbolic refs. A symbolic ref under `refs/heads` is another
+/// name for some ref, such as the worktree's own branch, a remote-tracking
+/// branch or a worktree's HEAD, so it holds nothing of its own.
+fn branch_refs(raw: &str) -> Result<Vec<&str>> {
+    let mut refs = Vec::new();
+    for line in raw.lines() {
+        match line.split_once('\t') {
+            Some((name, "")) => refs.push(name),
+            Some(_) => {}
+            None => return Err(anyhow!("git for-each-ref printed {line:?}")),
+        }
+    }
+    Ok(refs)
 }
 
 fn format_idle(idle: Duration) -> String {
@@ -872,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_head_only_when_contained_in_main() {
+    fn detached_head_only_when_held_by_a_local_branch() {
         let fx = Fixture::new(&[]);
         let r = repo(&fx);
         let on_main = r.join(".claude/worktrees/agent-on-main");
@@ -1130,14 +1433,29 @@ mod tests {
     /// `.claude/worktrees` as embedded repositories.
     fn pick_onto(repo: &Path, branch: &str, ids: &[&str]) {
         git(repo, &["checkout", "-q", branch]);
-        let file = format!("{branch}-work");
-        std::fs::write(repo.join(&file), &file).unwrap();
-        git(repo, &["add", "--", &file]);
-        git(repo, &["commit", "-qm", &file]);
+        commit_only(repo, &format!("{branch}-work"));
         for id in ids {
             git(repo, &["cherry-pick", id]);
         }
         git(repo, &["checkout", "-q", "main"]);
+    }
+
+    /// Commits a new `file` alone. In the main worktree, `git add .` would add
+    /// the linked worktrees under `.claude/worktrees` as embedded repositories.
+    fn commit_only(dir: &Path, file: &str) {
+        std::fs::write(dir.join(file), file).unwrap();
+        git(dir, &["add", "--", file]);
+        git(dir, &["commit", "-qm", file]);
+    }
+
+    /// Adds a bare `origin` outside the roots to `repo`.
+    fn add_origin(fx: &Fixture, repo: &Path) {
+        let remote = fx.dir.path().join("remote.git");
+        git(
+            fx.dir.path(),
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        );
+        git(repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
     }
 
     /// True if any local branch holds `id`.
@@ -1326,11 +1644,11 @@ mod tests {
         let linear = format!("{a} {b}\n{b} {c}\n{c}\n");
         assert_eq!(
             non_merge_commits(&linear),
-            Some(HashSet::from([a.as_str(), b.as_str(), c.as_str()]))
+            Ok(vec![a.as_str(), b.as_str(), c.as_str()])
         );
         let with_merge = format!("{a} {b}\n{b} {c} {d}\n");
-        assert_eq!(non_merge_commits(&with_merge), None);
-        assert_eq!(non_merge_commits(""), Some(HashSet::new()));
+        assert_eq!(non_merge_commits(&with_merge), Err(b.as_str()));
+        assert_eq!(non_merge_commits(""), Ok(vec![]));
     }
 
     #[test]
@@ -1339,6 +1657,572 @@ mod tests {
         // A `commit` header, as `--format` would add, is not a mark.
         let raw = format!("={a}\n+{b}\ncommit ={c}\n");
         assert_eq!(patch_equivalent(&raw), HashSet::from([a.as_str()]));
+    }
+
+    #[test]
+    fn finds_commits_that_make_the_same_change() {
+        let [a, b, c, p, q] = ["a", "b", "c", "p", "q"].map(|x| x.repeat(40));
+        let ids = [a.as_str(), b.as_str(), c.as_str()];
+        let distinct = format!("{p} {a}\n{q} {b}\n");
+        assert_eq!(repeated_patch(&ids, &distinct), None, "one empty commit");
+        let same = format!("{p} {a}\n{p} {c}\n");
+        let why = repeated_patch(&ids, &same).unwrap();
+        assert!(why.contains("make the same change"), "{why}");
+        let two_empty = format!("{p} {a}\n");
+        let why = repeated_patch(&ids, &two_empty).unwrap();
+        assert!(why.contains("both change nothing"), "{why}");
+        // Output it does not expect can only fail the match.
+        assert!(repeated_patch(&ids, "garbage\n").is_some());
+        assert!(repeated_patch(&ids, &format!("{p} {q}\n")).is_some());
+    }
+
+    #[test]
+    fn leaves_symbolic_refs_out_of_the_branches() {
+        let raw = "refs/heads/main\t\nrefs/heads/alias\trefs/heads/main\nrefs/heads/x/y\t\n";
+        assert_eq!(
+            branch_refs(raw).unwrap(),
+            vec!["refs/heads/main", "refs/heads/x/y"]
+        );
+        assert!(branch_refs("refs/heads/no-tab\n").is_err());
+    }
+
+    /// Writes a sequence editor that turns the first `pick` into `edit`, so
+    /// `rebase -i` stops after its first commit with a clean tree.
+    fn edit_first(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("edit-first.sh");
+        std::fs::write(&script, "#!/bin/sh\nsed -i.bak '1s/^pick/edit/' \"$1\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Starts `rebase -i main` in `wt`, paused at its first commit.
+    fn pause_rebase(fx: &Fixture, wt: &Path) {
+        let editor = format!("sequence.editor={}", edit_first(fx.dir.path()).display());
+        git(wt, &["-c", &editor, "rebase", "-i", "main"]);
+    }
+
+    /// Stopped onto a moved main, HEAD is a reworded copy of the first commit.
+    /// The worktree's own branch, not checked out during the rebase, holds
+    /// the original, so the copy would match.
+    #[test]
+    fn paused_rebase_onto_a_moved_base_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "rebasing");
+        commit(&wt, "one");
+        commit(&wt, "two");
+        commit_only(&r, "main-moves");
+        pause_rebase(&fx, &wt);
+        git(&wt, &["commit", "--amend", "-qm", "one, reworded"]);
+        age(&fx, &wt, 1);
+        assert_eq!(
+            GitCmd::default().operation_in_progress(&wt).unwrap(),
+            Some("a rebase")
+        );
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// Stopped without moving the base, HEAD is the first commit itself, which
+    /// the worktree's own branch holds.
+    #[test]
+    fn paused_rebase_onto_the_same_base_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "rebasing");
+        commit(&wt, "one");
+        commit(&wt, "two");
+        pause_rebase(&fx, &wt);
+        age(&fx, &wt, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn bisect_in_progress_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "bisecting");
+        for i in 0..6 {
+            commit(&wt, &format!("f{i}"));
+        }
+        git(&wt, &["bisect", "start", "bisecting", "main"]);
+        age(&fx, &wt, 1);
+        assert_eq!(
+            GitCmd::default().operation_in_progress(&wt).unwrap(),
+            Some("a bisect")
+        );
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn run_refuses_a_worktree_whose_bisect_started_after_the_scan() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "late-bisect");
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["late-bisect"]);
+        git(&wt, &["bisect", "start"]);
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(report.failed[0].1, "has a bisect in progress");
+        assert!(wt.exists());
+    }
+
+    /// `cp -R` copies the repo's record of its worktree, which still points at
+    /// the original folder, with the HEAD it had then. New work there must
+    /// not be judged by that HEAD.
+    #[test]
+    fn copied_repo_does_not_judge_the_original_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = detached(&r, "agent-real");
+        let copy = fx.root.join("repo-copy");
+        let copied = Command::new("cp")
+            .arg("-R")
+            .arg(&r)
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        commit(&wt, "precious");
+        assert!(!on_a_branch(&r, &head_of(&wt)));
+        age(&fx, &wt, 1);
+
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        let listed = t.worktrees(&copy).unwrap();
+        let state = t.repo_state(&copy, &listed).unwrap();
+        let why = t.identity_problem(&state, &listed[1]).unwrap().unwrap();
+        assert!(why.starts_with("belongs to the repo at "), "{why}");
+
+        // Through its own repo, a stale HEAD is refused too.
+        let listed = t.worktrees(&r).unwrap();
+        let state = t.repo_state(&r, &listed).unwrap();
+        let mut stale = listed[1].clone();
+        stale.head = head_of(&r);
+        let why = t.identity_problem(&state, &stale).unwrap().unwrap();
+        assert!(why.starts_with("HEAD is "), "{why}");
+
+        // Removal judges the worktree again, through the repo it points at.
+        let offered = Candidate {
+            path: wt.clone(),
+            bytes: 0,
+            reason: "on main, idle 24 h".to_string(),
+            estimate: Estimate::Exact,
+        };
+        let report = t.run(&ctx, &[offered]);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(
+            report.failed[0].1,
+            "its commits are no longer on another branch or pushed"
+        );
+        assert!(wt.exists());
+    }
+
+    /// The worktree adds a file, reverts it and adds it again. Another branch
+    /// has copies of the add and the revert only, so the file is not there.
+    /// Git matches the second add to the first add's copy.
+    #[test]
+    fn a_change_made_again_after_a_revert_needs_a_copy_of_its_own() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = detached(&r, "reapplied");
+        commit(&wt, "x");
+        let add = head_of(&wt);
+        git(&wt, &["revert", "--no-edit", "HEAD"]);
+        let revert = head_of(&wt);
+        git(&wt, &["revert", "--no-edit", "HEAD"]);
+        git(&r, &["branch", "other", "main"]);
+        pick_onto(&r, "other", &[&add, &revert]);
+        age(&fx, &wt, 60);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A symbolic ref under `refs/heads` can name the worktree's own branch or
+    /// its HEAD. Either holds its HEAD only by pointing at it.
+    #[test]
+    fn symbolic_ref_to_the_worktrees_own_branch_or_head_does_not_count() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let own = worktree(&r, "feat");
+        commit(&own, "wip");
+        git(
+            &r,
+            &["symbolic-ref", "refs/heads/feat-alias", "refs/heads/feat"],
+        );
+        let agent = detached(&r, "agent-sym");
+        commit(&agent, "agent-work");
+        git(
+            &r,
+            &[
+                "symbolic-ref",
+                "refs/heads/mirror",
+                "worktrees/agent-sym/HEAD",
+            ],
+        );
+        age(&fx, &own, 60);
+        age(&fx, &agent, 60);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A symbolic ref under `refs/heads` that names a remote-tracking branch
+    /// counts no more than that branch does, for HEAD or for a copy.
+    #[test]
+    fn symbolic_ref_to_a_remote_tracking_branch_does_not_count() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        add_origin(&fx, &r);
+        // HEAD itself pushed, and aliased.
+        let held = detached(&r, "agent-held");
+        commit(&held, "held-work");
+        git(&held, &["push", "-q", "origin", "HEAD:refs/heads/held"]);
+        git(
+            &r,
+            &[
+                "symbolic-ref",
+                "refs/heads/held-alias",
+                "refs/remotes/origin/held",
+            ],
+        );
+        // A copy pushed from a branch since deleted, and aliased.
+        let copied = detached(&r, "agent-copied");
+        commit(&copied, "copied-work");
+        let id = head_of(&copied);
+        git(&r, &["branch", "pick", "main"]);
+        pick_onto(&r, "pick", &[&id]);
+        git(&r, &["push", "-q", "origin", "pick"]);
+        git(&r, &["branch", "-q", "-D", "pick"]);
+        git(
+            &r,
+            &[
+                "symbolic-ref",
+                "refs/heads/pick-alias",
+                "refs/remotes/origin/pick",
+            ],
+        );
+        age(&fx, &held, 60);
+        age(&fx, &copied, 60);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn copy_held_only_by_a_remote_tracking_branch_does_not_count() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        add_origin(&fx, &r);
+        let wt = detached(&r, "remote-copy");
+        commit(&wt, "work");
+        let id = head_of(&wt);
+        git(&r, &["branch", "pick", "main"]);
+        pick_onto(&r, "pick", &[&id]);
+        git(&r, &["push", "-q", "origin", "pick"]);
+        git(&r, &["branch", "-q", "-D", "pick"]);
+        age(&fx, &wt, 60);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A worktree on `feat` with commits one and two, pushed to `origin`.
+    fn pushed_two_commits(fx: &Fixture, r: &Path) -> (PathBuf, String, String) {
+        add_origin(fx, r);
+        let wt = worktree(r, "feat");
+        commit(&wt, "one");
+        let one = head_of(&wt);
+        commit(&wt, "two");
+        let two = head_of(&wt);
+        git(&wt, &["push", "-q", "-u", "origin", "feat"]);
+        (wt, one, two)
+    }
+
+    #[test]
+    fn pushed_branch_with_only_some_commits_copied_waits_for_stale_days() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let (wt, one, _) = pushed_two_commits(&fx, &r);
+        pick_onto(&r, "main", &[&one]);
+        age(&fx, &wt, 5);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "not stale yet: {found:?}");
+        age(&fx, &wt, 20);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(reason_of(&found, "feat"), "idle 20 days");
+    }
+
+    #[test]
+    fn pushed_branch_with_every_commit_copied_goes_after_min_idle() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let (wt, one, two) = pushed_two_commits(&fx, &r);
+        pick_onto(&r, "main", &[&one, &two]);
+        age(&fx, &wt, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(
+            reason_of(&found, "feat"),
+            "cherry-picked to another branch, idle 24 h"
+        );
+    }
+
+    /// Points `child`'s first parent at `parent` in a commit-graph file, with
+    /// topological level `level`, as a forged graph would. Git does not check
+    /// the file's checksum when it reads it.
+    fn forge_first_parent(graph: &Path, child: &str, parent: &str, level: u64) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut data = std::fs::read(graph).unwrap();
+        assert_eq!(&data[..4], b"CGPH");
+        let word = |at: usize| u64::from_be_bytes(data[at..at + 8].try_into().unwrap());
+        let chunk = |id: &[u8]| {
+            let at = (0..usize::from(data[6]))
+                .map(|i| 8 + 12 * i)
+                .find(|&at| &data[at..at + 4] == id)
+                .unwrap();
+            usize::try_from(word(at + 4)).unwrap()
+        };
+        let (fanout, oids, commits) = (chunk(b"OIDF"), chunk(b"OIDL"), chunk(b"CDAT"));
+        let count = u32::from_be_bytes(data[fanout + 1020..fanout + 1024].try_into().unwrap());
+        let index = |hex: &str| {
+            (0..count)
+                .find(|&i| {
+                    let at = oids + 20 * usize::try_from(i).unwrap();
+                    let id: String = data[at..at + 20]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    id == hex
+                })
+                .unwrap()
+        };
+        let (c, p) = (index(child), index(parent));
+        let record = commits + 36 * usize::try_from(c).unwrap();
+        let date = word(record + 28) & ((1 << 34) - 1);
+        data[record + 20..record + 24].copy_from_slice(&p.to_be_bytes());
+        data[record + 28..record + 36].copy_from_slice(&((level << 34) | date).to_be_bytes());
+        std::fs::set_permissions(graph, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(graph, data).unwrap();
+    }
+
+    /// A forged commit-graph claims main holds a commit that no branch holds.
+    /// Git trusts the graph unless told not to.
+    #[test]
+    fn forged_commit_graph_cannot_make_a_branch_hold_a_commit() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = detached(&r, "agent-graph");
+        commit(&wt, "unique");
+        let x = head_of(&wt);
+        commit_only(&r, "m1");
+        let m1 = head_of(&r);
+        commit_only(&r, "m2");
+        let m2 = head_of(&r);
+        // A branch puts X in the graph while it is written.
+        git(&r, &["branch", "graph-tmp", &x]);
+        git(
+            &r,
+            &[
+                "-c",
+                "commitGraph.generationVersion=1",
+                "commit-graph",
+                "write",
+                "--reachable",
+                "--no-progress",
+            ],
+        );
+        git(&r, &["branch", "-D", "graph-tmp"]);
+        // The first commit is level 1 and X level 2, so m1 on X is level 3.
+        let graph = r.join(".git/objects/info/commit-graph");
+        forge_first_parent(&graph, &m1, &x, 3);
+        forge_first_parent(&graph, &m2, &m1, 4);
+        assert!(
+            git(&r, &["branch", "--contains", &x]).contains("main"),
+            "the forged graph must fool git that reads it"
+        );
+        age(&fx, &wt, 60);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A blobless clone with lazy fetch off cannot diff a commit whose blobs
+    /// it never fetched, so the cherry-pick check fails with an error. That
+    /// must not stop the pushed check.
+    #[test]
+    fn cherry_pick_check_error_still_lets_a_pushed_worktree_wait_for_stale_days() {
+        let fx = Fixture::new(&[]);
+        let src = fx.dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q"]);
+        git(&src, &["config", "uploadpack.allowFilter", "true"]);
+        git(&src, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+        std::fs::write(src.join("f"), "line1\nline2\n").unwrap();
+        git(&src, &["add", "f"]);
+        git(&src, &["commit", "-qm", "f"]);
+        git(&src, &["checkout", "-q", "-b", "other"]);
+        std::fs::write(src.join("f"), "line1\nother\n").unwrap();
+        git(&src, &["commit", "-qam", "other edits f"]);
+        git(&src, &["checkout", "-q", "main"]);
+        let r = fx.root.join("repo");
+        let url = format!("file://{}", src.display());
+        let file_ok = ["-c", "protocol.file.allow=always"];
+        git(
+            fx.dir.path(),
+            &[
+                &file_ok[..],
+                &[
+                    "clone",
+                    "-q",
+                    "--filter=blob:none",
+                    &url,
+                    r.to_str().unwrap(),
+                ],
+            ]
+            .concat(),
+        );
+        git(&r, &["branch", "-q", "other", "origin/other"]);
+        let wt = worktree(&r, "feat");
+        std::fs::write(wt.join("f"), "line1\nmine\n").unwrap();
+        git(&wt, &["commit", "-qam", "mine edits f"]);
+        git(
+            &wt,
+            &[&file_ok[..], &["push", "-q", "-u", "origin", "feat"]].concat(),
+        );
+        age(&fx, &wt, 20);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(reason_of(&found, "feat"), "idle 20 days");
+    }
+
+    /// Far more branches than fit on one command line. The cherry-pick check
+    /// passes revisions through stdin, so it still works.
+    #[test]
+    fn cherry_pick_check_works_past_the_command_line_limit() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let base = head_of(&r);
+        let wt = detached(&r, "agent-many");
+        commit(&wt, "agent-work");
+        let id = head_of(&wt);
+        pick_onto(&r, "main", &[&id]);
+        let mut packed = String::from("# pack-refs with: peeled fully-peeled sorted \n");
+        for i in 0..20_000 {
+            packed.push_str(&format!("{base} refs/heads/many/{i:05}\n"));
+        }
+        std::fs::write(r.join(".git/packed-refs"), packed).unwrap();
+        age(&fx, &wt, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(
+            reason_of(&found, "agent-many"),
+            "cherry-picked to another branch, idle 24 h"
+        );
+    }
+
+    /// The branch holding HEAD merged in a commit whose object is gone, so
+    /// reading merge records fails. The worktree is still done.
+    #[test]
+    fn unreadable_merge_records_fall_back_to_naming_the_branch() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "feat");
+        commit(&wt, "work");
+        git(&r, &["checkout", "-q", "-b", "side", "main"]);
+        commit_only(&r, "side-work");
+        let side = head_of(&r);
+        git(&r, &["checkout", "-q", "-b", "stacked", "feat"]);
+        git(&r, &["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
+        git(&r, &["checkout", "-q", "main"]);
+        git(&r, &["branch", "-q", "-D", "side"]);
+        std::fs::remove_file(r.join(".git/objects").join(&side[..2]).join(&side[2..])).unwrap();
+        age(&fx, &wt, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(reason_of(&found, "feat"), "on stacked, idle 24 h");
+    }
+
+    /// Without `--`, git reads a ref that does not exist as a path when a file
+    /// of that name exists, and answers as if the ref held nothing.
+    #[test]
+    fn a_missing_branch_is_an_error_rather_than_a_path() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let head = head_of(&r);
+        std::fs::create_dir_all(r.join("refs/heads")).unwrap();
+        std::fs::write(r.join("refs/heads/gone"), "a file, not a branch").unwrap();
+        let t = task(14, vec![]);
+        let gone = ["gone".to_string()];
+        assert!(t.merge_commit_of(&r, &head, &gone).is_err());
+        assert!(t.reflog_merged_into(&r, &head, &gone).is_err());
+        assert!(t.unique_commits(&r, &head, &["refs/heads/gone"]).is_err());
+        assert!(t.copied_commits(&r, &head, &["refs/heads/gone"]).is_err());
+    }
+
+    /// Two worktrees found done because other branches held their HEADs.
+    /// Those branches are deleted before the run. One worktree is pushed.
+    #[test]
+    fn run_refuses_a_worktree_that_is_no_longer_done() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        add_origin(&fx, &r);
+        let local = worktree(&r, "local");
+        commit(&local, "local-work");
+        git(&r, &["branch", "local-copy", "local"]);
+        let pushed = worktree(&r, "pushed");
+        commit(&pushed, "pushed-work");
+        git(&pushed, &["push", "-q", "-u", "origin", "pushed"]);
+        git(&r, &["branch", "pushed-copy", "pushed"]);
+        age(&fx, &local, 1);
+        age(&fx, &pushed, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["local", "pushed"]);
+        git(&r, &["branch", "-q", "-D", "local-copy", "pushed-copy"]);
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        let why = |name: &str| {
+            report
+                .failed
+                .iter()
+                .find(|(p, _)| p.ends_with(name))
+                .map(|(_, why)| why.as_str())
+                .unwrap()
+        };
+        assert_eq!(
+            why("local"),
+            "its commits are no longer on another branch or pushed"
+        );
+        assert_eq!(
+            why("pushed"),
+            "is no longer done, so it waits for stale_days"
+        );
+    }
+
+    /// An empty commit writes only to the repo's git dir, so the check for
+    /// files written during the run cannot see it. On a detached HEAD, no
+    /// branch holds it. Judging the worktree again keeps it.
+    #[test]
+    fn run_refuses_a_worktree_that_gained_a_commit_after_the_scan() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = detached(&r, "late-commit");
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(reason_of(&found, "late-commit"), "on main, idle 24 h");
+        git(&wt, &["commit", "-q", "--allow-empty", "-m", "late"]);
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(
+            report.failed[0].1,
+            "its commits are no longer on another branch or pushed"
+        );
+        assert!(wt.exists());
     }
 
     /// A detached worktree with a commit no branch holds, and a repo that

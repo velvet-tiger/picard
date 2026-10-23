@@ -59,6 +59,9 @@ impl GitCmd {
             "core.hooksPath=/dev/null",
             "-c",
             "log.showSignature=false",
+            // See the note on GIT_NO_REPLACE_OBJECTS below.
+            "-c",
+            "core.commitGraph=false",
         ]);
         cmd.arg("-C").arg(dir).args(args);
         // Picard only reads, apart from `worktree remove`. Skipping optional
@@ -75,7 +78,10 @@ impl GitCmd {
         // A replace ref can make a commit look contained in, or merged into, a
         // branch that does not hold it. Picard decides safety from history, so
         // it reads the real one. Grafts do the same and are refused in
-        // `unsafe_to_inspect`, because no variable turns them off.
+        // `unsafe_to_inspect`, because no variable turns them off. A
+        // commit-graph file caches each commit's parents, and git trusts it
+        // over the commits themselves, so a forged one can do the same.
+        // `core.commitGraph=false` above makes git read the commits.
         cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
         if let Some(path) = &self.path_var {
             cmd.env("PATH", path);
@@ -90,16 +96,22 @@ impl GitCmd {
         }
     }
 
-    fn exec(&self, dir: &Path, args: &[&str]) -> Result<Output> {
-        let out =
-            proc::run(self.command(dir, args), GIT_TIMEOUT, GIT_OUTPUT_CAP).with_context(|| {
-                format!(
-                    "running {} {} in {}",
-                    self.program.display(),
-                    args.join(" "),
-                    dir.display()
-                )
-            })?;
+    fn exec(&self, dir: &Path, args: &[&str], input: Option<&str>) -> Result<Output> {
+        let cmd = self.command(dir, args);
+        let out = match input {
+            None => proc::run(cmd, GIT_TIMEOUT, GIT_OUTPUT_CAP),
+            Some(text) => {
+                proc::run_with_input(cmd, text.as_bytes().to_vec(), GIT_TIMEOUT, GIT_OUTPUT_CAP)
+            }
+        }
+        .with_context(|| {
+            format!(
+                "running {} {} in {}",
+                self.program.display(),
+                args.join(" "),
+                dir.display()
+            )
+        })?;
         if out.timed_out || out.truncated {
             bail!(
                 "git {} in {}: {}",
@@ -117,22 +129,22 @@ impl GitCmd {
 
     /// Runs git in `dir` and returns stdout. Fails with stderr on a non-zero exit.
     pub fn output(&self, dir: &Path, args: &[&str]) -> Result<String> {
-        let out = self.exec(dir, args)?;
-        if !out.success() {
-            bail!(
-                "git {} in {} failed: {}",
-                args.join(" "),
-                dir.display(),
-                out.stderr.trim()
-            );
-        }
-        Ok(out.stdout)
+        let out = self.exec(dir, args, None)?;
+        stdout_of(out, dir, args)
+    }
+
+    /// Like `output`, but writes `input` to git's stdin, as `--stdin` options
+    /// read it. A list of revisions passed this way cannot overflow the
+    /// command line, and git never reads one of them as a path.
+    pub fn output_with_input(&self, dir: &Path, args: &[&str], input: &str) -> Result<String> {
+        let out = self.exec(dir, args, Some(input))?;
+        stdout_of(out, dir, args)
     }
 
     /// Runs a git command whose exit status is the answer, like
     /// `merge-base --is-ancestor`: 0 is yes, 1 is no, anything else is an error.
     pub fn check(&self, dir: &Path, args: &[&str]) -> Result<bool> {
-        let out = self.exec(dir, args)?;
+        let out = self.exec(dir, args, None)?;
         match out.code {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -143,6 +155,64 @@ impl GitCmd {
                 out.stderr.trim()
             ),
         }
+    }
+}
+
+/// The stdout of a finished git command, or an error with its stderr.
+fn stdout_of(out: Output, dir: &Path, args: &[&str]) -> Result<String> {
+    if !out.success() {
+        bail!(
+            "git {} in {} failed: {}",
+            args.join(" "),
+            dir.display(),
+            out.stderr.trim()
+        );
+    }
+    Ok(out.stdout)
+}
+
+/// What git keeps in a worktree's git dir while an operation is paused, and a
+/// name for each operation.
+const IN_PROGRESS: &[(&str, &str)] = &[
+    ("rebase-merge", "a rebase"),
+    ("rebase-apply", "a rebase or `git am`"),
+    ("MERGE_HEAD", "a merge"),
+    ("CHERRY_PICK_HEAD", "a cherry-pick"),
+    ("REVERT_HEAD", "a revert"),
+    ("sequencer", "a cherry-pick or revert of several commits"),
+    ("BISECT_LOG", "a bisect"),
+    ("BISECT_START", "a bisect"),
+];
+
+impl GitCmd {
+    /// The git operation paused in worktree `dir`, such as "a rebase", if any.
+    /// A paused rebase or bisect can leave a clean worktree on a detached HEAD
+    /// that another branch holds, while its state lives in the worktree's git
+    /// dir. Removing the worktree deletes that state. `--git-path` resolves
+    /// each name for this worktree. A path that cannot be checked is an error,
+    /// so the worktree is kept. Reads only; runs nothing the repo names.
+    pub fn operation_in_progress(&self, dir: &Path) -> Result<Option<&'static str>> {
+        let mut args = vec!["rev-parse", "--path-format=absolute"];
+        for (name, _) in IN_PROGRESS {
+            args.extend(["--git-path", name]);
+        }
+        let raw = self.output(dir, &args)?;
+        let paths: Vec<&str> = raw.lines().collect();
+        if paths.len() != IN_PROGRESS.len() {
+            bail!(
+                "git rev-parse --git-path in {}: expected {} paths, got {raw:?}",
+                dir.display(),
+                IN_PROGRESS.len()
+            );
+        }
+        for ((_, what), path) in IN_PROGRESS.iter().zip(paths) {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => return Ok(Some(what)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("checking {path}")),
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -535,6 +605,21 @@ mod tests {
             .unwrap();
         let seen = git
             .output(dir.path(), &["config", "--bool", "log.showSignature"])
+            .unwrap();
+        assert_eq!(seen.trim(), "false");
+    }
+
+    /// Repo config cannot turn the commit-graph back on, so a forged graph
+    /// cannot change which parents git sees.
+    #[test]
+    fn repo_config_cannot_turn_on_the_commit_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitCmd::default();
+        git.output(dir.path(), &["init", "-q"]).unwrap();
+        git.output(dir.path(), &["config", "core.commitGraph", "true"])
+            .unwrap();
+        let seen = git
+            .output(dir.path(), &["config", "--bool", "core.commitGraph"])
             .unwrap();
         assert_eq!(seen.trim(), "false");
     }
