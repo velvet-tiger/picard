@@ -554,34 +554,41 @@ impl GitWorktrees {
 
     /// The commits the worktree's HEAD reflog file says it was created at.
     /// `log --walk-reflogs` cannot show an entry's old value, so the file is
-    /// read directly. That runs nothing the repo configures. A missing file,
-    /// or one that is not a plain file of a sane size, gives no commits, so
-    /// every empty reflog message counts as a commit made here.
+    /// read directly, with `read_small_file`. That runs nothing the repo
+    /// configures. A missing file, a symlink, a FIFO or any other file that
+    /// is not a plain file of a sane size gives no commits, so every empty
+    /// reflog message counts as a commit made here.
     fn creation_commits(&self, wt: &Path) -> Result<HashSet<String>> {
-        let raw = self.git.output(
-            wt,
-            &[
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                "logs/HEAD",
-            ],
-        )?;
-        let path = PathBuf::from(raw.strip_suffix('\n').unwrap_or(&raw));
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
+        // HEAD's reflog is always `logs/HEAD` in the worktree's own git dir.
+        // `--path-format=absolute --git-path logs/HEAD` would resolve a
+        // symlink there to its target, which O_NOFOLLOW could then not see.
+        let raw = self
+            .git
+            .output(wt, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+        let path = Path::new(raw.strip_suffix('\n').unwrap_or(&raw)).join("logs/HEAD");
+        let bytes = match read_small_file(&path, REFLOG_FILE_LIMIT) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                log::debug!(
+                    "worktree {}: not reading {}: not a plain file of at most {REFLOG_FILE_LIMIT} bytes",
+                    wt.display(),
+                    path.display()
+                );
+                return Ok(HashSet::new());
+            }
+            // No file means no reflog, so there is nothing to read.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            // Any other failure, such as ELOOP for a symlink, gives no
+            // creation commits, so empty messages count as made here.
+            Err(e) => {
+                log::debug!(
+                    "worktree {}: not reading {}: {e}",
+                    wt.display(),
+                    path.display()
+                );
+                return Ok(HashSet::new());
+            }
         };
-        if !meta.is_file() || meta.len() > REFLOG_FILE_LIMIT {
-            log::debug!(
-                "worktree {}: not reading {}: not a plain file of at most {REFLOG_FILE_LIMIT} bytes",
-                wt.display(),
-                path.display()
-            );
-            return Ok(HashSet::new());
-        }
-        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let text = String::from_utf8_lossy(&bytes);
         Ok(creation_ids(&text)
             .into_iter()
@@ -1308,6 +1315,29 @@ fn only_moved(message: &str) -> bool {
     ONLY_MOVED.iter().any(|m| message.starts_with(m))
         || ((message.starts_with("merge ") || message.starts_with("pull"))
             && message.ends_with(": Fast-forward"))
+}
+
+/// The contents of the plain file at `path`, or None when it is not a plain
+/// file or holds more than `limit` bytes. The file is opened once, without
+/// following a symlink and without blocking on a FIFO, and the checks run on
+/// that handle, so the file cannot be swapped between the check and the
+/// read. Reading stops one byte past `limit`, so a file that grows during
+/// the read cannot use more memory than that.
+fn read_small_file(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > limit {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    let within = u64::try_from(bytes.len()).is_ok_and(|n| n <= limit);
+    Ok(within.then_some(bytes))
 }
 
 /// The commits that `git rev-list --cherry-mark` marks `=`, because the other
@@ -2973,6 +3003,68 @@ mod tests {
         git(&wt, &["update-ref", "HEAD", id.trim()]);
         git(&wt, &["checkout", "-q", "--detach", "main"]);
         waits_for_its_unbranched_commits(&fx, &task(14, vec![]), &wt, "plumbed");
+    }
+
+    /// The HEAD reflog file of the worktree `name` in `repo`.
+    fn head_log(repo: &Path, name: &str) -> PathBuf {
+        repo.join(".git/worktrees").join(name).join("logs/HEAD")
+    }
+
+    /// A symlink at `logs/HEAD` is never followed, even to a file that holds
+    /// a creation entry.
+    #[test]
+    fn creation_commits_ignore_a_symlinked_reflog() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = detached(&r, "linked-log");
+        let t = task(14, vec![]);
+        assert_eq!(
+            t.creation_commits(&wt).unwrap(),
+            HashSet::from([head_of(&wt)])
+        );
+        let log = head_log(&r, "linked-log");
+        let real = fx.dir.path().join("real-log");
+        std::fs::rename(&log, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &log).unwrap();
+        assert!(t.creation_commits(&wt).unwrap().is_empty());
+    }
+
+    /// A FIFO with no writer at `logs/HEAD` must not block the scan. The
+    /// check runs on a thread with a deadline, so a regression fails the test
+    /// rather than hanging it.
+    #[test]
+    fn creation_commits_do_not_block_on_a_fifo() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = detached(&r, "fifo-log");
+        let log = head_log(&r, "fifo-log");
+        std::fs::remove_file(&log).unwrap();
+        assert!(Command::new("mkfifo").arg(&log).status().unwrap().success());
+        let t = task(14, vec![]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(t.creation_commits(&wt).map_err(|e| format!("{e:#}")));
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("creation_commits blocked on a FIFO");
+        assert_eq!(result, Ok(HashSet::new()));
+    }
+
+    #[test]
+    fn reads_only_a_plain_file_within_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ten");
+        std::fs::write(&file, b"0123456789").unwrap();
+        assert_eq!(
+            read_small_file(&file, 10).unwrap(),
+            Some(b"0123456789".to_vec())
+        );
+        assert_eq!(read_small_file(&file, 9).unwrap(), None);
+        assert_eq!(read_small_file(dir.path(), 10).unwrap(), None);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(read_small_file(&link, 10).is_err());
     }
 
     /// Once gc has expired the entry `git worktree add` wrote, a plumbing
