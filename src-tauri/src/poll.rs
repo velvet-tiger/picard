@@ -26,7 +26,7 @@ use crate::config::{self, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::env::ToolEnv;
 use crate::monitor::{self, DailyAction, States};
-use crate::preview_scans::{self, Scope};
+use crate::preview_scans::{self, CancelMark, Request, Scope};
 use crate::runner::{self, CleanRequest, LockBusy, VolumeRun};
 use crate::state::Shared;
 use crate::tray::{MenuView, Tray};
@@ -366,13 +366,15 @@ pub struct Poller<R: Runtime> {
 }
 
 /// Runs the shared preview scan of the volume mounted at `mount` on a
-/// blocking thread. `None` if it cannot run, fails or is cancelled; the reason
-/// is logged.
+/// blocking thread. `mark` is when it was asked for; see
+/// `PreviewScans::mark`. `None` if it cannot run, fails or is cancelled; the
+/// reason is logged.
 async fn scan_one<R: Runtime>(
     app: AppHandle<R>,
     shared: Arc<Shared>,
     config: Config,
     mount: String,
+    mark: CancelMark,
 ) -> Option<Vec<VolumePreview>> {
     let Some(tools) = shared.tools() else {
         log::warn!("preview scan of {mount} skipped: tool paths are not resolved");
@@ -380,7 +382,12 @@ async fn scan_one<R: Runtime>(
     };
     let scope_mount = mount.clone();
     let scanned = tauri::async_runtime::spawn_blocking(move || {
-        preview_scans::scan(&shared, &config, &tools, Scope::Volume(&scope_mount), &app)
+        let request = Request {
+            scope: Scope::Volume(&scope_mount),
+            mark,
+            ticket: None,
+        };
+        preview_scans::scan(&shared, &config, &tools, request, &app)
     })
     .await;
     match scanned {
@@ -397,6 +404,21 @@ async fn scan_one<R: Runtime>(
             log::warn!("preview scan task for {mount} failed: {e}");
             None
         }
+    }
+}
+
+/// Shows a notification with the Clean… button.
+fn notify<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
+    log::info!("alert: {title}: {body}");
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .action_type_id(LOW_SPACE_ACTIONS)
+        .show()
+    {
+        log::error!("could not show notification {title:?}: {e}");
     }
 }
 
@@ -521,11 +543,13 @@ impl<R: Runtime> Poller<R> {
                 DailyAction::Skip => log::info!("daily scan: skipping {}", volume.name),
                 DailyAction::Offer => {
                     let name = volume.name.clone();
-                    let cleanable = self.estimate(&config, volume).await;
-                    match monitor::daily_scan_message(&name, space, cleanable) {
-                        Some((title, body)) => self.notify(&title, &body),
-                        None => log::info!("daily scan: nothing to offer on {name}"),
-                    }
+                    self.notify_with_estimate(&config, &volume, move |cleanable| {
+                        let message = monitor::daily_scan_message(&name, space, cleanable);
+                        if message.is_none() {
+                            log::info!("daily scan: nothing to offer on {name}");
+                        }
+                        message
+                    });
                 }
             }
         }
@@ -564,11 +588,11 @@ impl<R: Runtime> Poller<R> {
     /// a drive is low at the scheduled time, and the second run is still useful.
     async fn clean_daily(&mut self, config: &Config, date: NaiveDate, volumes: Vec<Volume>) {
         let mut busy = Vec::new();
-        let mut cleaned = false;
+        let mut rescan = Vec::new();
         for volume in volumes {
             let mount = volume.mount.clone();
             match self.clean(config, volume, Trigger::Daily).await {
-                Cleaned::Removed => cleaned = true,
+                Cleaned::Removed => rescan.push(mount.display().to_string()),
                 Cleaned::NothingRemoved => {}
                 Cleaned::LockBusy => busy.push(mount),
             }
@@ -580,10 +604,12 @@ impl<R: Runtime> Poller<R> {
             );
             self.daily_retry = Some((date, busy));
         }
-        // Refresh the menu with the space the cleanup freed.
-        if cleaned {
+        // Refresh the menu with the space the cleanup freed. That check can
+        // clean too, so the rescans wait until it is done.
+        if !rescan.is_empty() {
             self.check().await;
         }
+        self.rescan_if_open(config, rescan);
     }
 
     /// Re-reads the config file. A bad file keeps the last good config running.
@@ -662,23 +688,32 @@ impl<R: Runtime> Poller<R> {
             monitor::evaluate(&self.states, &found.readings, &config, Instant::now());
         self.states = states;
         let mut cleaned = false;
+        let mut rescan = Vec::new();
         for alert in &alerts {
-            if config.mode == Mode::Auto {
-                let volume = found.readings.iter().find(|(v, _)| v.mount == alert.mount);
-                if let Some((volume, _)) = volume {
-                    self.clean(&config, volume.clone(), Trigger::LowSpace).await;
+            let volume = found.readings.iter().find(|(v, _)| v.mount == alert.mount);
+            match volume {
+                Some((volume, _)) if config.mode == Mode::Auto => {
+                    let mount = volume.mount.display().to_string();
+                    if self.clean(&config, volume.clone(), Trigger::LowSpace).await
+                        == Cleaned::Removed
+                    {
+                        rescan.push(mount);
+                    }
                     cleaned = true;
-                    continue;
+                }
+                Some((volume, _)) => {
+                    let alert = alert.clone();
+                    self.notify_with_estimate(&config, volume, move |cleanable| {
+                        Some(alert.message(cleanable))
+                    });
+                }
+                None => {
+                    let (title, body) = alert.message(None);
+                    self.notify(&title, &body);
                 }
             }
-            let volume = found.readings.iter().find(|(v, _)| v.mount == alert.mount);
-            let cleanable = match volume {
-                Some((v, _)) => self.estimate(&config, v.clone()).await,
-                None => None,
-            };
-            let (title, body) = alert.message(cleanable);
-            self.notify(&title, &body);
         }
+        self.rescan_if_open(&config, rescan);
         // Show the space after cleaning, not the reading that triggered it.
         if cleaned && let Some(after) = self.scan_volumes(&config).await {
             found = after;
@@ -708,20 +743,46 @@ impl<R: Runtime> Poller<R> {
         }
     }
 
-    /// How much can be cleaned on `volume`, for an ask-mode notification.
-    /// The scan behind the number is the shared preview scan, so it is stored
-    /// for the Clean tab, which the notification opens, and an open tab shows
-    /// it running. `None` if the scan cannot run, fails or is cancelled.
-    async fn estimate(&self, config: &Config, volume: Volume) -> Option<u64> {
-        let mount = volume.mount.display().to_string();
-        let found = scan_one(
-            self.app.clone(),
-            Arc::clone(&self.shared),
-            config.clone(),
-            mount,
-        )
-        .await?;
-        found.first().map(|v| v.total_bytes)
+    /// Sends an ask-mode notification about `volume` once a preview scan has
+    /// counted what could be cleaned. `message` turns that count into the
+    /// title and body, or `None` to send nothing; the count is `None` if the
+    /// scan could not run, failed or was cancelled.
+    ///
+    /// The scan is the shared preview scan, so it is stored for the Clean tab,
+    /// which the notification opens, and an open tab shows it running. It runs
+    /// apart from the loop: it waits for its turn and for any clean, which can
+    /// take minutes, and the loop must keep checking meanwhile.
+    fn notify_with_estimate(
+        &self,
+        config: &Config,
+        volume: &Volume,
+        message: impl FnOnce(Option<u64>) -> Option<(String, String)> + Send + 'static,
+    ) {
+        let (app, shared) = (self.app.clone(), Arc::clone(&self.shared));
+        let (config, mount) = (config.clone(), volume.mount.display().to_string());
+        let mark = shared.scans.mark();
+        tauri::async_runtime::spawn(async move {
+            let found = scan_one(app.clone(), shared, config, mount, mark).await;
+            let cleanable = found.and_then(|f| f.first().map(|v| v.total_bytes));
+            if let Some((title, body)) = message(cleanable) {
+                notify(&app, &title, &body);
+            }
+        });
+    }
+
+    /// Rescans each volume in `mounts` after a clean there, so an open Clean
+    /// tab gets a fresh list, not only a note that its list is out of date.
+    /// Call it once the loop's cleans have all finished, so a rescan does not
+    /// run while the next volume is cleaned. Does nothing with no window open.
+    fn rescan_if_open(&self, config: &Config, mounts: Vec<String>) {
+        if mounts.is_empty() || !windows::is_open(&self.app) {
+            return;
+        }
+        for mount in mounts {
+            let (app, shared) = (self.app.clone(), Arc::clone(&self.shared));
+            let mark = shared.scans.mark();
+            tauri::async_runtime::spawn(scan_one(app, shared, config.clone(), mount, mark));
+        }
     }
 
     /// Runs the cleanup tasks on one volume and reports the result.
@@ -739,7 +800,6 @@ impl<R: Runtime> Poller<R> {
             return Cleaned::NothingRemoved;
         };
         let _cleaning = self.shared.start_cleaning(&self.app);
-        let rescan_config = config.clone();
         let config = config.clone();
         let sizes = Arc::clone(&self.shared.sizes);
         let paths = self.shared.paths.clone();
@@ -793,17 +853,6 @@ impl<R: Runtime> Poller<R> {
             if let Err(e) = windows::preview_changed(&self.app) {
                 log::warn!("could not tell the window about the clean: {e}");
             }
-            // An open Clean tab gets a fresh list, not only a note that its
-            // list is out of date. The scan waits for this clean to end, and
-            // runs apart from the loop so the next check is not held up.
-            if windows::is_open(&self.app) {
-                tauri::async_runtime::spawn(scan_one(
-                    self.app.clone(),
-                    Arc::clone(&self.shared),
-                    rescan_config,
-                    mount,
-                ));
-            }
             Cleaned::Removed
         } else {
             Cleaned::NothingRemoved
@@ -811,18 +860,7 @@ impl<R: Runtime> Poller<R> {
     }
 
     fn notify(&self, title: &str, body: &str) {
-        log::info!("alert: {title}: {body}");
-        if let Err(e) = self
-            .app
-            .notification()
-            .builder()
-            .title(title)
-            .body(body)
-            .action_type_id(LOW_SPACE_ACTIONS)
-            .show()
-        {
-            log::error!("could not show notification {title:?}: {e}");
-        }
+        notify(&self.app, title, body);
     }
 
     fn show(&mut self, view: MenuView) {

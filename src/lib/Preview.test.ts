@@ -460,7 +460,7 @@ describe('Preview', () => {
       render(Preview)
       await settle()
 
-      await emit('scan-changed', { state: 'scanning', since: since(0) })
+      await emit('scan-changed', { state: 'scanning', since: since(0), ticket: null })
       expect(await screen.findByText('Scanning your folders…')).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Scan' })).toBeDisabled()
 
@@ -476,7 +476,7 @@ describe('Preview', () => {
     })
 
     it('shows a scan already running when the window opens, timed from its start', async () => {
-      backend({ get_scan_state: () => ({ state: 'scanning', since: since(7) }) })
+      backend({ get_scan_state: () => ({ state: 'scanning', since: since(7), ticket: null }) })
       render(Preview)
 
       expect(await screen.findByText('Scanning your folders…')).toBeInTheDocument()
@@ -488,9 +488,9 @@ describe('Preview', () => {
       render(Preview)
       await settle()
 
-      await emit('scan-changed', { state: 'waiting_for_clean', since: since(0) })
+      await emit('scan-changed', { state: 'waiting_for_clean', since: since(0), ticket: null })
       expect(await screen.findByText('Waiting for Picard to finish cleaning…')).toBeInTheDocument()
-      await emit('scan-changed', { state: 'scanning', since: since(0) })
+      await emit('scan-changed', { state: 'scanning', since: since(0), ticket: null })
       expect(await screen.findByText('Scanning your folders…')).toBeInTheDocument()
     })
 
@@ -501,7 +501,7 @@ describe('Preview', () => {
       stored = volumes()
       await fireEvent.click(box('shop/web'))
 
-      await emit('scan-changed', { state: 'scanning', since: since(0) })
+      await emit('scan-changed', { state: 'scanning', since: since(0), ticket: null })
       await fireEvent.click(await screen.findByRole('button', { name: 'Cancel scan' }))
       expect(sent('cancel_scan')).toHaveLength(1)
       await emit('scan-changed', { state: 'idle' })
@@ -509,6 +509,108 @@ describe('Preview', () => {
       expect(await screen.findByText('Macintosh HD')).toBeInTheDocument()
       expect(box('shop/web')).not.toBeChecked()
     })
+  })
+
+  it('drops a phase read that an event overtook, so a finished scan does not stick', async () => {
+    const read = deferred<ScanPhase>()
+    backend({ get_scan_state: () => read.promise })
+    render(Preview)
+    await settle()
+
+    // The scan ends while the page's first read of the phase is in flight.
+    await emit('scan-changed', { state: 'idle' })
+    read.resolve({ state: 'scanning', since: new Date().toISOString(), ticket: null })
+    await settle()
+
+    expect(screen.queryByText('Scanning your folders…')).not.toBeInTheDocument()
+    expect(
+      screen.getByText('Press Scan to find build folders, caches and stale worktrees.'),
+    ).toBeInTheDocument()
+  })
+
+  it('shows a background scan queued right behind its own scan like its own', async () => {
+    const own = deferred<VolumePreview[]>()
+    let stored: VolumePreview[] = []
+    const { sent } = backend({ preview: () => own.promise, get_last_preview: () => stored })
+    render(Preview)
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }))
+    const ticket = sent('preview')[0].ticket as number
+    const now = new Date().toISOString()
+    await emit('scan-changed', { state: 'scanning', since: now, ticket })
+
+    // The estimate starts before the page has handled its own reply.
+    await emit('scan-changed', { state: 'scanning', since: now, ticket: null })
+    stored = volumes()
+    own.resolve(volumes())
+    await settle()
+    // The queued scan is running, so the panel stays up, as for any scan.
+    expect(screen.getByText('Scanning your folders…')).toBeInTheDocument()
+
+    const later = volumes()
+    later[0].scanned_at = '2026-10-22T10:00:00Z'
+    later[0].tasks[0].items.push(item('/Users/a/w/docs/node_modules', 3e9))
+    stored = later
+    await emit('preview-changed')
+    await emit('scan-changed', { state: 'idle' })
+
+    expect(await screen.findByRole('checkbox', { name: /docs/ })).toBeChecked()
+    expect(screen.queryByRole('button', { name: 'Show it' })).not.toBeInTheDocument()
+  })
+
+  it('cancels its own scan while it waits for a clean', async () => {
+    const own = deferred<VolumePreview[] | null>()
+    const { sent } = backend({ preview: () => own.promise })
+    render(Preview)
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }))
+    const ticket = sent('preview')[0].ticket as number
+    await emit('scan-changed', {
+      state: 'waiting_for_clean',
+      since: new Date().toISOString(),
+      ticket,
+    })
+    expect(await screen.findByText('Waiting for Picard to finish cleaning…')).toBeInTheDocument()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel scan' }))
+    expect(sent('cancel_scan')).toHaveLength(1)
+    own.resolve(null)
+
+    expect(
+      await screen.findByText('Press Scan to find build folders, caches and stale worktrees.'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Waiting for Picard to finish cleaning…')).not.toBeInTheDocument()
+    expect(document.querySelector('.error')).toBeNull()
+  })
+
+  it('reads the phase again after Cancel, so a missed idle event cannot leave the panel up', async () => {
+    let phase: ScanPhase = { state: 'idle' }
+    const { sent } = backend({ get_scan_state: () => phase })
+    render(Preview)
+    await settle()
+    await emit('scan-changed', { state: 'scanning', since: new Date().toISOString(), ticket: null })
+    const cancel = await screen.findByRole('button', { name: 'Cancel scan' })
+
+    // The backend is already idle, and its idle event never arrived.
+    phase = { state: 'idle' }
+    await fireEvent.click(cancel)
+
+    await waitFor(() =>
+      expect(screen.queryByText('Scanning your folders…')).not.toBeInTheDocument(),
+    )
+    expect(sent('get_scan_state').length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('does not call its own clean a background one once it ends', async () => {
+    const run = deferred<RunResult[]>()
+    backend({ run_selected: () => run.promise })
+    await renderScanned()
+    const note = 'Picard is cleaning in the background. You can clean again when it finishes.'
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Clean selected' }))
+    await emit('cleaning-changed', true)
+    // The run ends before its `cleaning-changed` false arrives.
+    run.resolve([])
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Clean selected' })).toBeEnabled())
+    expect(screen.queryByText(note)).not.toBeInTheDocument()
   })
 
   it('keeps the list and shows no error when its own scan is cancelled', async () => {

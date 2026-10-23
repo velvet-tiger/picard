@@ -40,8 +40,12 @@
   let history = $state<HistoryEntry[]>([])
   let totals = $state<Totals | null>(null)
   let status = $state<Status | null>(null)
-  // The page's own Scan, from the click until its reply, and when it was clicked.
-  let asked = $state(false)
+  // The ticket sent with the page's own Scan, from the click until its reply,
+  // and when it was clicked. The backend puts the ticket in that scan's phase,
+  // so the page can tell its own scan from one it should follow.
+  let myTicket = $state<number | null>(null)
+  let lastTicket = Math.floor(Math.random() * 1e9)
+  const asked = $derived(myTicket !== null)
   let askedAt = $state(0)
   // The shared scan as the backend reports it, whoever started it: a click
   // here, a notification's estimate, or the rescan after a background clean.
@@ -56,6 +60,9 @@
   // Set while the page follows a scan it did not start, so the result is
   // shown when it ends, as the page's own would be.
   let following = false
+  // Counts `scan-changed` events, so a phase read that was in flight when one
+  // arrived does not overwrite it with an older answer.
+  let scanEvents = 0
   // A scan can take half a minute, so the page does not start one itself. It
   // shows the latest stored scan, such as the one behind a notification, or
   // waits for a click.
@@ -83,6 +90,17 @@
   function cleaningChanged(now: boolean) {
     cleaningEvents++
     cleaningAnywhere = now
+  }
+
+  /** Reads whether a cleanup runs anywhere, unless an event says so first. */
+  async function readCleaning() {
+    const seen = cleaningEvents
+    try {
+      const now = await getStatus()
+      if (seen === cleaningEvents) cleaningAnywhere = now.cleaning
+    } catch (e) {
+      console.error('status', e)
+    }
   }
   let error = $state<string | null>(null)
   let results = $state<RunResult[] | null>(null)
@@ -165,43 +183,67 @@
   }
 
   async function scan() {
-    asked = true
+    myTicket = ++lastTicket
     askedAt = Date.now()
     error = null
     try {
       // Null means the scan was cancelled; the list stays as it was.
-      const found = await preview()
+      const found = await preview(myTicket)
       if (found) show(found)
     } catch (e) {
       error = errorText(e)
     } finally {
-      asked = false
+      myTicket = null
     }
     reloadRecords()
     afterBusy()
   }
 
-  /** Cancels the running scan, whoever started it. */
+  /**
+   * Cancels the running scan, whoever started it. Then reads the phase again,
+   * so a missed `scan-changed` cannot leave the panel up with nothing running.
+   */
   async function cancel() {
     try {
       await cancelScan()
     } catch (e) {
       error = errorText(e)
+      return
     }
+    await readScanState()
+  }
+
+  function phaseChanged(next: ScanPhase) {
+    scanEvents++
+    applyPhase(next)
+  }
+
+  /** Reads the phase, for a window opened mid-scan and as a backstop for a missed event. */
+  async function readScanState() {
+    const seen = scanEvents
+    let now: ScanPhase
+    try {
+      now = await getScanState()
+    } catch (e) {
+      console.error('scan state', e)
+      return
+    }
+    if (seen === scanEvents) applyPhase(now)
   }
 
   /**
-   * Follows the shared scan. One the page did not start is shown when it
-   * ends, as if the page had started it.
+   * Follows the shared scan. Any scan but the page's own, even one queued
+   * right behind it, is shown when it ends, as if the page had started it.
    */
-  function phaseChanged(next: ScanPhase) {
+  function applyPhase(next: ScanPhase) {
     phase = next
     if (next.state !== 'idle') {
-      if (!asked) following = true
+      following = next.ticket === null || next.ticket !== myTicket
       return
     }
-    if (following && !asked) {
-      following = false
+    const followed = following
+    following = false
+    if (followed && !asked) {
       showFollowed()
     } else {
       afterBusy()
@@ -415,6 +457,9 @@
     } catch (e) {
       error = errorText(e)
     } finally {
+      // The page's own clean has ended. A fresh read says whether another is
+      // still running, so the background note does not flash up meanwhile.
+      await readCleaning()
       cleaning = false
     }
     await scan()
@@ -513,8 +558,11 @@
     }
   })
 
+  // The phase is read once the listener is live, so a scan that ends between
+  // the two cannot leave the page showing it.
   $effect(() => {
     const unlisten = onScanChanged(phaseChanged)
+    unlisten.then(readScanState)
     return () => {
       unlisten.then((stop) => stop())
     }
@@ -536,12 +584,6 @@
 
   reloadRecords()
   loadStored()
-  // A window opened mid-scan shows that scan, as if it had started it.
-  getScanState()
-    .then((now) => {
-      if (phase.state === 'idle' && now.state !== 'idle') phaseChanged(now)
-    })
-    .catch((e) => console.error('scan state', e))
 </script>
 
 <main>

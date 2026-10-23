@@ -19,7 +19,7 @@ use crate::config::{self, Appearance, Config, Mode};
 use crate::disk::{self, DiskSpace};
 use crate::history::{self, Entry, Totals};
 use crate::poll;
-use crate::preview_scans::{self, ScanPhase, Scope};
+use crate::preview_scans::{self, Request, ScanPhase, Scope};
 use crate::runner::{self, CleanRequest, TaskScan, VolumeRun};
 use crate::settings::{self, Settings};
 use crate::state::Shared;
@@ -273,17 +273,26 @@ fn protection_view(ignore: &IgnoreList, paths: &[String]) -> Vec<Option<&'static
 
 /// Scans every volume through the shared preview scan, waiting first for any
 /// running clean to end. `None` if the scan was cancelled; the page then keeps
-/// the list it had. See `preview_scans`.
+/// the list it had. `ticket` comes back in the scan's phase, so the page can
+/// tell its own scan from others. See `preview_scans`.
 #[tauri::command]
 pub async fn preview<R: Runtime>(
     app: AppHandle<R>,
     state: SharedState<'_>,
+    ticket: Option<u64>,
 ) -> Result<Option<Vec<VolumePreview>>, String> {
     let shared = Arc::clone(&state);
+    // Marked before any slow work, so a Cancel pressed straight after Scan counts.
+    let mark = shared.scans.mark();
     blocking(move || {
         let config = load_config(&shared)?;
         let tools = shared.tools().ok_or(STILL_STARTING)?;
-        preview_scans::scan(&shared, &config, &tools, Scope::Every, &app)
+        let request = Request {
+            scope: Scope::Every,
+            mark,
+            ticket,
+        };
+        preview_scans::scan(&shared, &config, &tools, request, &app)
     })
     .await
 }

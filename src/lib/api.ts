@@ -131,12 +131,13 @@ export interface Status {
 /**
  * Where the shared preview scan is. Mirrors `ScanPhase` in preview_scans.rs.
  * `since` is when the phase began, as RFC 3339. A scan asked for during a
- * clean waits for it to end.
+ * clean waits for it to end. `ticket` is the one the page sent with its own
+ * Scan, and null for any other scan.
  */
 export type ScanPhase =
   | { state: 'idle' }
-  | { state: 'waiting_for_clean'; since: string }
-  | { state: 'scanning'; since: string }
+  | { state: 'waiting_for_clean'; since: string; ticket: number | null }
+  | { state: 'scanning'; since: string; ticket: number | null }
 
 export const getStatus = () => invoke<Status>('get_status')
 export const getSettings = () => invoke<Settings>('get_settings')
@@ -145,9 +146,10 @@ export const getAppearance = () => invoke<Appearance>('get_appearance')
 export const saveSettings = (settings: Settings) => invoke<void>('save_settings', { settings })
 /**
  * Scans every volume, waiting first for any running clean to end. Resolves to
- * null when the scan was cancelled.
+ * null when the scan was cancelled. `ticket` comes back in the scan's phase.
  */
-export const preview = () => invoke<VolumePreview[] | null>('preview')
+export const preview = (ticket: number) =>
+  invoke<VolumePreview[] | null>('preview', { ticket })
 /** Where the shared preview scan is, whoever started it. */
 export const getScanState = () => invoke<ScanPhase>('get_scan_state')
 /** Cancels the running preview scan, whoever started it. Harmless when none runs. */

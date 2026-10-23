@@ -3,8 +3,8 @@
 //! A Scan click, a notification's estimate and the rescan after a background
 //! clean all go through `scan`, so they follow the same rules: one scan at a
 //! time, never alongside a clean, stored the same way, shown the same way, and
-//! cancelled by the same Cancel button. The Clean tab cannot tell who started
-//! a scan, and does not need to.
+//! cancelled by the same Cancel button. The Clean tab shows every scan the
+//! same way; a ticket only tells it which reply is its own.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +23,9 @@ use crate::state::Shared;
 use crate::tasks::Stop;
 use crate::volume::Volume;
 
-/// Where the preview scan is. Mirrors `ScanPhase` in api.ts.
+/// Where the preview scan is. Mirrors `ScanPhase` in api.ts. `ticket` is the
+/// number the Clean tab sent with its own Scan, and `None` for any other
+/// scan, so the tab can tell its own scan from one it should follow.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ScanPhase {
@@ -32,9 +34,11 @@ pub enum ScanPhase {
     /// A scan was asked for while a clean runs, and starts when it ends.
     WaitingForClean {
         since: DateTime<Utc>,
+        ticket: Option<u64>,
     },
     Scanning {
         since: DateTime<Utc>,
+        ticket: Option<u64>,
     },
 }
 
@@ -55,14 +59,29 @@ pub enum Scope<'a> {
     Volume(&'a str),
 }
 
+/// When a scan was asked for, as far as Cancel is concerned. See
+/// `PreviewScans::mark`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelMark(u64);
+
+/// One scan as asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Request<'a> {
+    pub scope: Scope<'a>,
+    /// Taken when the request arrived. See `PreviewScans::mark`.
+    pub mark: CancelMark,
+    /// See `ScanPhase`.
+    pub ticket: Option<u64>,
+}
+
 /// The shared scan's state, held in `Shared::scans`.
 #[derive(Debug, Default)]
 pub struct PreviewScans {
     /// Held for the whole of a scan, so only one runs at a time.
     turn: Mutex<()>,
     phase: Mutex<ScanPhase>,
-    /// Bumped by `cancel`. A scan stops once this differs from the value it
-    /// read when it was asked for, so Cancel also stops scans still queued.
+    /// Bumped by `cancel`. A scan stops once this differs from its mark, so
+    /// Cancel also stops scans still queued for their turn.
     cancels: AtomicU64,
 }
 
@@ -72,7 +91,14 @@ impl PreviewScans {
         lock(&self.phase).clone()
     }
 
-    /// Stops the running scan, and any asked for before now, within about a
+    /// Marks a scan as asked for now. Take it as soon as the request arrives,
+    /// before any slow work, so a Cancel pressed straight after the request
+    /// still stops it.
+    pub fn mark(&self) -> CancelMark {
+        CancelMark(self.cancels.load(Ordering::SeqCst))
+    }
+
+    /// Stops every scan marked before now, running or queued, within about a
     /// second. They store nothing. Harmless when no scan runs.
     pub fn cancel(&self) {
         self.cancels.fetch_add(1, Ordering::SeqCst);
@@ -101,41 +127,46 @@ impl Drop for IdleOnDrop<'_> {
     }
 }
 
-/// Scans `scope` with the config's tasks. See `scan_with`.
+/// Scans with the config's tasks. See `scan_with`.
 pub fn scan(
     shared: &Shared,
     config: &Config,
     tools: &ToolEnv,
-    scope: Scope,
+    request: Request,
     events: &dyn ScanEvents,
 ) -> Result<Option<Vec<VolumePreview>>, String> {
     let scan_volume = |volume: &Volume, stop: Stop| {
         runner::preview_volume(config, volume, &shared.sizes, tools, stop)
     };
-    scan_with(shared, &config.roots, scope, events, &scan_volume)
+    scan_with(shared, &config.roots, request, events, &scan_volume)
 }
 
-/// Waits for its turn and for any clean to end, then scans `scope` with
-/// `scan_volume`, stores the result and tells `events`. Returns what it
-/// found, or `None` if it was cancelled, in which case nothing is stored.
-/// A failure on any volume fails the whole scan and stores nothing.
+/// Waits for its turn and for any clean to end, then scans the request's
+/// volumes with `scan_volume`, stores the result and tells `events`. Returns
+/// what it found, or `None` if it was cancelled, in which case nothing is
+/// stored. A failure on any volume fails the whole scan and stores nothing.
 pub fn scan_with(
     shared: &Shared,
     roots: &[PathBuf],
-    scope: Scope,
+    request: Request,
     events: &dyn ScanEvents,
     scan_volume: &dyn Fn(&Volume, Stop) -> Result<Vec<TaskScan>>,
 ) -> Result<Option<Vec<VolumePreview>>, String> {
+    let Request {
+        scope,
+        mark,
+        ticket,
+    } = request;
     let scans = &shared.scans;
-    let asked = scans.cancels.load(Ordering::SeqCst);
-    let stop = move || scans.cancels.load(Ordering::SeqCst) != asked;
+    let stop = move || scans.mark() != mark;
     let _turn = lock(&scans.turn);
     if stop() {
         return Ok(None);
     }
     let _idle = IdleOnDrop { scans, events };
     if shared.is_cleaning() {
-        scans.set_phase(ScanPhase::WaitingForClean { since: Utc::now() }, events);
+        let since = Utc::now();
+        scans.set_phase(ScanPhase::WaitingForClean { since, ticket }, events);
     }
     // A scan alongside a clean would repeat its work and list folders it is
     // about to delete. A clean that starts after this is still caught by the
@@ -144,7 +175,11 @@ pub fn scan_with(
         return Ok(None);
     }
     let started = Utc::now();
-    scans.set_phase(ScanPhase::Scanning { since: started }, events);
+    let phase = ScanPhase::Scanning {
+        since: started,
+        ticket,
+    };
+    scans.set_phase(phase, events);
     log::info!("preview scan started ({scope:?})");
     let found = poll::scan(roots, &shared.uuids);
     let mut out = Vec::new();
@@ -229,6 +264,26 @@ mod tests {
         }
     }
 
+    /// A request for every volume, marked now, from no ticket.
+    fn every(shared: &Shared) -> Request<'static> {
+        Request {
+            scope: Scope::Every,
+            mark: shared.scans.mark(),
+            ticket: None,
+        }
+    }
+
+    fn until_stopped(_: &Volume, stop: Stop) -> Result<Vec<TaskScan>> {
+        while !stop() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(ScanStopped.into())
+    }
+
+    fn never(_: &Volume, _: Stop) -> Result<Vec<TaskScan>> {
+        panic!("a cancelled scan must not start")
+    }
+
     fn empty(_: &Volume, _: Stop) -> Result<Vec<TaskScan>> {
         Ok(Vec::new())
     }
@@ -237,7 +292,7 @@ mod tests {
     fn a_scan_stores_its_result_and_reports_each_phase() {
         let s = setup();
         let events = Recorder::default();
-        let found = scan_with(&s.shared, &s.roots, Scope::Every, &events, &empty)
+        let found = scan_with(&s.shared, &s.roots, every(&s.shared), &events, &empty)
             .unwrap()
             .expect("not cancelled");
         assert_eq!(found.len(), 1, "the temp root sits on one volume");
@@ -253,7 +308,11 @@ mod tests {
         let found = scan_with(
             &s.shared,
             &s.roots,
-            Scope::Volume("/not/a/mount"),
+            Request {
+                scope: Scope::Volume("/not/a/mount"),
+                mark: s.shared.scans.mark(),
+                ticket: None,
+            },
             &Recorder::default(),
             &empty,
         )
@@ -270,7 +329,7 @@ mod tests {
         let scanner = {
             let (shared, roots, events) =
                 (Arc::clone(&s.shared), s.roots.clone(), Arc::clone(&events));
-            std::thread::spawn(move || scan_with(&shared, &roots, Scope::Every, &*events, &empty))
+            std::thread::spawn(move || scan_with(&shared, &roots, every(&shared), &*events, &empty))
         };
         std::thread::sleep(Duration::from_millis(100));
         assert!(matches!(
@@ -304,7 +363,7 @@ mod tests {
                         running.fetch_sub(1, Ordering::SeqCst);
                         Ok(Vec::new())
                     };
-                    scan_with(&shared, &roots, Scope::Every, &Recorder::default(), &slow)
+                    scan_with(&shared, &roots, every(&shared), &Recorder::default(), &slow)
                 })
             })
             .collect();
@@ -322,13 +381,7 @@ mod tests {
             let (shared, roots, events) =
                 (Arc::clone(&s.shared), s.roots.clone(), Arc::clone(&events));
             std::thread::spawn(move || {
-                let until_stopped = |_: &Volume, stop: Stop| {
-                    while !stop() {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(ScanStopped.into())
-                };
-                scan_with(&shared, &roots, Scope::Every, &*events, &until_stopped)
+                scan_with(&shared, &roots, every(&shared), &*events, &until_stopped)
             })
         };
         std::thread::sleep(Duration::from_millis(50));
@@ -346,10 +399,13 @@ mod tests {
         let scanner = {
             let (shared, roots) = (Arc::clone(&s.shared), s.roots.clone());
             std::thread::spawn(move || {
-                let never = |_: &Volume, _: Stop| -> Result<Vec<TaskScan>> {
-                    panic!("a cancelled scan must not start")
-                };
-                scan_with(&shared, &roots, Scope::Every, &Recorder::default(), &never)
+                scan_with(
+                    &shared,
+                    &roots,
+                    every(&shared),
+                    &Recorder::default(),
+                    &never,
+                )
             })
         };
         std::thread::sleep(Duration::from_millis(50));
@@ -368,7 +424,7 @@ mod tests {
         let found = scan_with(
             &s.shared,
             &s.roots,
-            Scope::Every,
+            every(&s.shared),
             &Recorder::default(),
             &empty,
         );
@@ -382,7 +438,7 @@ mod tests {
         let err = scan_with(
             &s.shared,
             &s.roots,
-            Scope::Every,
+            every(&s.shared),
             &Recorder::default(),
             &broken,
         )
@@ -390,5 +446,118 @@ mod tests {
         assert!(err.ends_with("no exclude"), "{err}");
         assert!(s.shared.previews().is_empty());
         assert_eq!(s.shared.scans.phase(), ScanPhase::Idle);
+    }
+
+    #[test]
+    fn the_phase_carries_the_ticket_of_the_request() {
+        let s = setup();
+        let events = Recorder::default();
+        let request = Request {
+            ticket: Some(41),
+            ..every(&s.shared)
+        };
+        scan_with(&s.shared, &s.roots, request, &events, &empty).unwrap();
+        let phases = lock(&events.phases).clone();
+        assert!(
+            matches!(
+                phases[0],
+                ScanPhase::Scanning {
+                    ticket: Some(41),
+                    ..
+                }
+            ),
+            "{phases:?}"
+        );
+    }
+
+    #[test]
+    fn a_cancel_before_the_request_reaches_its_thread_still_stops_it() {
+        let s = setup();
+        let mark = s.shared.scans.mark();
+        s.shared.scans.cancel();
+        let request = Request {
+            mark,
+            ..every(&s.shared)
+        };
+        let found = scan_with(&s.shared, &s.roots, request, &Recorder::default(), &never);
+        assert_eq!(found, Ok(None));
+    }
+
+    #[test]
+    fn cancel_stops_a_scan_queued_behind_a_running_one() {
+        let s = setup();
+        let running = {
+            let (shared, roots) = (Arc::clone(&s.shared), s.roots.clone());
+            std::thread::spawn(move || {
+                let request = every(&shared);
+                scan_with(
+                    &shared,
+                    &roots,
+                    request,
+                    &Recorder::default(),
+                    &until_stopped,
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let queued = {
+            let (shared, roots) = (Arc::clone(&s.shared), s.roots.clone());
+            std::thread::spawn(move || {
+                scan_with(
+                    &shared,
+                    &roots,
+                    every(&shared),
+                    &Recorder::default(),
+                    &never,
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!queued.is_finished(), "the second scan waits for its turn");
+        s.shared.scans.cancel();
+        assert_eq!(running.join().unwrap(), Ok(None));
+        assert_eq!(queued.join().unwrap(), Ok(None));
+        assert!(s.shared.previews().is_empty());
+    }
+
+    /// A clean finds its candidates again just before removing them. Cancel
+    /// is for scans only, so it must not cut that re-check short: the clean
+    /// builds its own context, which nothing can stop.
+    #[test]
+    fn a_cancel_does_not_reach_a_clean() {
+        let s = setup();
+        let root = &s.roots[0];
+        let modules = root.join("web/node_modules");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(root.join("web/package.json"), "{}").unwrap();
+        std::fs::write(modules.join("x.js"), vec![b'x'; 1000]).unwrap();
+        let old = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - Duration::from_secs(60 * 86_400),
+        );
+        for e in walkdir::WalkDir::new(root.join("web")).contents_first(true) {
+            filetime::set_symlink_file_times(e.unwrap().path(), old, old).unwrap();
+        }
+        let text = format!(
+            "min_free_gb = 1\nroots = [{:?}]\n[[task]]\ntype = \"node_modules\"\nstale_days = 30\n",
+            root.display().to_string()
+        );
+        let config = crate::config::parse(&text, s._dir.path()).unwrap();
+        let found = poll::scan(&config.roots, &s.shared.uuids);
+        let (volume, _) = &found.readings[0];
+        let tools = ToolEnv::from_dirs(s._dir.path(), Vec::new());
+
+        s.shared.scans.cancel();
+        let run = runner::clean_volume(
+            &config,
+            volume,
+            &s.shared.sizes,
+            &s.shared.paths,
+            &tools,
+            runner::CleanRequest::Everything,
+            &|| Ok(Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(run.removed.len(), 1, "{run:?}");
+        assert!(!modules.exists());
     }
 }
