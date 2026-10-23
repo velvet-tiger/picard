@@ -7,9 +7,9 @@
 //! listings Picard parses for safety decisions) pass a large cap and treat
 //! `truncated` as an error.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -60,12 +60,44 @@ impl Output {
 
 /// Runs `cmd` to completion or until `timeout`, keeping the last `cap` bytes of
 /// stdout and of stderr. stdin is closed so a command waiting for input cannot hang.
-pub fn run(mut cmd: Command, timeout: Duration, cap: usize) -> io::Result<Output> {
-    cmd.stdin(Stdio::null())
+pub fn run(cmd: Command, timeout: Duration, cap: usize) -> io::Result<Output> {
+    run_inner(cmd, None, timeout, cap)
+}
+
+/// Like `run`, but writes `input` to the command's stdin and then closes it.
+/// A thread of its own writes, so a command that fills its output pipe before
+/// it reads all its input cannot deadlock against the readers.
+///
+/// If the command exits with success while part of `input` is still
+/// unwritten, that is an error: its output came from only part of the input.
+/// This can only be seen when the input is larger than the pipe's buffer.
+/// Smaller input fits in the buffer whether or not the command reads it.
+pub fn run_with_input(
+    cmd: Command,
+    input: Vec<u8>,
+    timeout: Duration,
+    cap: usize,
+) -> io::Result<Output> {
+    run_inner(cmd, Some(input), timeout, cap)
+}
+
+fn run_inner(
+    mut cmd: Command,
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+    cap: usize,
+) -> io::Result<Output> {
+    let stdin = if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+    cmd.stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
     let mut child = cmd.spawn()?;
+    let writer = input.map(|bytes| spawn_writer(child.stdin.take(), bytes));
     let stdout = spawn_reader(child.stdout.take(), cap);
     let stderr = spawn_reader(child.stderr.take(), cap);
 
@@ -73,15 +105,24 @@ pub fn run(mut cmd: Command, timeout: Duration, cap: usize) -> io::Result<Output
         Some(status) => (status, false),
         None => (terminate_group(&mut child)?, true),
     };
+    let fed = writer.map(collect_written);
     let (stdout, out_cut) = collect(stdout);
     let (stderr, err_cut) = collect(stderr);
-    Ok(Output {
+    let out = Output {
         code: status.code(),
         stdout,
         stderr,
         timed_out,
         truncated: out_cut || err_cut,
-    })
+    };
+    if let Some(Err(e)) = fed
+        && out.success()
+    {
+        return Err(io::Error::other(format!(
+            "the command succeeded without reading all its input: {e}"
+        )));
+    }
+    Ok(out)
 }
 
 fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
@@ -146,10 +187,38 @@ fn spawn_reader<R: Read + Send + 'static>(
                 Err(_) => break,
             }
         }
+        // Valid UTF-8 becomes a String without a copy, so a large output is
+        // not held twice.
+        let text = String::from_utf8(kept)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         // The receiver may have given up waiting; nothing to do then.
-        let _ = tx.send((String::from_utf8_lossy(&kept).into_owned(), cut));
+        let _ = tx.send((text, cut));
     });
     rx
+}
+
+/// Writes `bytes` to the child's stdin on a thread, then closes it. A child
+/// that exits early makes the write fail with a broken pipe, which the thread
+/// reports rather than raising SIGPIPE: Rust programs ignore that signal.
+fn spawn_writer(stdin: Option<ChildStdin>, bytes: Vec<u8>) -> mpsc::Receiver<io::Result<()>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = match stdin {
+            Some(mut pipe) => pipe.write_all(&bytes),
+            None => Err(io::Error::other("stdin was not piped")),
+        };
+        // The receiver may have given up waiting; nothing to do then.
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+/// Whether the writer wrote all its input. A writer that never reports back
+/// (its pipe held open by an escaped grandchild that does not read) counts as
+/// a failure.
+fn collect_written(rx: mpsc::Receiver<io::Result<()>>) -> io::Result<()> {
+    rx.recv_timeout(READ_GRACE)
+        .unwrap_or_else(|_| Err(io::Error::other("writing the input did not finish")))
 }
 
 /// The stream's text and whether it was cut. A reader that never reports back
@@ -242,6 +311,52 @@ mod tests {
         .unwrap();
         assert!(out.success());
         assert_eq!(out.stdout, "done\n");
+    }
+
+    /// Both sizes are far past a pipe's buffer, so the child blocks on its
+    /// output while input is still unwritten. A writer on the main thread
+    /// would deadlock here.
+    #[test]
+    fn feeds_large_input_while_reading_large_output() {
+        let input: Vec<u8> = (0..2_000_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let out = run_with_input(
+            Command::new("cat"),
+            input.clone(),
+            Duration::from_secs(20),
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        assert!(out.success(), "{out:?}");
+        assert_eq!(out.stdout.as_bytes(), &input[..]);
+        assert!(!out.truncated);
+    }
+
+    #[test]
+    fn success_without_reading_all_input_is_an_error() {
+        let err = run_with_input(
+            sh("exit 0"),
+            vec![b'x'; 2_000_000],
+            Duration::from_secs(5),
+            SCRIPT_OUTPUT_CAP,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("without reading all its input"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn failure_without_reading_input_is_still_reported_as_output() {
+        let out = run_with_input(
+            sh("echo nope >&2; exit 3"),
+            vec![b'x'; 2_000_000],
+            Duration::from_secs(5),
+            SCRIPT_OUTPUT_CAP,
+        )
+        .unwrap();
+        assert_eq!(out.code, Some(3));
+        assert_eq!(out.stderr, "nope\n");
     }
 
     #[test]

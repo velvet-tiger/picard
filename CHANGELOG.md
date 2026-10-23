@@ -6,10 +6,32 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- When Picard removes a worktree with a detached HEAD, it logs that commit's id. No branch holds the commit, so `git gc` can delete it later. Until then, `git fsck --lost-found` can find it.
+
 ### Changed
 
+- A worktree is done when another local branch holds its HEAD, even with no record of a merge. It is cleaned after `min_idle_minutes`, and the reason names the branch, for example "on dev". When that branch was not the default branch and git had no record of a merge, the worktree used to wait for `stale_days`. Symbolic refs under `refs/heads` do not count as branches.
+- A worktree is also done when other local branches hold a cherry-picked copy of each commit that no other branch holds. The copies can be spread over several branches. The reason says "cherry-picked to another branch". A merge commit among those commits fails this check. So do two commits that make the same change, such as a change made, reverted and made again. A detached worktree whose commit was cherry-picked into `main` used to be kept forever.
+- When git cannot run the cherry-pick check, for example in a partial clone that lacks some files' contents, Picard logs a warning. A pushed worktree then still goes after `stale_days`.
+- Picard no longer looks for a default branch. A repo used to be skipped when `origin/HEAD` named no local branch and the repo had neither `main` nor `master`, such as a repo whose only branch is `trunk`. Its worktrees are now checked.
+- A worktree whose HEAD is in `main` used to show "merged into main". It now names the merge when git recorded one, as in "merged into main (reflog)", and shows "on main" otherwise.
 - Free space is checked more often. Picard checks when you point at or click the menu bar icon, when a scan ends, when a cleanup is recorded (including one from the `picard` command), and every 30 seconds while its window is open. Any of these checks notices a drive that drops below its threshold. A repeat alert for a drive that stays low still waits for the regular `poll_minutes` check after the cooldown. A drive that recovers is ready to alert again from the next regular `poll_minutes` check.
 - An error reading a folder is logged when it first appears, and again only if the error changes. It used to be logged on every check.
+
+### Fixed
+
+- A worktree with a paused rebase, `git am`, merge, cherry-pick, revert, bisect or notes merge is never removed. Removing it would delete that operation's state.
+- A done worktree whose HEAD reflog shows commits made in it, which no other local branch holds and which have no copy on one, now waits for `stale_days`. Its reason says "has commits on no branch". This covers a detached worktree that made a commit and then checked out `main`. Picard used to remove it after `min_idle_minutes`, which lost that commit. Commits the worktree only checked out or reset to do not count. An empty reflog message counts as a commit made here, except on the entry that created the worktree (old value all zeros), which `git worktree add` writes. A squash or fixup rebase leaves its original commits with no copy, so that worktree waits too. So does a worktree whose copies git cannot look for, or whose search would be too large. Without a reflog there is nothing to check.
+- A worktree is kept while one of its own refs, under `refs/worktree/` or `refs/bisect/`, points at a commit that no other local branch holds, or at anything that is not a commit. Removing the worktree would delete that ref.
+- Picard makes git write `log` output in UTF-8. Repo config such as `i18n.logOutputEncoding=UTF-16` made that output unreadable, so every done worktree in the repo was kept.
+- A failed git command logs only the end of a long stderr.
+- A copied repo, made with `cp -R` or Finder's Duplicate, still lists the original repo's worktrees, with the HEAD each had when copied. Picard judged those worktrees by that old HEAD and could remove one that held newer work. It now judges a worktree only through its own repo, by the HEAD it has now.
+- Picard tells git not to read commit-graph files. A forged commit-graph could make a commit look as if a branch held it. Without the commit-graph, scans can be slower on very large repos.
+- Every worktree is judged again just before it is removed, with its repo's branches read afresh. A worktree that is no longer done, or whose commits are no longer anywhere else, is kept. Its HEAD is read once more right before removal, and a worktree whose HEAD moved is kept.
+- Picard passes branch lists to git on stdin. A repo with many thousands of branches no longer fails with an argument list that is too long. A failed git command logs only the start of a long argument list.
+- A branch deleted while Picard reads a repo is now an error. Git used to read its name as a path when a file of that name existed.
 
 ## [0.6.0] - 2026-10-23
 
