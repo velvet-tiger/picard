@@ -6,6 +6,13 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- A worktree is done when another local branch holds its HEAD, even with no record of a merge. It is cleaned after `min_idle_minutes`, and the reason names the branch, for example "on main". It used to wait for `stale_days`.
+- A worktree is also done when other local branches hold cherry-picked copies of all its commits, and none of them is a merge commit. The reason says "cherry-picked to another branch". A detached worktree whose commit was cherry-picked into `main` used to be kept forever.
+- Picard no longer looks for a default branch. A repo with neither `main` nor `master`, such as one whose only branch is `trunk`, used to be skipped. Its worktrees are now checked.
+- A worktree whose HEAD is in `main` used to show "merged into main". It now names the merge when git recorded one, as in "merged into main (reflog)", and shows "on main" otherwise.
+
 ## [0.6.0] - 2026-10-23
 
 ### Added
