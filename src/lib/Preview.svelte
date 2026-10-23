@@ -750,7 +750,13 @@
               aria-controls={listId}
               aria-label="{label} list"
               onclick={() => (open[tk] = !open[tk])}
-              ><span class="chevron" class:open={open[tk]} aria-hidden="true">▸</span></button
+              ><svg
+                class="chevron"
+                class:open={open[tk]}
+                viewBox="0 0 16 16"
+                aria-hidden="true"
+                ><path d="M6 3l5 5-5 5" /></svg
+              ></button
             >
             <h3>
               {#if !t.error && selectable(t).length > 0}
@@ -891,14 +897,22 @@
     background: none;
     padding: 0;
     color: var(--muted);
-    font-size: 16px;
     cursor: pointer;
   }
   .items {
     padding-left: calc(var(--toggle-size) + var(--task-gap));
   }
+  /* Drawn, not a text glyph: the small-triangle characters stay tiny at any font size. */
   .chevron {
-    display: inline-block;
+    display: block;
+    width: 16px;
+    height: 16px;
+    margin: auto;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
     transition: transform 0.15s;
   }
   .chevron.open {
