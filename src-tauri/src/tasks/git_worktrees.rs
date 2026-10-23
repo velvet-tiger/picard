@@ -50,11 +50,17 @@
 //! only its HEAD reflog reaches that commit. Removal deletes that reflog. So
 //! a done worktree whose reflog shows a commit made in it, which no other
 //! local branch holds and which has no copy on one, waits for `stale_days`
-//! instead. Commits it only checked out or reset to do not count. Neither
-//! do drafts with a copy on a branch, such as commits from before a rebase.
-//! The reflog message decides: `ONLY_MOVED` lists the plain movements, and
-//! any other message, even an unknown one, counts as a commit made here.
-//! With no reflog there is nothing to read.
+//! instead. Commits it only checked out or reset to do not count. That
+//! includes a commit made outside the reflog, for example with `git
+//! commit-tree`, and then reached with `checkout` or `reset`. Drafts with a
+//! copy on a branch do not count, such as commits from before a plain
+//! rebase. A squash or fixup rebase leaves originals with no copy, so the
+//! worktree waits. The reflog message decides: `ONLY_MOVED` lists the plain
+//! movements, and any other message, even an unknown one, counts as a
+//! commit made here. An empty message counts as a movement only on the
+//! oldest entry, which `git worktree add` writes. If the search for copies
+//! fails, or would pass `REFLOG_COPY_LIMIT`, the worktree waits. With no
+//! reflog there is nothing to read.
 //!
 //! A branch holding the commits shows they survive, not that the work was
 //! finished. A branch stacked on top of the worktree's branch counts, and so
@@ -209,11 +215,21 @@ fn err_text(e: anyhow::Error) -> String {
     format!("{e:#}")
 }
 
+/// The most `commit...branch` ranges the reflog copy check gives git: one
+/// for each commit made in the worktree, for each other branch. Each range
+/// costs git a merge-base walk. On a repo with a short history, 100,000
+/// ranges took 1.5 s, against git's 60 s timeout. That leaves room for repos
+/// whose merge bases lie much further back. Past the limit the check is
+/// skipped, and the worktree waits for `stale_days`.
+const REFLOG_COPY_LIMIT: usize = 100_000;
+
 pub struct GitWorktrees {
     git: GitCmd,
     stale_days: u32,
     min_idle: Duration,
     in_use: InUseSource,
+    /// `REFLOG_COPY_LIMIT`, lowered in tests.
+    reflog_copy_limit: usize,
 }
 
 impl GitWorktrees {
@@ -223,7 +239,14 @@ impl GitWorktrees {
             stale_days,
             min_idle,
             in_use,
+            reflog_copy_limit: REFLOG_COPY_LIMIT,
         }
+    }
+
+    #[cfg(test)]
+    fn with_reflog_copy_limit(mut self, limit: usize) -> Self {
+        self.reflog_copy_limit = limit;
+        self
     }
 
     /// Decides whether one linked worktree is a candidate. Returns the reason if so.
@@ -485,10 +508,34 @@ impl GitWorktrees {
         }
         let others = state.others(wt.branch.as_deref());
         let unheld = self.unheld(repo, &made, &others)?;
-        if unheld.is_empty() || others.is_empty() {
-            return Ok(unheld.first().map(|id| id.to_string()));
+        let Some(first) = unheld.first() else {
+            return Ok(None);
+        };
+        let path = wt.path.display();
+        let ranges = unheld.len().saturating_mul(others.len());
+        if others.is_empty() {
+            return Ok(Some(first.to_string()));
         }
-        let marked = self.copied_commits(repo, &unheld, &others)?;
+        if ranges > self.reflog_copy_limit {
+            log::debug!(
+                "worktree {path}: not looking for copies of {} commits made here on {} branches: {ranges} ranges exceed the limit of {}",
+                unheld.len(),
+                others.len(),
+                self.reflog_copy_limit
+            );
+            return Ok(Some(first.to_string()));
+        }
+        // Finding no copy only makes the worktree wait, so an error here,
+        // such as a blob a partial clone never fetched, counts as no copy.
+        let marked = match self.copied_commits(repo, &unheld, &others) {
+            Ok(marked) => marked,
+            Err(e) => {
+                log::warn!(
+                    "worktree {path}: cannot look for copies of commits made here, so it waits for stale_days: {e:#}"
+                );
+                return Ok(Some(first.to_string()));
+            }
+        };
         let copied = patch_equivalent(&marked);
         Ok(unheld
             .iter()
@@ -1162,15 +1209,24 @@ fn non_merge_commits(raw: &str) -> Result<Vec<&str>, &str> {
 
 /// The commits a HEAD reflog shows were made in the worktree, newest first,
 /// each once. Lines are `<commit>\t<message>`, from `log --walk-reflogs
-/// --format=%H%x09%gs`. Each entry's commit is the one HEAD moved to.
+/// --format=%H%x09%gs`, newest first. Each entry's commit is the one HEAD
+/// moved to.
+///
+/// `git worktree add` writes the oldest entry, with an empty message. A
+/// later empty message comes from plumbing, such as `git update-ref HEAD`
+/// without `-m`, which can point HEAD at a commit it just made. So only the
+/// oldest entry's empty message counts as a movement.
 fn made_here(raw: &str) -> Result<Vec<&str>> {
+    let lines: Vec<&str> = raw.lines().collect();
+    let oldest = lines.len().saturating_sub(1);
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
-    for line in raw.lines() {
+    for (i, line) in lines.iter().enumerate() {
         let Some((id, message)) = line.split_once('\t') else {
             anyhow::bail!("git log --walk-reflogs printed {line:?}");
         };
-        if !only_moved(message) && seen.insert(id) {
+        let created = i == oldest && message.is_empty();
+        if !created && !only_moved(message) && seen.insert(id) {
             ids.push(id);
         }
     }
@@ -1178,11 +1234,9 @@ fn made_here(raw: &str) -> Result<Vec<&str>> {
 }
 
 /// True if a HEAD reflog message shows HEAD only moved to a commit that
-/// already existed. `git worktree add` writes an empty message. A merge or
-/// pull that fast-forwards made no commit either.
+/// already existed. A merge or pull that fast-forwards made no commit.
 fn only_moved(message: &str) -> bool {
-    message.is_empty()
-        || ONLY_MOVED.iter().any(|m| message.starts_with(m))
+    ONLY_MOVED.iter().any(|m| message.starts_with(m))
         || ((message.starts_with("merge ") || message.starts_with("pull"))
             && message.ends_with(": Fast-forward"))
 }
@@ -1968,14 +2022,20 @@ mod tests {
         assert!(branch_refs("refs/heads/no-tab\n").is_err());
     }
 
-    /// Writes a sequence editor that turns the first `pick` into `edit`, so
-    /// `rebase -i` stops after its first commit with a clean tree.
-    fn edit_first(dir: &Path) -> PathBuf {
+    /// Writes a sequence editor named `name` that applies `sed` to the
+    /// `rebase -i` todo list.
+    fn todo_editor(dir: &Path, name: &str, sed: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let script = dir.join("edit-first.sh");
-        std::fs::write(&script, "#!/bin/sh\nsed -i.bak '1s/^pick/edit/' \"$1\"\n").unwrap();
+        let script = dir.join(name);
+        std::fs::write(&script, format!("#!/bin/sh\nsed -i.bak '{sed}' \"$1\"\n")).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         script
+    }
+
+    /// A sequence editor that turns the first `pick` into `edit`, so
+    /// `rebase -i` stops after its first commit with a clean tree.
+    fn edit_first(dir: &Path) -> PathBuf {
+        todo_editor(dir, "edit-first.sh", "1s/^pick/edit/")
     }
 
     /// Starts `rebase -i main` in `wt`, paused at its first commit.
@@ -2336,6 +2396,31 @@ mod tests {
     #[test]
     fn cherry_pick_check_error_still_lets_a_pushed_worktree_wait_for_stale_days() {
         let fx = Fixture::new(&[]);
+        let r = blobless_clone(&fx);
+        let wt = worktree(&r, "feat");
+        std::fs::write(wt.join("f"), "line1\nmine\n").unwrap();
+        git(&wt, &["commit", "-qam", "mine edits f"]);
+        git(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "push",
+                "-q",
+                "-u",
+                "origin",
+                "feat",
+            ],
+        );
+        age(&fx, &wt, 20);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(reason_of(&found, "feat"), "idle 20 days");
+    }
+
+    /// A blobless clone at `root/repo` of a source outside the roots. Its
+    /// local branch `other` edits `f`, and that blob was never fetched, so
+    /// git with lazy fetch off cannot diff that commit.
+    fn blobless_clone(fx: &Fixture) -> PathBuf {
         let src = fx.dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         git(&src, &["init", "-q"]);
@@ -2350,32 +2435,20 @@ mod tests {
         git(&src, &["checkout", "-q", "main"]);
         let r = fx.root.join("repo");
         let url = format!("file://{}", src.display());
-        let file_ok = ["-c", "protocol.file.allow=always"];
         git(
             fx.dir.path(),
             &[
-                &file_ok[..],
-                &[
-                    "clone",
-                    "-q",
-                    "--filter=blob:none",
-                    &url,
-                    r.to_str().unwrap(),
-                ],
-            ]
-            .concat(),
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "-q",
+                "--filter=blob:none",
+                &url,
+                r.to_str().unwrap(),
+            ],
         );
         git(&r, &["branch", "-q", "other", "origin/other"]);
-        let wt = worktree(&r, "feat");
-        std::fs::write(wt.join("f"), "line1\nmine\n").unwrap();
-        git(&wt, &["commit", "-qam", "mine edits f"]);
-        git(
-            &wt,
-            &[&file_ok[..], &["push", "-q", "-u", "origin", "feat"]].concat(),
-        );
-        age(&fx, &wt, 20);
-        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
-        assert_eq!(reason_of(&found, "feat"), "idle 20 days");
+        r
     }
 
     /// Far more branches than fit on one command line. The cherry-pick check
@@ -2514,11 +2587,14 @@ mod tests {
 
     #[test]
     fn reads_commits_made_here_from_a_head_reflog() {
-        let [a, b, c, d, e, f, g] = ["a", "b", "c", "d", "e", "f", "g"].map(|x| x.repeat(40));
+        let [a, b, c, d, e, f, g, h] =
+            ["a", "b", "c", "d", "e", "f", "g", "h"].map(|x| x.repeat(40));
         let raw = [
             format!("{a}\tcheckout: moving from {b} to main"),
             format!("{b}\tcommit (amend): x"),
             format!("{c}\tcommit: x"),
+            // An empty message after the first entry, as `update-ref` writes.
+            format!("{h}\t"),
             format!("{d}\treset: moving to HEAD"),
             format!("{e}\tmerge topic: Fast-forward"),
             format!("{f}\tpull origin main: Fast-forward"),
@@ -2527,12 +2603,13 @@ mod tests {
             format!("{d}\trebase -i (start): checkout main"),
             format!("{b}\tcherry-pick: x"),
             format!("{a}\tfrobnicate: something git may add later"),
+            // The oldest entry, as `git worktree add` writes it.
             format!("{d}\t"),
         ]
         .join("\n");
         assert_eq!(
             made_here(&raw).unwrap(),
-            vec![b.as_str(), c.as_str(), g.as_str(), a.as_str()]
+            vec![b.as_str(), c.as_str(), h.as_str(), g.as_str(), a.as_str()]
         );
         assert!(made_here("no tab here\n").is_err());
     }
@@ -2767,6 +2844,132 @@ mod tests {
             t.head_unmoved(&entry),
             Err("HEAD moved since it was checked".to_string())
         );
+    }
+
+    /// Asserts `name` is kept while fresh, then found after `stale_days`
+    /// because it made commits that are on no branch.
+    fn waits_for_its_unbranched_commits(fx: &Fixture, t: &GitWorktrees, wt: &Path, name: &str) {
+        age(fx, wt, 1);
+        let found = t.scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "not stale yet: {found:?}");
+        age(fx, wt, 20);
+        let found = t.scan(&fx.ctx()).unwrap();
+        assert_eq!(
+            reason_of(&found, name),
+            "has commits on no branch, idle 20 days"
+        );
+    }
+
+    /// `git update-ref HEAD` without `-m` writes an empty reflog message, as
+    /// `git worktree add` does. Only the first entry is the worktree's own
+    /// creation, so a later empty one counts as a commit made here.
+    #[test]
+    fn plumbing_commit_with_an_empty_reflog_message_waits_for_stale_days() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = detached(&r, "plumbed");
+        std::fs::write(wt.join("plumbing"), "made by plumbing").unwrap();
+        git(&wt, &["add", "plumbing"]);
+        let tree = git(&wt, &["write-tree"]).trim().to_string();
+        let id = git(&wt, &["commit-tree", &tree, "-p", "HEAD", "-m", "plumbing"]);
+        git(&wt, &["update-ref", "HEAD", id.trim()]);
+        git(&wt, &["checkout", "-q", "--detach", "main"]);
+        waits_for_its_unbranched_commits(&fx, &task(14, vec![]), &wt, "plumbed");
+    }
+
+    /// The copy check for a commit made here fails in a blobless clone. Not
+    /// finding a copy only makes the worktree wait, so it still goes.
+    #[test]
+    fn reflog_copy_check_error_makes_the_worktree_wait() {
+        let fx = Fixture::new(&[]);
+        let r = blobless_clone(&fx);
+        let wt = detached(&r, "drafter");
+        std::fs::write(wt.join("f"), "line1\ndraft\n").unwrap();
+        git(&wt, &["commit", "-qam", "draft edits f"]);
+        git(&wt, &["checkout", "-q", "--detach", "main"]);
+        waits_for_its_unbranched_commits(&fx, &task(14, vec![]), &wt, "drafter");
+    }
+
+    /// One draft and two other branches make two ranges, over a limit of one.
+    /// With the usual limit, the reworded draft's copy on `keep` counts.
+    #[test]
+    fn reflog_copy_check_over_its_limit_makes_the_worktree_wait() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = detached(&r, "limited");
+        commit(&wt, "x");
+        git(&wt, &["commit", "--amend", "-qm", "x, reworded"]);
+        git(&r, &["branch", "keep", &head_of(&wt)]);
+        age(&fx, &wt, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(reason_of(&found, "limited"), "on keep, idle 24 h");
+        let limited = task(14, vec![]).with_reflog_copy_limit(1);
+        waits_for_its_unbranched_commits(&fx, &limited, &wt, "limited");
+    }
+
+    /// A ref left in `refs/bisect/` after the bisect state files are gone.
+    #[test]
+    fn leftover_bisect_ref_holding_an_unbranched_commit_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let other = unbranched_commit(&r);
+        let wt = detached(&r, "bisect-leftover");
+        git(&wt, &["update-ref", "refs/bisect/bad", &other]);
+        assert_eq!(GitCmd::default().operation_in_progress(&wt).unwrap(), None);
+        age(&fx, &wt, 60);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn worktree_ref_to_a_tag_object_keeps_the_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = detached(&r, "tagged");
+        git(&r, &["tag", "-a", "-m", "a tag", "short-lived", "main"]);
+        let tag = git(&r, &["rev-parse", "short-lived"]).trim().to_string();
+        git(&r, &["tag", "-d", "short-lived"]);
+        git(&wt, &["update-ref", "refs/worktree/tagged", &tag]);
+        age(&fx, &wt, 60);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A fixup rebase folds two commits into one. Main holds the result, but
+    /// neither original has a copy, so the worktree waits.
+    #[test]
+    fn fixup_rebase_leaves_originals_without_a_copy_and_waits_for_stale_days() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "squashed");
+        commit(&wt, "f1");
+        commit(&wt, "f2");
+        let fixup = todo_editor(fx.dir.path(), "fixup-second.sh", "2s/^pick/fixup/");
+        let editor = format!("sequence.editor={}", fixup.display());
+        git(&wt, &["-c", &editor, "rebase", "-i", "main"]);
+        git(&r, &["merge", "-q", "--ff-only", "squashed"]);
+        waits_for_its_unbranched_commits(&fx, &task(14, vec![]), &wt, "squashed");
+    }
+
+    /// A pull that merges makes a commit here. Once main holds it, it counts.
+    #[test]
+    fn merge_made_by_a_pull_counts_once_a_branch_holds_it() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "puller");
+        commit(&wt, "p1");
+        git(&r, &["checkout", "-q", "-b", "side", "main"]);
+        commit_only(&r, "s1");
+        git(&r, &["checkout", "-q", "main"]);
+        git(
+            &wt,
+            &["pull", "-q", "--no-rebase", "--no-edit", ".", "side"],
+        );
+        git(&r, &["merge", "-q", "--ff-only", "puller"]);
+        age(&fx, &wt, 1);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        let reason = reason_of(&found, "puller");
+        assert!(reason.starts_with("merged into main"), "{reason}");
     }
 
     /// A detached worktree with a commit no branch holds, and a repo that

@@ -62,6 +62,10 @@ impl GitCmd {
             // See the note on GIT_NO_REPLACE_OBJECTS below.
             "-c",
             "core.commitGraph=false",
+            // `log` re-encodes commit and reflog text to this. Picard parses
+            // that text, so repo config such as UTF-16 must not change it.
+            "-c",
+            "i18n.logOutputEncoding=UTF-8",
         ]);
         cmd.arg("-C").arg(dir).args(args);
         // Picard only reads, apart from `worktree remove`. Skipping optional
@@ -151,10 +155,28 @@ impl GitCmd {
                 "git {} in {} failed: {}",
                 shown_args(args),
                 dir.display(),
-                out.stderr.trim()
+                shown_stderr(&out.stderr)
             ),
         }
     }
+}
+
+/// About how many bytes of git's stderr an error message shows.
+const STDERR_SHOWN: usize = 2_000;
+
+/// The end of `stderr`, cut to about `STDERR_SHOWN` bytes, for an error
+/// message. Git writes the fatal line last, and a failure with a huge
+/// stderr must not put megabytes into the log.
+fn shown_stderr(stderr: &str) -> String {
+    let text = stderr.trim();
+    if text.len() <= STDERR_SHOWN {
+        return text.to_string();
+    }
+    let mut start = text.len() - STDERR_SHOWN;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("… ({start} bytes cut) {}", &text[start..])
 }
 
 /// About how much of a command's arguments an error message shows.
@@ -186,7 +208,7 @@ fn stdout_of(out: Output, dir: &Path, args: &[&str]) -> Result<String> {
             "git {} in {} failed: {}",
             shown_args(args),
             dir.display(),
-            out.stderr.trim()
+            shown_stderr(&out.stderr)
         );
     }
     Ok(out.stdout)
@@ -646,6 +668,37 @@ mod tests {
             .output(dir.path(), &["config", "--bool", "core.commitGraph"])
             .unwrap();
         assert_eq!(seen.trim(), "false");
+    }
+
+    /// Repo config cannot change the encoding of `log` output, which Picard
+    /// parses.
+    #[test]
+    fn repo_config_cannot_change_the_log_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitCmd::default();
+        git.output(dir.path(), &["init", "-q"]).unwrap();
+        git.output(dir.path(), &["config", "i18n.logOutputEncoding", "UTF-16"])
+            .unwrap();
+        let seen = git
+            .output(dir.path(), &["config", "i18n.logOutputEncoding"])
+            .unwrap();
+        assert_eq!(seen.trim(), "UTF-8");
+    }
+
+    #[test]
+    fn error_messages_show_only_the_end_of_a_long_stderr() {
+        assert_eq!(
+            shown_stderr("  fatal: bad revision\n"),
+            "fatal: bad revision"
+        );
+        let long = format!(
+            "{}fatal: the last line",
+            "warning: noise é\n".repeat(10_000)
+        );
+        let shown = shown_stderr(&long);
+        assert!(shown.len() < STDERR_SHOWN + 40, "{} bytes", shown.len());
+        assert!(shown.starts_with("… ("), "{shown}");
+        assert!(shown.ends_with("fatal: the last line"), "{shown}");
     }
 
     #[test]
