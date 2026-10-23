@@ -2574,25 +2574,21 @@ mod tests {
         );
     }
 
-    /// The branch holding HEAD merged in a commit whose object is gone, so
-    /// reading merge records fails. The worktree is still done.
+    /// Reading merge records fails for a branch that no longer exists, so the
+    /// reason names the branch. A deleted object in the branch's history does
+    /// not reach this fallback on every git: from 2.56, `for-each-ref
+    /// --contains` fails on it first, and the worktree is kept.
     #[test]
     fn unreadable_merge_records_fall_back_to_naming_the_branch() {
         let fx = Fixture::new(&[]);
         let r = repo(&fx);
         let wt = worktree(&r, "feat");
         commit(&wt, "work");
-        git(&r, &["checkout", "-q", "-b", "side", "main"]);
-        commit_only(&r, "side-work");
-        let side = head_of(&r);
-        git(&r, &["checkout", "-q", "-b", "stacked", "feat"]);
-        git(&r, &["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
-        git(&r, &["checkout", "-q", "main"]);
-        git(&r, &["branch", "-q", "-D", "side"]);
-        std::fs::remove_file(r.join(".git/objects").join(&side[..2]).join(&side[2..])).unwrap();
-        age(&fx, &wt, 1);
-        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
-        assert_eq!(reason_of(&found, "feat"), "on stacked, idle 24 h");
+        let t = task(14, vec![]);
+        let listed = t.worktrees(&r).unwrap();
+        let gone = ["gone".to_string()];
+        assert!(t.merge_evidence(&r, &listed[1].head, &gone).is_err());
+        assert_eq!(t.held_wording(&r, &listed[1], &gone, "gone"), "on gone");
     }
 
     /// Without `--`, git reads a ref that does not exist as a path when a file
