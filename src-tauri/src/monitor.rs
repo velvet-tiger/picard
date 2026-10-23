@@ -5,6 +5,13 @@
 //! `threshold + recover_margin`, or after `cooldown` while still low. Without
 //! this, a cleanup that cannot free enough space would alert on every poll.
 //!
+//! The repeat after `cooldown` waits for a routine check, one that comes on
+//! the `poll_minutes` beat. Picard also checks when the menu opens, when a
+//! scan ends and every 30 seconds while its window is open. Those checks
+//! catch a volume that newly drops below its threshold, but a repeat on them
+//! could chain: an alert's own estimate scan ends, which asks for a check,
+//! which repeats the alert once a short cooldown has passed.
+//!
 //! Everything here is pure. The poll loop owns the clock and the I/O.
 
 use std::collections::HashMap;
@@ -39,7 +46,16 @@ pub struct Policy {
 }
 
 /// Advances one volume's state given a new free-space reading.
-pub fn step(state: State, free_bytes: u64, policy: &Policy, now: Instant) -> (State, Decision) {
+///
+/// `routine` is true on a routine check; only those may repeat an alert
+/// after the cooldown. See the module notes.
+pub fn step(
+    state: State,
+    free_bytes: u64,
+    policy: &Policy,
+    now: Instant,
+    routine: bool,
+) -> (State, Decision) {
     // Off keeps the volume armed, so switching back to ask or auto alerts at once
     // if the volume is still low.
     if policy.mode == Mode::Off {
@@ -54,7 +70,7 @@ pub fn step(state: State, free_bytes: u64, policy: &Policy, now: Instant) -> (St
         {
             (State::Armed, Decision::Quiet)
         }
-        State::Fired { at } if low && now.duration_since(at) >= policy.cooldown => {
+        State::Fired { at } if routine && low && now.duration_since(at) >= policy.cooldown => {
             (State::Fired { at: now }, Decision::Fire)
         }
         fired @ State::Fired { .. } => (fired, Decision::Quiet),
@@ -138,12 +154,13 @@ pub fn states_after_reload(states: States, old_mode: Option<Mode>, new_mode: Mod
 ///
 /// Returns the new states and the alerts to send. Volumes missing from
 /// `readings` are dropped, so a drive that is unplugged and plugged back in
-/// starts armed.
+/// starts armed. `routine` is passed to `step`.
 pub fn evaluate(
     states: &States,
     readings: &[(Volume, DiskSpace)],
     config: &Config,
     now: Instant,
+    routine: bool,
 ) -> (States, Vec<Alert>) {
     let mut next = States::new();
     let mut alerts = Vec::new();
@@ -157,7 +174,7 @@ pub fn evaluate(
             mode: config.mode,
         };
         let prev = states.get(&volume.mount).copied().unwrap_or(State::Armed);
-        let (state, decision) = step(prev, space.free_bytes, &policy, now);
+        let (state, decision) = step(prev, space.free_bytes, &policy, now, routine);
         next.insert(volume.mount.clone(), state);
         if decision == Decision::Fire {
             alerts.push(Alert {
@@ -274,7 +291,8 @@ mod tests {
         }
     }
 
-    /// Feeds (free GB, minutes since start) readings and returns which ones fired.
+    /// Feeds (free GB, minutes since start) readings to routine checks and
+    /// returns which ones fired.
     fn run(readings: &[(u64, u64)], mode: Mode) -> Vec<bool> {
         let t0 = Instant::now();
         let p = policy(mode);
@@ -283,7 +301,7 @@ mod tests {
             .iter()
             .map(|&(free_gb, minute)| {
                 let now = t0 + Duration::from_secs(minute * 60);
-                let (s, d) = step(state, free_gb * GB, &p, now);
+                let (s, d) = step(state, free_gb * GB, &p, now, true);
                 state = s;
                 d == Decision::Fire
             })
@@ -335,9 +353,43 @@ mod tests {
     }
 
     #[test]
+    fn only_a_routine_check_repeats_an_alert() {
+        let t0 = Instant::now();
+        let no_cooldown = Policy {
+            cooldown: Duration::ZERO,
+            ..policy(Mode::Ask)
+        };
+        let fired = State::Fired { at: t0 };
+        let later = t0 + Duration::from_secs(5);
+        assert_eq!(
+            step(fired, 25 * GB, &no_cooldown, later, false),
+            (fired, Decision::Quiet),
+            "a refresh while still low stays quiet"
+        );
+        assert_eq!(
+            step(fired, 25 * GB, &no_cooldown, later, true),
+            (State::Fired { at: later }, Decision::Fire)
+        );
+    }
+
+    #[test]
+    fn any_check_catches_a_new_drop_and_a_recovery() {
+        let t0 = Instant::now();
+        let p = policy(Mode::Ask);
+        assert_eq!(
+            step(State::Armed, 25 * GB, &p, t0, false),
+            (State::Fired { at: t0 }, Decision::Fire)
+        );
+        assert_eq!(
+            step(State::Fired { at: t0 }, 40 * GB, &p, t0, false),
+            (State::Armed, Decision::Quiet)
+        );
+    }
+
+    #[test]
     fn off_mode_never_fires_and_stays_armed() {
         let t0 = Instant::now();
-        let (s, d) = step(State::Fired { at: t0 }, 0, &policy(Mode::Off), t0);
+        let (s, d) = step(State::Fired { at: t0 }, 0, &policy(Mode::Off), t0, true);
         assert_eq!((s, d), (State::Armed, Decision::Quiet));
         assert_eq!(run(&[(1, 0), (1, 500)], Mode::Off), vec![false, false]);
     }
@@ -374,14 +426,38 @@ mod tests {
             (volume("/Volumes/Big", "Big"), space(60, 1000)),
         ];
         let now = Instant::now();
-        let (states, alerts) = evaluate(&States::new(), &readings, &config, now);
+        let (states, alerts) = evaluate(&States::new(), &readings, &config, now, false);
         let names: Vec<_> = alerts.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["Startup disk", "P"]);
         assert_eq!(states[Path::new("/Volumes/Big")], State::Armed);
 
         // Second pass: still low, but already fired, so nothing new.
-        let (_, alerts) = evaluate(&states, &readings, &config, now + Duration::from_secs(300));
+        let (_, alerts) = evaluate(
+            &states,
+            &readings,
+            &config,
+            now + Duration::from_secs(300),
+            true,
+        );
         assert!(alerts.is_empty());
+    }
+
+    #[test]
+    fn evaluate_repeats_after_the_cooldown_only_when_routine() {
+        let config = parse(
+            "min_free_gb = 30\ncooldown_minutes = 0\nroots = [\"/a\"]",
+            Path::new("/Users/t"),
+        )
+        .unwrap();
+        let readings = vec![(volume("/", "Startup disk"), space(20, 500))];
+        let now = Instant::now();
+        let (states, alerts) = evaluate(&States::new(), &readings, &config, now, true);
+        assert_eq!(alerts.len(), 1);
+        let later = now + Duration::from_secs(1);
+        let (states, alerts) = evaluate(&states, &readings, &config, later, false);
+        assert!(alerts.is_empty(), "a refresh does not repeat the alert");
+        let (_, alerts) = evaluate(&states, &readings, &config, later, true);
+        assert_eq!(alerts.len(), 1, "the routine check does");
     }
 
     #[test]
@@ -439,7 +515,7 @@ mod tests {
             PathBuf::from("/Volumes/Gone"),
             State::Fired { at: Instant::now() },
         );
-        let (next, _) = evaluate(&states, &[], &config, Instant::now());
+        let (next, _) = evaluate(&states, &[], &config, Instant::now(), true);
         assert!(next.is_empty());
     }
 

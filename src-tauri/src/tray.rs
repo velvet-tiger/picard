@@ -106,15 +106,62 @@ pub struct MenuView {
 pub struct Tray<R: Runtime> {
     app: AppHandle<R>,
     icon: TrayIcon<R>,
-    shown: ShownMenu<R>,
+    shown: ShownMenu<MenuItem<R>>,
+}
+
+/// A status line in the menu whose text can change: a `MenuItem` in the
+/// app, a recorder in tests.
+trait LineItem {
+    fn set_text(&self, text: &str) -> tauri::Result<()>;
+}
+
+impl<R: Runtime> LineItem for MenuItem<R> {
+    fn set_text(&self, text: &str) -> tauri::Result<()> {
+        MenuItem::set_text(self, text)
+    }
 }
 
 /// What the current menu holds, so `Tray::show` can edit it in place.
-struct ShownMenu<R: Runtime> {
+struct ShownMenu<I> {
     /// The status line items, in menu order, one per entry in `lines`.
-    items: Vec<MenuItem<R>>,
+    items: Vec<I>,
     lines: Vec<String>,
     update_ready: Option<String>,
+}
+
+/// Whether `ShownMenu::update_in_place` could show the new lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InPlace {
+    Done,
+    NeedsRebuild,
+}
+
+impl<I: LineItem> ShownMenu<I> {
+    /// Sets the text of each status line that differs from `lines`.
+    /// Returns `NeedsRebuild`, and changes nothing, when a line or the
+    /// restart item comes or goes. Each line is recorded once it is set, so
+    /// after a failure the next call retries only the lines still out of date.
+    fn update_in_place(
+        &mut self,
+        lines: &[String],
+        update_ready: Option<&str>,
+    ) -> tauri::Result<InPlace> {
+        if !fits_in_place(
+            &self.lines,
+            self.update_ready.as_deref(),
+            lines,
+            update_ready,
+        ) {
+            return Ok(InPlace::NeedsRebuild);
+        }
+        for ((item, shown), line) in self.items.iter().zip(self.lines.iter_mut()).zip(lines) {
+            if shown != line {
+                item.set_text(line)?;
+                shown.clone_from(line);
+            }
+        }
+        Ok(InPlace::Done)
+    }
 }
 
 impl<R: Runtime> Tray<R> {
@@ -166,26 +213,7 @@ impl<R: Runtime> Tray<R> {
     pub fn show(&mut self, view: &MenuView) -> tauri::Result<()> {
         let lines = status_lines(view);
         let update_ready = view.update_ready.as_deref();
-        if fits_in_place(
-            &self.shown.lines,
-            self.shown.update_ready.as_deref(),
-            &lines,
-            update_ready,
-        ) {
-            // Each line is recorded as it is set, so after a failure the
-            // next call retries only the lines still out of date.
-            for ((item, shown), line) in self
-                .shown
-                .items
-                .iter()
-                .zip(self.shown.lines.iter_mut())
-                .zip(lines)
-            {
-                if *shown != line {
-                    item.set_text(&line)?;
-                    *shown = line;
-                }
-            }
+        if self.shown.update_in_place(&lines, update_ready)? == InPlace::Done {
             return Ok(());
         }
         let (menu, items) = build_menu(&self.app, &lines, update_ready)?;
@@ -324,6 +352,7 @@ pub fn status_lines(view: &MenuView) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
 
     fn volume(name: &str) -> Volume {
@@ -341,11 +370,114 @@ mod tests {
             root: PathBuf::from(root),
             name: name.to_string(),
             reason: "not mounted".to_string(),
+            error: None,
         }
     }
 
     fn lines(texts: &[&str]) -> Vec<String> {
         texts.iter().map(|t| t.to_string()).collect()
+    }
+
+    /// Records every `set_text` call, and fails them while `fail` is set.
+    #[derive(Default)]
+    struct FakeLine {
+        calls: RefCell<Vec<String>>,
+        fail: Cell<bool>,
+    }
+
+    impl LineItem for FakeLine {
+        fn set_text(&self, text: &str) -> tauri::Result<()> {
+            self.calls.borrow_mut().push(text.to_string());
+            if self.fail.get() {
+                return Err(tauri::Error::FailedToReceiveMessage);
+            }
+            Ok(())
+        }
+    }
+
+    fn shown(texts: &[&str], update_ready: Option<&str>) -> ShownMenu<FakeLine> {
+        ShownMenu {
+            items: texts.iter().map(|_| FakeLine::default()).collect(),
+            lines: lines(texts),
+            update_ready: update_ready.map(str::to_string),
+        }
+    }
+
+    fn calls(menu: &ShownMenu<FakeLine>) -> Vec<Vec<String>> {
+        menu.items
+            .iter()
+            .map(|i| i.calls.borrow().clone())
+            .collect()
+    }
+
+    const DISK: &str = "Startup disk: 19 GB free (2%)";
+    const PROJECTS: &str = "Projects: not mounted";
+
+    #[test]
+    fn unchanged_lines_are_left_alone() {
+        let mut menu = shown(&[DISK, PROJECTS], None);
+        let same = lines(&[DISK, PROJECTS]);
+        assert_eq!(menu.update_in_place(&same, None).unwrap(), InPlace::Done);
+        assert_eq!(calls(&menu), vec![Vec::<String>::new(), vec![]]);
+    }
+
+    #[test]
+    fn one_changed_line_is_set_once() {
+        let mut menu = shown(&[DISK, PROJECTS], None);
+        let new = lines(&["Startup disk: 21 GB free (2%)", PROJECTS]);
+        assert_eq!(menu.update_in_place(&new, None).unwrap(), InPlace::Done);
+        assert_eq!(
+            calls(&menu),
+            vec![vec!["Startup disk: 21 GB free (2%)".to_string()], vec![]]
+        );
+        assert_eq!(menu.lines, new);
+    }
+
+    #[test]
+    fn a_new_line_or_restart_item_asks_for_a_rebuild() {
+        let mut menu = shown(&[DISK], None);
+        let more = lines(&[DISK, PROJECTS]);
+        assert_eq!(
+            menu.update_in_place(&more, None).unwrap(),
+            InPlace::NeedsRebuild
+        );
+        assert_eq!(
+            menu.update_in_place(&lines(&[DISK]), Some("0.7.0"))
+                .unwrap(),
+            InPlace::NeedsRebuild
+        );
+        assert_eq!(calls(&menu), vec![Vec::<String>::new()]);
+        assert_eq!(menu.lines, lines(&[DISK]), "nothing recorded");
+    }
+
+    #[test]
+    fn a_failed_line_is_retried_alone() {
+        let mut menu = shown(&[DISK, PROJECTS], None);
+        let new = lines(&[
+            "Startup disk: 21 GB free (2%)",
+            "Projects: 8.0 GB free (2%)",
+        ]);
+        menu.items[1].fail.set(true);
+        assert!(menu.update_in_place(&new, None).is_err());
+        assert_eq!(
+            menu.lines,
+            lines(&["Startup disk: 21 GB free (2%)", PROJECTS])
+        );
+
+        menu.items[1].fail.set(false);
+        assert_eq!(menu.update_in_place(&new, None).unwrap(), InPlace::Done);
+        assert_eq!(
+            calls(&menu),
+            vec![
+                vec!["Startup disk: 21 GB free (2%)".to_string()],
+                vec![
+                    "Projects: 8.0 GB free (2%)".to_string(),
+                    "Projects: 8.0 GB free (2%)".to_string()
+                ],
+            ],
+            "the first line is not set again"
+        );
+        assert_eq!(menu.lines, new);
     }
 
     #[test]

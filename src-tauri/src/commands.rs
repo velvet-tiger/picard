@@ -740,6 +740,7 @@ mod tests {
             root: PathBuf::from(root),
             name: "Projects".into(),
             reason: "not mounted".into(),
+            error: None,
         };
         let status = status_view(
             &config,

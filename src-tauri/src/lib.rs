@@ -89,7 +89,9 @@ pub fn run() {
 
             // Capacity 16 is plenty: the loop drains the queue on every wake.
             let (tx, rx) = mpsc::channel(16);
-            app.manage(poll::RefreshSender::new(tx.downgrade()));
+            let refresh = poll::RefreshSender::new(tx.downgrade());
+            let refresh_pending = refresh.pending();
+            app.manage(refresh);
             let handle = app.handle().clone();
             let on_history = move || {
                 if let Err(e) = windows::history_changed(&handle) {
@@ -112,7 +114,12 @@ pub fn run() {
 
             let shared = Arc::new(state::Shared::new(home, config_path));
             app.manage(Arc::clone(&shared));
-            let poller = poll::Poller::new(app.handle().clone(), tray, Arc::clone(&shared));
+            let poller = poll::Poller::new(
+                app.handle().clone(),
+                tray,
+                Arc::clone(&shared),
+                refresh_pending,
+            );
             // Nothing that cleans or updates runs until the first-run warning is
             // accepted. Quit in the dialog exits before any of it starts.
             let accepted = welcome::confirm(app.handle(), shared.paths.warning_accepted.clone());
