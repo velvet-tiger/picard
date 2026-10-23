@@ -10,6 +10,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime, Theme, WebviewUrl, WebviewWindowBuilder};
 
 use crate::config::{self, Appearance};
+use crate::poll;
 use crate::preview_scans::{ScanEvents, ScanPhase};
 use crate::state::Shared;
 
@@ -34,6 +35,9 @@ const SCAN_CHANGED_EVENT: &str = "scan-changed";
 /// Must match the event name `onUpdateStatus` in api.ts listens for.
 const UPDATE_STATUS_EVENT: &str = "update-status";
 
+/// Must match the event name `onStatusChanged` in api.ts listens for.
+const STATUS_CHANGED_EVENT: &str = "status-changed";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Clean,
@@ -51,8 +55,14 @@ impl Tab {
 }
 
 /// Shows the window on `tab`, creating it if needed, and brings it to the front.
+///
+/// Also asks the poll loop for a check. It may be part way through a
+/// `poll_minutes` sleep, and an open window should not wait that long for
+/// its first 30 second update. A new window asks only once it exists, so
+/// the loop sees it open when choosing its next wait.
 pub fn open<R: Runtime>(app: &AppHandle<R>, tab: Tab) -> tauri::Result<()> {
     if let Some(existing) = app.get_webview_window(WINDOW_LABEL) {
+        poll::request_refresh(app);
         existing.emit_to(WINDOW_LABEL, SHOW_TAB_EVENT, tab.id())?;
         existing.unminimize()?;
         existing.show()?;
@@ -65,6 +75,7 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, tab: Tab) -> tauri::Result<()> {
         .min_inner_size(480.0, 400.0)
         .center()
         .build()?;
+    poll::request_refresh(app);
     // The config read can block (a stalled network mount, say), and this runs
     // on the event thread, so the title bar catches up once the read is done.
     let handle = app.clone();
@@ -132,6 +143,15 @@ pub fn cleaning_changed<R: Runtime>(app: &AppHandle<R>, cleaning: bool) -> tauri
     app.emit_to(WINDOW_LABEL, CLEANING_CHANGED_EVENT, cleaning)
 }
 
+/// Tells the open window that the poll loop has just read free space, so the
+/// Clean tab can reload its disk tiles. Does nothing when no window is open.
+pub fn status_changed<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    if !is_open(app) {
+        return Ok(());
+    }
+    app.emit_to(WINDOW_LABEL, STATUS_CHANGED_EVENT, ())
+}
+
 /// Tells the open window where the preview scan is, so the Clean tab shows
 /// any scan, whoever started it. Does nothing when no window is open.
 pub fn scan_changed<R: Runtime>(app: &AppHandle<R>, phase: &ScanPhase) -> tauri::Result<()> {
@@ -154,6 +174,10 @@ impl<R: Runtime> ScanEvents for AppHandle<R> {
         if let Err(e) = preview_changed(self) {
             log::warn!("could not tell the window about the new scan: {e}");
         }
+    }
+
+    fn scan_ended(&self) {
+        poll::request_refresh(self);
     }
 }
 

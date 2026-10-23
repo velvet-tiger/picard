@@ -47,6 +47,11 @@ pub struct UnavailableRoot {
     pub root: PathBuf,
     pub name: String,
     pub reason: String,
+    /// The error behind an unreadable root, for the log. `None` for a root
+    /// that is only not mounted. Kept here rather than logged where it is
+    /// found, because roots are checked on every refresh and every window
+    /// read; the poll loop logs it when it changes.
+    pub error: Option<String>,
 }
 
 /// The result of mapping every root: volumes to monitor and roots to grey out.
@@ -94,15 +99,14 @@ pub fn map_roots(roots: &[PathBuf], locate: impl Fn(&Path) -> Location) -> Volum
                 root: root.clone(),
                 name: unmounted_name(root),
                 reason: "not mounted".to_string(),
+                error: None,
             }),
-            Location::Unreadable(err) => {
-                log::warn!("cannot read root {}: {err}", root.display());
-                map.unavailable.push(UnavailableRoot {
-                    root: root.clone(),
-                    name: unmounted_name(root),
-                    reason: "unreadable, see log".to_string(),
-                });
-            }
+            Location::Unreadable(err) => map.unavailable.push(UnavailableRoot {
+                root: root.clone(),
+                name: unmounted_name(root),
+                reason: "unreadable, see log".to_string(),
+                error: Some(err),
+            }),
         }
     }
     map
@@ -254,6 +258,7 @@ mod tests {
         assert!(map.volumes.is_empty());
         assert_eq!(map.unavailable[0].name, "Projects");
         assert_eq!(map.unavailable[0].reason, "not mounted");
+        assert_eq!(map.unavailable[0].error, None);
         assert_eq!(map.unavailable[1].name, "/opt/gone");
     }
 
@@ -262,6 +267,7 @@ mod tests {
         let roots = vec![PathBuf::from("/secret")];
         let map = map_roots(&roots, |_| Location::Unreadable("denied".into()));
         assert_eq!(map.unavailable[0].reason, "unreadable, see log");
+        assert_eq!(map.unavailable[0].error.as_deref(), Some("denied"));
     }
 
     #[test]

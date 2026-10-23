@@ -306,6 +306,43 @@ describe('Preview', () => {
     expect(screen.queryByText('Disk size')).not.toBeInTheDocument()
   })
 
+  it('reloads the available space when the poll loop reads it again', async () => {
+    let free = 112e9
+    const { sent } = backend({ get_status: () => status([{ free_bytes: free }]) })
+    render(Preview)
+    await waitFor(() => expect(tile('Available')).toEqual(['112 GB', '11% free']))
+
+    free = 90e9
+    await emit('status-changed')
+
+    await waitFor(() => expect(tile('Available')).toEqual(['90 GB', '9% free']))
+    expect(sent('get_status')).toHaveLength(2)
+  })
+
+  it('keeps the newer free space when an older read answers last', async () => {
+    const slow = deferred<Status>()
+    let call = 0
+    backend({
+      get_status: () => {
+        call++
+        if (call === 1) return status()
+        if (call === 2) return slow.promise
+        return status([{ free_bytes: 80e9 }])
+      },
+    })
+    render(Preview)
+    await waitFor(() => expect(tile('Available')).toEqual(['112 GB', '11% free']))
+
+    await emit('status-changed')
+    await waitFor(() => expect(call).toBe(2))
+    await emit('status-changed')
+    await waitFor(() => expect(tile('Available')).toEqual(['80 GB', '8% free']))
+
+    slow.resolve(status([{ free_bytes: 100e9 }]))
+    await settle()
+    expect(tile('Available')).toEqual(['80 GB', '8% free'])
+  })
+
   it('names the summary for screen readers', async () => {
     backend()
     render(Preview)

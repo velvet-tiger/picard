@@ -81,7 +81,7 @@ Tool caches and custom commands have no **Ignore** button. Switch them off in **
 Picard normally acts only when a drive drops below its threshold. Set `daily_scan` to also scan once a day at a set local time, even when space is fine. It follows the mode:
 
 - **Ask**: Picard notifies you if anything can be cleaned, for example "Daily scan of Startup disk: 120 GB free (12%). About 8.5 GB can be cleaned." If nothing can be cleaned, it stays quiet. A drive that is already low gets its low-space alert instead.
-- **Auto**: Picard runs every task in full on each drive. It does not stop early once space is free, as a low-space cleanup does. So tasks at the end of the list, including your `command` scripts, run every day. Picard tells you how much it freed, and tells you if every removal failed. If another cleanup is running at that moment, Picard tries that drive again at the next check. If a drive is low at the scan time, it gets a low-space cleanup and then the full one, so you may see two notifications.
+- **Auto**: Picard runs every task in full on each drive. It does not stop early once space is free, as a low-space cleanup does. So tasks at the end of the list, including your `command` scripts, run every day. Picard tells you how much it freed, and tells you if every removal failed. If another cleanup is running at that moment, Picard tries that drive again at the next regular `poll_minutes` check. If a drive is low at the scan time, it gets a low-space cleanup and then the full one, so you may see two notifications.
 - **Off**: nothing happens.
 
 If your Mac is asleep or Picard is closed at that time, the scan runs at the next check that day. That can be up to `poll_minutes` after the Mac wakes. It never runs twice in one day. If you turn the daily scan on, or change its time, after that time has passed today, the first scan runs tomorrow. Picard records the date of the last scan, and the time it was set for, in `daily-scan.txt` next to the config. That is how it notices a change you make to `config.toml` while it is closed.
@@ -95,6 +95,8 @@ If your Mac is asleep or Picard is closed at that time, the scan runs at the nex
 | Solid drive | A drive is below its threshold. |
 
 The menu lists each drive with its free space, then **Clean…**, **Settings…** and **Open Log**.
+
+Picard checks free space every `poll_minutes`. It also checks when you point at or click the icon, when a scan ends, and when a cleanup is recorded. While the Picard window is open, it checks every 30 seconds. Each check updates the menu, the icon and the Clean tab. Any check notices a drive that drops below its threshold. While a drive stays low, its alert repeats only on the regular `poll_minutes` check, once `cooldown_minutes` has passed. A drive that recovers past its threshold plus `recover_margin_gb` is ready to alert again from the next regular `poll_minutes` check.
 
 ## About and updates
 

@@ -17,6 +17,8 @@ All notable changes to Picard are recorded here. The format follows
 - When git cannot run the cherry-pick check, for example in a partial clone that lacks some files' contents, Picard logs a warning. A pushed worktree then still goes after `stale_days`.
 - Picard no longer looks for a default branch. A repo used to be skipped when `origin/HEAD` named no local branch and the repo had neither `main` nor `master`, such as a repo whose only branch is `trunk`. Its worktrees are now checked.
 - A worktree whose HEAD is in `main` used to show "merged into main". It now names the merge when git recorded one, as in "merged into main (reflog)", and shows "on main" otherwise.
+- Free space is checked more often. Picard checks when you point at or click the menu bar icon, when a scan ends, when a cleanup is recorded (including one from the `picard` command), and every 30 seconds while its window is open. Any of these checks notices a drive that drops below its threshold. A repeat alert for a drive that stays low still waits for the regular `poll_minutes` check after the cooldown. A drive that recovers is ready to alert again from the next regular `poll_minutes` check.
+- An error reading a folder is logged when it first appears, and again only if the error changes. It used to be logged on every check.
 
 ### Fixed
 
