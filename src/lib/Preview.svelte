@@ -16,6 +16,7 @@
     notifyIgnoreChanged,
     onIgnoreChanged,
     onHistoryChanged,
+    onStatusChanged,
     errorText,
     formatBytes,
     itemTitle,
@@ -419,15 +420,22 @@
     }
   }
 
+  // Counts status reads. Reads now overlap, since the poll loop asks for one
+  // every 30 seconds, so a slow reply must not replace a newer one.
+  let statusCalls = 0
+
   async function loadStatus() {
+    const call = ++statusCalls
     try {
       const seen = cleaningEvents
-      status = await getStatus()
-      if (seen === cleaningEvents) cleaningAnywhere = status.cleaning
+      const now = await getStatus()
+      if (call !== statusCalls) return
+      status = now
+      if (seen === cleaningEvents) cleaningAnywhere = now.cleaning
     } catch (e) {
-      // The disk tiles are a convenience; hide them rather than show stale numbers.
-      status = null
       console.error('status', e)
+      // The disk tiles are a convenience; hide them rather than show stale numbers.
+      if (call === statusCalls) status = null
     }
   }
 
@@ -561,6 +569,15 @@
   // and would reset the ticks.
   $effect(() => {
     const unlisten = onHistoryChanged(reloadRecords)
+    return () => {
+      unlisten.then((stop) => stop())
+    }
+  })
+
+  // The poll loop has read free space: on its 30 second beat while this
+  // window is open, or because the menu opened or a scan ended.
+  $effect(() => {
+    const unlisten = onStatusChanged(loadStatus)
     return () => {
       unlisten.then((stop) => stop())
     }

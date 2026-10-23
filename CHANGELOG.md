@@ -6,6 +6,10 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Free space is checked more often. Picard checks when you point at or click the menu bar icon, when a scan ends, when a cleanup is recorded (including one from the `picard` command), and every 30 seconds while its window is open.
+
 ## [0.6.0] - 2026-10-23
 
 ### Added

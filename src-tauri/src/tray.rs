@@ -1,18 +1,24 @@
 //! Menu bar icon and menu.
 //!
 //! The menu shows one disabled status line per volume, then Quit. The poll loop
-//! calls `Tray::show` after every check. The menu is rebuilt each time because it
-//! is small and the set of volumes changes as drives come and go.
+//! calls `Tray::show` after every check. When only the numbers changed, the
+//! status lines are edited in place, so a menu that is already open shows them.
+//! macOS shows the menu the moment the icon is clicked, before Picard hears of
+//! the click, so a rebuilt menu would only appear at the next open. The menu is
+//! rebuilt when lines come or go, as drives are mounted and unmounted.
+//!
+//! Pointing at the icon, and pressing it, ask the poll loop for a fresh check.
 
 use std::sync::Arc;
 
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{TrayIcon, TrayIconBuilder};
+use tauri::tray::{MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::disk::{self, DiskSpace};
+use crate::poll;
 use crate::state::Shared;
 use crate::updater::Updates;
 use crate::volume::{UnavailableRoot, Volume};
@@ -96,16 +102,26 @@ pub struct MenuView {
     pub update_ready: Option<String>,
 }
 
-/// Handle to the tray icon, used to replace its menu.
+/// Handle to the tray icon, used to update its menu.
 pub struct Tray<R: Runtime> {
     app: AppHandle<R>,
     icon: TrayIcon<R>,
+    shown: ShownMenu<R>,
+}
+
+/// What the current menu holds, so `Tray::show` can edit it in place.
+struct ShownMenu<R: Runtime> {
+    /// The status line items, in menu order, one per entry in `lines`.
+    items: Vec<MenuItem<R>>,
+    lines: Vec<String>,
+    update_ready: Option<String>,
 }
 
 impl<R: Runtime> Tray<R> {
     /// Creates the tray icon with a placeholder menu until the first check.
     pub fn install(app: &AppHandle<R>) -> tauri::Result<Self> {
-        let menu = build_menu(app, &["Checking disks…".to_string()], None)?;
+        let lines = vec!["Checking disks…".to_string()];
+        let (menu, items) = build_menu(app, &lines, None)?;
         let icon = TrayIconBuilder::with_id(TRAY_ID)
             .icon(Image::from_bytes(ICON_OK)?)
             .icon_as_template(true)
@@ -128,28 +144,100 @@ impl<R: Runtime> Tray<R> {
                     log::error!("menu item {:?} failed: {e}", event.id().as_ref());
                 }
             })
+            .on_tray_icon_event(|tray, event| {
+                if comes_before_menu(&event) {
+                    poll::request_refresh(tray.app_handle());
+                }
+            })
             .build(app)?;
         Ok(Self {
             app: app.clone(),
             icon,
+            shown: ShownMenu {
+                items,
+                lines,
+                update_ready: None,
+            },
         })
     }
 
-    /// Replaces the menu with one built from `view`.
-    pub fn show(&self, view: &MenuView) -> tauri::Result<()> {
-        let menu = build_menu(&self.app, &status_lines(view), view.update_ready.as_deref())?;
-        self.icon.set_menu(Some(menu))
+    /// Shows `view` in the menu: in place when only the text of the status
+    /// lines changed, otherwise in a new menu.
+    pub fn show(&mut self, view: &MenuView) -> tauri::Result<()> {
+        let lines = status_lines(view);
+        let update_ready = view.update_ready.as_deref();
+        if fits_in_place(
+            &self.shown.lines,
+            self.shown.update_ready.as_deref(),
+            &lines,
+            update_ready,
+        ) {
+            // Each line is recorded as it is set, so after a failure the
+            // next call retries only the lines still out of date.
+            for ((item, shown), line) in self
+                .shown
+                .items
+                .iter()
+                .zip(self.shown.lines.iter_mut())
+                .zip(lines)
+            {
+                if *shown != line {
+                    item.set_text(&line)?;
+                    *shown = line;
+                }
+            }
+            return Ok(());
+        }
+        let (menu, items) = build_menu(&self.app, &lines, update_ready)?;
+        self.icon.set_menu(Some(menu))?;
+        self.shown = ShownMenu {
+            items,
+            lines,
+            update_ready: view.update_ready.clone(),
+        };
+        Ok(())
     }
 }
 
+/// True for the tray events that come just before the menu opens: the
+/// pointer reaching the icon, and a button going down on it. Hovering gives
+/// the check a head start, so the menu usually opens on fresh numbers.
+fn comes_before_menu(event: &TrayIconEvent) -> bool {
+    matches!(
+        event,
+        TrayIconEvent::Enter { .. }
+            | TrayIconEvent::Click {
+                button_state: MouseButtonState::Down,
+                ..
+            }
+    )
+}
+
+/// True if a menu that shows `old_lines` and offers `old_update` can show
+/// `lines` and `update` by changing the text of its status lines. A line
+/// that comes or goes, or a change to the restart item, needs a new menu.
+fn fits_in_place(
+    old_lines: &[String],
+    old_update: Option<&str>,
+    lines: &[String],
+    update: Option<&str>,
+) -> bool {
+    old_lines.len() == lines.len() && old_update == update
+}
+
+/// Builds the menu. Also returns the status line items, in order, so
+/// `Tray::show` can change their text later.
 fn build_menu<R: Runtime>(
     app: &AppHandle<R>,
     lines: &[String],
     update_ready: Option<&str>,
-) -> tauri::Result<Menu<R>> {
+) -> tauri::Result<(Menu<R>, Vec<MenuItem<R>>)> {
     let menu = Menu::new(app)?;
+    let mut items = Vec::with_capacity(lines.len());
     for line in lines {
-        menu.append(&MenuItem::new(app, line, false, None::<&str>)?)?;
+        let item = MenuItem::new(app, line, false, None::<&str>)?;
+        menu.append(&item)?;
+        items.push(item);
     }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     for (id, label) in [
@@ -176,7 +264,7 @@ fn build_menu<R: Runtime>(
         true,
         None::<&str>,
     )?)?;
-    Ok(menu)
+    Ok((menu, items))
 }
 
 /// The menu item that restarts Picard into an installed update.
@@ -254,6 +342,67 @@ mod tests {
             name: name.to_string(),
             reason: "not mounted".to_string(),
         }
+    }
+
+    fn lines(texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn new_numbers_on_the_same_lines_fit_in_place() {
+        let old = lines(&["Startup disk: 19 GB free (2%)", "Projects: not mounted"]);
+        let new = lines(&["Startup disk: 21 GB free (2%)", "Projects: not mounted"]);
+        assert!(fits_in_place(&old, None, &new, None));
+        assert!(fits_in_place(&old, Some("0.7.0"), &new, Some("0.7.0")));
+        // The placeholder from `install` is replaced in place by the first check.
+        assert!(fits_in_place(
+            &lines(&["Checking disks…"]),
+            None,
+            &lines(&["Startup disk: 19 GB free (2%)"]),
+            None
+        ));
+    }
+
+    #[test]
+    fn a_line_or_restart_item_that_comes_or_goes_needs_a_new_menu() {
+        let one = lines(&["Startup disk: 19 GB free (2%)"]);
+        let two = lines(&[
+            "Startup disk: 19 GB free (2%)",
+            "Projects: 8.0 GB free (2%)",
+        ]);
+        assert!(!fits_in_place(&one, None, &two, None));
+        assert!(!fits_in_place(&two, None, &one, None));
+        assert!(!fits_in_place(&one, None, &one, Some("0.7.0")));
+        assert!(!fits_in_place(&one, Some("0.7.0"), &one, None));
+        assert!(!fits_in_place(&one, Some("0.7.0"), &one, Some("0.7.1")));
+    }
+
+    fn click(button_state: MouseButtonState) -> TrayIconEvent {
+        TrayIconEvent::Click {
+            id: TRAY_ID.into(),
+            position: tauri::PhysicalPosition::new(0.0, 0.0),
+            rect: tauri::Rect::default(),
+            button: tauri::tray::MouseButton::Left,
+            button_state,
+        }
+    }
+
+    #[test]
+    fn hovering_and_pressing_come_before_the_menu() {
+        let enter = TrayIconEvent::Enter {
+            id: TRAY_ID.into(),
+            position: tauri::PhysicalPosition::new(0.0, 0.0),
+            rect: tauri::Rect::default(),
+        };
+        let leave = TrayIconEvent::Leave {
+            id: TRAY_ID.into(),
+            position: tauri::PhysicalPosition::new(0.0, 0.0),
+            rect: tauri::Rect::default(),
+        };
+        assert!(comes_before_menu(&enter));
+        assert!(comes_before_menu(&click(MouseButtonState::Down)));
+        assert!(!comes_before_menu(&click(MouseButtonState::Up)));
+        assert!(!comes_before_menu(&leave));
     }
 
     #[test]

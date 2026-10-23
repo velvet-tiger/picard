@@ -89,11 +89,14 @@ pub fn run() {
 
             // Capacity 16 is plenty: the loop drains the queue on every wake.
             let (tx, rx) = mpsc::channel(16);
+            app.manage(poll::RefreshSender::new(tx.downgrade()));
             let handle = app.handle().clone();
             let on_history = move || {
                 if let Err(e) = windows::history_changed(&handle) {
                     log::warn!("could not tell the window that history changed: {e}");
                 }
+                // A clean from the CLI shows up only here, and it frees space.
+                poll::request_refresh(&handle);
             };
             let updates = Arc::new(updater::Updates::new(tx.downgrade()));
             app.manage(Arc::clone(&updates));

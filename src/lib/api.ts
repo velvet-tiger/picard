@@ -325,6 +325,15 @@ export const onHistoryChanged = (handler: () => void) =>
   getCurrentWebviewWindow().listen('history-changed', () => handler())
 
 /**
+ * Calls `handler` each time the poll loop has read free space: every 30
+ * seconds while this window is open, and when the menu opens, a scan ends or
+ * a clean is recorded (see `Poller::show` in src-tauri/src/poll.rs). Resolves
+ * to an unlisten function.
+ */
+export const onStatusChanged = (handler: () => void) =>
+  getCurrentWebviewWindow().listen('status-changed', () => handler())
+
+/**
  * Calls `handler` when the stored previews change: any preview scan stored
  * one, or a background clean dropped one (see `scan_with` in
  * src-tauri/src/preview_scans.rs). Resolves to an unlisten function.

@@ -4,6 +4,8 @@
 //! a drive is mounted or unmounted under `/Volumes`. File-system watchers run
 //! on their own thread and send `Wake` messages into the loop. When
 //! `daily_scan` is set it also wakes at that time and runs the daily scan.
+//! While the Picard window is open it wakes at least every 30 seconds, and
+//! `request_refresh` wakes it at once when the menu opens or a scan ends.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -16,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_notification::{Action, ActionType, NotificationExt};
 
 use crate::windows::{self, Tab};
@@ -72,6 +74,69 @@ pub enum Wake {
     VolumesChanged,
     /// An update was installed. The menu offers the restart.
     UpdateReady,
+    /// Something asked for fresh numbers: the menu opened, the window
+    /// opened, a preview scan ended, or a clean was written to history.
+    Refresh,
+}
+
+impl Wake {
+    /// File events and update notices come in bursts, so they wait out
+    /// `DEBOUNCE` and are handled together. A refresh is answered at once,
+    /// because an open menu is waiting on it.
+    fn debounced(self) -> bool {
+        self != Wake::Refresh
+    }
+}
+
+/// True if any of `wakes` should wait out `DEBOUNCE` before the check.
+fn needs_debounce(wakes: &[Wake]) -> bool {
+    wakes.iter().any(|w| w.debounced())
+}
+
+/// True if every one of `wakes` only reports an installed update. That adds
+/// a menu item and is no reason to scan the drives, which can alert or clean.
+fn is_redraw_only(wakes: &[Wake]) -> bool {
+    wakes.iter().all(|&w| w == Wake::UpdateReady)
+}
+
+/// Moves every wake already queued on `rx` into `wakes`.
+fn drain(rx: &mut mpsc::Receiver<Wake>, wakes: &mut Vec<Wake>) {
+    while let Ok(next) = rx.try_recv() {
+        wakes.push(next);
+    }
+}
+
+/// Lets anything with an `AppHandle` ask the poll loop for a check now.
+/// Managed by Tauri. Weak, like `Updates::wake`, so it does not keep the
+/// loop's channel open after the file watchers are gone.
+pub struct RefreshSender(mpsc::WeakSender<Wake>);
+
+impl RefreshSender {
+    pub fn new(wake: mpsc::WeakSender<Wake>) -> Self {
+        Self(wake)
+    }
+}
+
+/// Asks the poll loop to check free space now, which redraws the menu and
+/// the Clean tab's disk tiles.
+///
+/// A refresh that cannot be sent is logged at debug level only. Before
+/// setup manages the sender, or after the loop stops, there is nothing to
+/// wake. A full queue already holds a wake, so the check still happens. In
+/// each case the numbers are only as old as the last check.
+pub fn request_refresh<R: Runtime>(app: &AppHandle<R>) {
+    let Some(sender) = app.try_state::<RefreshSender>() else {
+        log::debug!("refresh asked for before the poll loop was set up");
+        return;
+    };
+    match sender.0.upgrade() {
+        Some(tx) => {
+            if let Err(e) = tx.try_send(Wake::Refresh) {
+                log::debug!("refresh not queued: {e}");
+            }
+        }
+        None => log::debug!("refresh asked for after the poll loop stopped"),
+    }
 }
 
 const VOLUMES_DIR: &str = "/Volumes";
@@ -83,6 +148,19 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 // Used only when there is no valid config yet, so a fixed config error still
 // gets retried even if no file event arrives.
 const FALLBACK_POLL: Duration = Duration::from_secs(5 * 60);
+
+/// The longest the loop sleeps while the Picard window is open, so the free
+/// space on the Clean tab, in the menu and in the icon stays current.
+const WINDOW_OPEN_POLL: Duration = Duration::from_secs(30);
+
+/// `wait`, cut to `WINDOW_OPEN_POLL` while the window is open.
+fn cap_for_window(wait: Duration, window_open: bool) -> Duration {
+    if window_open {
+        wait.min(WINDOW_OPEN_POLL)
+    } else {
+        wait
+    }
+}
 
 const DAILY_STAMP_FORMAT: &str = "%Y-%m-%d";
 
@@ -514,17 +592,23 @@ impl<R: Runtime> Poller<R> {
                     return;
                 }
                 Ok(Some(first)) => {
-                    tokio::time::sleep(DEBOUNCE).await;
-                    let mut config_changed = first == Wake::ConfigChanged;
-                    let mut other_than_update = first != Wake::UpdateReady;
-                    while let Ok(next) = rx.try_recv() {
-                        config_changed |= next == Wake::ConfigChanged;
-                        other_than_update |= next != Wake::UpdateReady;
+                    let mut wakes = vec![first];
+                    drain(&mut rx, &mut wakes);
+                    if needs_debounce(&wakes) {
+                        tokio::time::sleep(DEBOUNCE).await;
+                        drain(&mut rx, &mut wakes);
                     }
-                    // An installed update only adds a menu item. It is no
-                    // reason to scan the drives, which can alert or clean.
-                    redraw_only = !other_than_update;
-                    log::info!(
+                    let config_changed = wakes.contains(&Wake::ConfigChanged);
+                    redraw_only = is_redraw_only(&wakes);
+                    // Hovering over the icon asks for a refresh, so these
+                    // would fill the log at info level.
+                    let level = if wakes.iter().all(|&w| w == Wake::Refresh) {
+                        log::Level::Debug
+                    } else {
+                        log::Level::Info
+                    };
+                    log::log!(
+                        level,
                         "woken early: config changed = {config_changed}, menu redraw only = {redraw_only}"
                     );
                     if config_changed {
@@ -535,13 +619,18 @@ impl<R: Runtime> Poller<R> {
         }
     }
 
-    /// How long to sleep: until the next poll or the next daily scan, whichever is sooner.
+    /// How long to sleep: until the next poll or the next daily scan,
+    /// whichever is sooner, and never more than 30 seconds while the window
+    /// is open.
     fn next_wait(&self, now: NaiveDateTime) -> Duration {
-        let Some(config) = &self.config else {
-            return FALLBACK_POLL;
+        let wait = match &self.config {
+            None => FALLBACK_POLL,
+            Some(config) => {
+                let poll = Duration::from_secs(config.poll_minutes.saturating_mul(60));
+                monitor::next_wait(poll, config.daily_scan, now, self.last_daily_scan)
+            }
         };
-        let poll = Duration::from_secs(config.poll_minutes.saturating_mul(60));
-        monitor::next_wait(poll, config.daily_scan, now, self.last_daily_scan)
+        cap_for_window(wait, windows::is_open(&self.app))
     }
 
     /// Records `date` as the day of the last daily scan (`None` if none has
@@ -914,10 +1003,20 @@ impl<R: Runtime> Poller<R> {
         notify(&self.app, title, body);
     }
 
+    /// Shows `view` in the menu and tells the open window to reload its disk
+    /// tiles. The status is logged only when it changes, because the loop can
+    /// check every 30 seconds.
     fn show(&mut self, view: MenuView) {
-        log::info!("status: {}", crate::tray::status_lines(&view).join("; "));
+        let lines = crate::tray::status_lines(&view);
+        let last = self.last_view.as_ref().map(crate::tray::status_lines);
+        if last.as_ref() != Some(&lines) {
+            log::info!("status: {}", lines.join("; "));
+        }
         if let Err(e) = self.tray.show(&view) {
             log::error!("could not update tray menu: {e}");
+        }
+        if let Err(e) = windows::status_changed(&self.app) {
+            log::warn!("could not tell the window about the new free space: {e}");
         }
         self.last_view = Some(view);
     }
@@ -934,6 +1033,50 @@ impl<R: Runtime> Poller<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_refresh_skips_the_debounce() {
+        assert!(!needs_debounce(&[Wake::Refresh]));
+        assert!(!needs_debounce(&[Wake::Refresh, Wake::Refresh]));
+        for wake in [Wake::ConfigChanged, Wake::VolumesChanged, Wake::UpdateReady] {
+            assert!(needs_debounce(&[wake]), "{wake:?}");
+            assert!(needs_debounce(&[Wake::Refresh, wake]), "{wake:?}");
+        }
+    }
+
+    #[test]
+    fn only_update_notices_skip_the_check() {
+        assert!(is_redraw_only(&[Wake::UpdateReady]));
+        assert!(is_redraw_only(&[Wake::UpdateReady, Wake::UpdateReady]));
+        assert!(!is_redraw_only(&[Wake::Refresh]));
+        assert!(!is_redraw_only(&[Wake::UpdateReady, Wake::Refresh]));
+        assert!(!is_redraw_only(&[Wake::UpdateReady, Wake::VolumesChanged]));
+    }
+
+    #[test]
+    fn drain_takes_every_queued_wake() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(Wake::Refresh).unwrap();
+        tx.try_send(Wake::ConfigChanged).unwrap();
+        let mut wakes = vec![Wake::VolumesChanged];
+        drain(&mut rx, &mut wakes);
+        assert_eq!(
+            wakes,
+            vec![Wake::VolumesChanged, Wake::Refresh, Wake::ConfigChanged]
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_open_window_caps_the_wait_at_30_seconds() {
+        let five_minutes = Duration::from_secs(300);
+        assert_eq!(cap_for_window(five_minutes, false), five_minutes);
+        assert_eq!(cap_for_window(five_minutes, true), WINDOW_OPEN_POLL);
+        assert_eq!(cap_for_window(FALLBACK_POLL, true), WINDOW_OPEN_POLL);
+        // A sooner daily scan still wins.
+        let soon = Duration::from_secs(1);
+        assert_eq!(cap_for_window(soon, true), soon);
+    }
 
     #[test]
     fn one_estimate_runs_per_mount_until_it_ends() {

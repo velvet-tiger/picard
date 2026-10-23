@@ -76,6 +76,8 @@ If your Mac is asleep or Picard is closed at that time, the scan runs at the nex
 
 The menu lists each drive with its free space, then **Clean…**, **Settings…** and **Open Log**.
 
+Picard checks free space every `poll_minutes`. It also checks when you point at or click the icon, when a scan ends, and when a cleanup is recorded. While the Picard window is open, it checks every 30 seconds. Each check updates the menu, the icon and the Clean tab.
+
 ## About and updates
 
 The **About** tab in Picard's window shows the version you are running. It also links to the Velvet Tiger website and to [GitHub issues](https://github.com/velvet-tiger/picard/issues).

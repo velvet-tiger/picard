@@ -47,6 +47,10 @@ pub trait ScanEvents {
     fn phase_changed(&self, phase: &ScanPhase);
     /// The stored previews changed; see `Shared::previews`.
     fn previews_changed(&self);
+    /// A scan that got its turn has ended, whether it stored a result,
+    /// failed or was cancelled. A scan can take minutes, so the free space
+    /// on show is due for a fresh read.
+    fn scan_ended(&self);
 }
 
 /// Which volumes a scan covers.
@@ -115,7 +119,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Puts the phase back to idle when a scan ends, however it ends.
+/// Puts the phase back to idle when a scan ends, however it ends, and
+/// reports the end.
 struct IdleOnDrop<'a> {
     scans: &'a PreviewScans,
     events: &'a dyn ScanEvents,
@@ -124,6 +129,7 @@ struct IdleOnDrop<'a> {
 impl Drop for IdleOnDrop<'_> {
     fn drop(&mut self) {
         self.scans.set_phase(ScanPhase::Idle, self.events);
+        self.events.scan_ended();
     }
 }
 
@@ -220,6 +226,7 @@ mod tests {
     struct Recorder {
         phases: Mutex<Vec<ScanPhase>>,
         stored: AtomicUsize,
+        ended: AtomicUsize,
     }
 
     impl ScanEvents for Recorder {
@@ -228,6 +235,9 @@ mod tests {
         }
         fn previews_changed(&self) {
             self.stored.fetch_add(1, Ordering::SeqCst);
+        }
+        fn scan_ended(&self) {
+            self.ended.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -299,6 +309,7 @@ mod tests {
         assert_eq!(s.shared.previews(), found);
         assert_eq!(events.states(), vec!["scanning", "idle"]);
         assert_eq!(events.stored.load(Ordering::SeqCst), 1);
+        assert_eq!(events.ended.load(Ordering::SeqCst), 1);
         assert_eq!(s.shared.scans.phase(), ScanPhase::Idle);
     }
 
@@ -389,6 +400,7 @@ mod tests {
         assert_eq!(scanner.join().unwrap(), Ok(None));
         assert!(s.shared.previews().is_empty());
         assert_eq!(events.stored.load(Ordering::SeqCst), 0);
+        assert_eq!(events.ended.load(Ordering::SeqCst), 1);
         assert_eq!(s.shared.scans.phase(), ScanPhase::Idle);
     }
 
@@ -435,16 +447,11 @@ mod tests {
     fn a_failed_volume_fails_the_scan_and_stores_nothing() {
         let s = setup();
         let broken = |_: &Volume, _: Stop| -> Result<Vec<TaskScan>> { anyhow::bail!("no exclude") };
-        let err = scan_with(
-            &s.shared,
-            &s.roots,
-            every(&s.shared),
-            &Recorder::default(),
-            &broken,
-        )
-        .unwrap_err();
+        let events = Recorder::default();
+        let err = scan_with(&s.shared, &s.roots, every(&s.shared), &events, &broken).unwrap_err();
         assert!(err.ends_with("no exclude"), "{err}");
         assert!(s.shared.previews().is_empty());
+        assert_eq!(events.ended.load(Ordering::SeqCst), 1);
         assert_eq!(s.shared.scans.phase(), ScanPhase::Idle);
     }
 
@@ -479,8 +486,11 @@ mod tests {
             mark,
             ..every(&s.shared)
         };
-        let found = scan_with(&s.shared, &s.roots, request, &Recorder::default(), &never);
+        let events = Recorder::default();
+        let found = scan_with(&s.shared, &s.roots, request, &events, &never);
         assert_eq!(found, Ok(None));
+        // It never got its turn, so there is no end to report.
+        assert_eq!(events.ended.load(Ordering::SeqCst), 0);
     }
 
     #[test]
