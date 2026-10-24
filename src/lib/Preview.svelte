@@ -116,12 +116,22 @@
   /** Never removed: ignored, or holding an ignored folder (see IgnoreList in tasks/mod.rs). */
   const isProtected = (i: PreviewItem) => i.ignored || i.holds_ignored
 
-  /** Items that can be ticked: everything not protected. */
-  const selectable = (task: PreviewTask) => task.items.filter((i) => !isProtected(i))
+  // Rows left out of this list's clean only, keyed like `checked`. Nothing is
+  // written to the config, and a new list clears them.
+  let skipped = $state<Record<string, boolean>>({})
 
-  /** What a volume could free now. Recomputed here so it follows Ignore clicks. */
+  const isSkipped = (mount: string, i: PreviewItem) => skipped[key(mount, i.path)] === true
+
+  /** Left out of Clean, Select all and the totals: protected, or skipped for now. */
+  const isExcluded = (mount: string, i: PreviewItem) => isProtected(i) || isSkipped(mount, i)
+
+  /** Items that can be ticked: everything not excluded. */
+  const selectable = (mount: string, task: PreviewTask) =>
+    task.items.filter((i) => !isExcluded(mount, i))
+
+  /** What a volume could free now. Recomputed here so it follows Ignore and Skip clicks. */
   const volumeTotal = (v: VolumePreview) =>
-    v.tasks.flatMap(selectable).reduce((sum, i) => sum + i.bytes, 0)
+    v.tasks.flatMap((t) => selectable(v.mount, t)).reduce((sum, i) => sum + i.bytes, 0)
 
   // Whether each category's list is shown, keyed by key(mount, task).
   let open = $state<Record<string, boolean>>({})
@@ -130,17 +140,25 @@
    * A category starts closed when it holds nothing Clean could remove. One that
    * failed to scan stays open so its error shows.
    */
-  const startsOpen = (task: PreviewTask) => task.error !== null || selectable(task).length > 0
+  const startsOpen = (mount: string, task: PreviewTask) =>
+    task.error !== null || selectable(mount, task).length > 0
 
   /** What a closed category's heading says about the hidden list. */
-  function closedSummary(task: PreviewTask): string {
+  function closedSummary(mount: string, task: PreviewTask): string {
     if (task.error) return 'could not scan'
     if (task.items.length === 0) return 'nothing to remove'
-    const free = selectable(task).length
-    if (free === 0) return 'all ignored'
-    const items = `${free} ${free === 1 ? 'item' : 'items'}`
-    const kept = task.items.length - free
-    return kept === 0 ? items : `${items}, ${kept} ignored`
+    const free = selectable(mount, task).length
+    // A row both ignored and skipped counts as ignored, the stronger of the two.
+    const ignored = task.items.filter(isProtected).length
+    const skips = task.items.length - free - ignored
+    if (free === 0) {
+      if (skips === 0) return 'all ignored'
+      return ignored === 0 ? 'all skipped' : `${ignored} ignored, ${skips} skipped`
+    }
+    const parts = [`${free} ${free === 1 ? 'item' : 'items'}`]
+    if (ignored > 0) parts.push(`${ignored} ignored`)
+    if (skips > 0) parts.push(`${skips} skipped`)
+    return parts.join(', ')
   }
 
   const selectedBytes = $derived(
@@ -169,6 +187,8 @@
   function show(found: VolumePreview[]) {
     stale = null
     volumes = found
+    // A skip lasts for one list; a fresh scan offers every row again.
+    skipped = {}
     // Everything not ignored starts ticked; one click on "Clean selected" removes it all.
     checked = Object.fromEntries(
       found.flatMap((v) =>
@@ -178,7 +198,7 @@
     // Set on every scan only. An Ignore click that empties a category leaves
     // it open, so the list does not vanish from under the pointer.
     open = Object.fromEntries(
-      found.flatMap((v) => v.tasks.map((t) => [key(v.mount, t.task), startsOpen(t)])),
+      found.flatMap((v) => v.tasks.map((t) => [key(v.mount, t.task), startsOpen(v.mount, t)])),
     )
     scanned = true
   }
@@ -470,7 +490,7 @@
       .map((v) => ({
         mount: v.mount,
         paths: v.tasks.flatMap((t) =>
-          selectable(t)
+          selectable(v.mount, t)
             .filter((i) => checked[key(v.mount, i.path)])
             .map((i) => i.path),
         ),
@@ -495,15 +515,26 @@
 
   /** How many of one task's items on one volume are ticked. */
   function taskTickedCount(mount: string, task: PreviewTask): number {
-    return selectable(task).filter((i) => checked[key(mount, i.path)]).length
+    return selectable(mount, task).filter((i) => checked[key(mount, i.path)]).length
   }
 
   /**
    * Ticks or unticks every item of one task on one volume, leaving other tasks
-   * alone. Ignored items stay unticked.
+   * alone. Ignored and skipped items stay unticked.
    */
   function setTask(mount: string, task: PreviewTask, value: boolean) {
-    for (const i of selectable(task)) checked[key(mount, i.path)] = value
+    for (const i of selectable(mount, task)) checked[key(mount, i.path)] = value
+  }
+
+  /**
+   * Skips an item for this list, or offers it again. The page alone keeps
+   * skips, so nothing reaches the backend. Either way the item ends unticked:
+   * a skipped row cannot be cleaned, and an unskipped one waits for your tick.
+   */
+  function toggleSkip(mount: string, item: PreviewItem) {
+    const k = key(mount, item.path)
+    checked[k] = false
+    skipped[k] = !skipped[k]
   }
 
   /**
@@ -520,6 +551,8 @@
     try {
       await setIgnored(item.path, ignore)
       item.ignored = ignore
+      // Ignore outranks a skip. Once unignored, the row should come back plain.
+      if (ignore) delete skipped[k]
       notifyIgnoreChanged({ path: item.path, ignored: ignore, source: 'clean' })
       // One change can protect or free other rows too, such as the worktree
       // that holds this folder.
@@ -559,6 +592,7 @@
       if (ignored !== item.ignored || holds !== item.holds_ignored) {
         checked[key(mount, item.path)] = false
       }
+      if (ignored || holds) delete skipped[key(mount, item.path)]
       item.ignored = ignored
       item.holds_ignored = holds
     })
@@ -776,9 +810,9 @@
               ></button
             >
             <h3>
-              {#if !t.error && selectable(t).length > 0}
+              {#if !t.error && selectable(v.mount, t).length > 0}
                 {@const ticked = taskTickedCount(v.mount, t)}
-                {@const total = selectable(t).length}
+                {@const total = selectable(v.mount, t).length}
                 <label class="group">
                   <input
                     type="checkbox"
@@ -793,7 +827,7 @@
               {/if}
             </h3>
             {#if !open[tk]}
-              <span class="muted summary">{closedSummary(t)}</span>
+              <span class="muted summary">{closedSummary(v.mount, t)}</span>
             {/if}
           </div>
           <div id={listId} class="items" hidden={!open[tk]}>
@@ -805,7 +839,8 @@
               <ul>
                 {#each t.items as i}
                   {@const k = key(v.mount, i.path)}
-                  <li class="candidate" class:ignored={isProtected(i)}>
+                  {@const skip = isSkipped(v.mount, i)}
+                  <li class="candidate" class:excluded={isExcluded(v.mount, i)}>
                     <!-- The row already shows the path; a tooltip only helps when shortPath has elided part of it. -->
                     <label
                       class="item"
@@ -814,7 +849,7 @@
                       <input
                         type="checkbox"
                         bind:checked={checked[k]}
-                        disabled={isProtected(i) || cleaning}
+                        disabled={isExcluded(v.mount, i) || cleaning}
                       />
                       <span class="text">
                         <span class="title"
@@ -824,19 +859,33 @@
                               ? 'ignored, never cleaned'
                               : i.holds_ignored
                                 ? 'holds an ignored folder, never cleaned'
-                                : i.reason}</span
+                                : skip
+                                  ? 'skipped this time'
+                                  : i.reason}</span
                           ></span
                         >
                         <span class="path muted">{shortPath(i.path)}</span>
                       </span>
                       <span class="size">{i.size_text}</span>
                     </label>
+                    <!-- A protected row is never cleaned, so skipping it would change nothing. -->
+                    {#if !isProtected(i)}
+                      <button
+                        class="row-action"
+                        onclick={() => toggleSkip(v.mount, i)}
+                        disabled={toggling[k] || cleaning}
+                        title={skip ? undefined : 'Leave out of this clean only'}
+                        aria-pressed={skip}
+                        aria-label="{skip ? 'Unskip' : 'Skip'} {tildePath(i.path)}"
+                        >{skip ? 'Unskip' : 'Skip'}</button
+                      >
+                    {/if}
                     {#if IGNORABLE_TASKS.includes(t.task)}
                       <button
-                        class="ignore"
+                        class="row-action"
                         onclick={() => toggleIgnore(v.mount, i)}
                         disabled={toggling[k] || cleaning}
-                        aria-label="{i.ignored ? 'Stop ignoring' : 'Ignore'} {tildePath(i.path)}"
+                        aria-label="{i.ignored ? 'Unignore' : 'Ignore'} {tildePath(i.path)}"
                         >{i.ignored ? 'Unignore' : 'Ignore'}</button
                       >
                     {/if}
@@ -959,7 +1008,7 @@
   li:last-child {
     border-bottom: none;
   }
-  /* item | Ignore button */
+  /* item | Skip button | Ignore button */
   .candidate {
     display: flex;
     align-items: start;
@@ -969,11 +1018,11 @@
     flex: 1;
     min-width: 0;
   }
-  .candidate.ignored .item {
+  .candidate.excluded .item {
     opacity: 0.55;
     cursor: default;
   }
-  .ignore {
+  .row-action {
     font-size: 11px;
     padding: 1px 8px;
     white-space: nowrap;

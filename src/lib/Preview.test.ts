@@ -854,7 +854,7 @@ describe('Preview', () => {
     expect(box('shop/web')).toBeDisabled()
     expect(sent('get_protection')).toEqual([{ paths: [SHOP, API, BLOG, WORKTREE] }])
     expect(
-      screen.getByRole('button', { name: 'Stop ignoring ~/w/shop/web/node_modules' }),
+      screen.getByRole('button', { name: 'Unignore ~/w/shop/web/node_modules' }),
     ).toBeInTheDocument()
   })
 
@@ -928,6 +928,176 @@ describe('Preview', () => {
     expect(
       await screen.findByText('get_protection returned 1 answers for 4 rows'),
     ).toBeInTheDocument()
+  })
+
+  describe('Skip', () => {
+    const skip = (path: string) => screen.getByRole('button', { name: `Skip ${path}` })
+    const unskip = (path: string) => screen.getByRole('button', { name: `Unskip ${path}` })
+
+    it('leaves a skipped item out of Clean without touching the config', async () => {
+      const { sent } = backend()
+      await renderScanned()
+
+      await fireEvent.click(skip('~/w/api/core/node_modules'))
+
+      expect(box('api/core')).not.toBeChecked()
+      expect(box('api/core')).toBeDisabled()
+      expect(screen.getByText('skipped this time')).toBeInTheDocument()
+      expect(screen.getByText('2 selected, 2.5 GB')).toBeInTheDocument()
+      expect(screen.getByText('up to 2.5 GB')).toBeInTheDocument()
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Clean selected' }))
+      await waitFor(() => expect(sent('run_selected')).toHaveLength(1))
+      expect(sent('run_selected')).toEqual([
+        { selections: [{ mount: '/', paths: [SHOP, WORKTREE] }] },
+      ])
+      expect(sent('set_ignored')).toHaveLength(0)
+      expect(sent('get_protection')).toHaveLength(0)
+    })
+
+    it('keeps a skipped item unticked through Select all and its group box', async () => {
+      backend()
+      await renderScanned()
+
+      await fireEvent.click(skip('~/w/api/core/node_modules'))
+      await fireEvent.click(screen.getByRole('button', { name: 'Select none' }))
+      await fireEvent.click(screen.getByRole('button', { name: 'Select all' }))
+      expect(box('api/core')).not.toBeChecked()
+
+      await fireEvent.click(screen.getByRole('checkbox', { name: 'node_modules' }))
+      await fireEvent.click(screen.getByRole('checkbox', { name: 'node_modules' }))
+      expect(box('shop/web')).toBeChecked()
+      expect(box('api/core')).not.toBeChecked()
+    })
+
+    it('offers a skipped item again on Unskip, unticked until you tick it', async () => {
+      backend()
+      await renderScanned()
+
+      await fireEvent.click(skip('~/w/api/core/node_modules'))
+      await fireEvent.click(unskip('~/w/api/core/node_modules'))
+
+      expect(box('api/core')).toBeEnabled()
+      expect(box('api/core')).not.toBeChecked()
+      expect(screen.queryByText('skipped this time')).not.toBeInTheDocument()
+      expect(screen.getByText('up to 3.5 GB')).toBeInTheDocument()
+    })
+
+    it('clears every skip when the list is scanned again', async () => {
+      backend()
+      await renderScanned()
+
+      await fireEvent.click(skip('~/w/api/core/node_modules'))
+      await fireEvent.click(screen.getByRole('button', { name: 'Rescan' }))
+
+      await waitFor(() => expect(box('api/core')).toBeChecked())
+      expect(box('api/core')).toBeEnabled()
+      expect(skip('~/w/api/core/node_modules')).toBeInTheDocument()
+    })
+
+    it('offers Skip on every row that could be cleaned, and not on ignored ones', async () => {
+      backend()
+      await renderScanned()
+
+      expect(skip('~/w/shop/web/node_modules')).toBeInTheDocument()
+      expect(skip('~/w/shop/.claude/worktrees/old-branch')).toBeInTheDocument()
+      expect(
+        screen.queryByRole('button', { name: 'Skip ~/w/blog/site/node_modules' }),
+      ).not.toBeInTheDocument()
+    })
+
+    it('counts skipped items in a closed category summary', async () => {
+      backend()
+      await renderScanned()
+
+      await fireEvent.click(skip('~/w/api/core/node_modules'))
+      await fireEvent.click(screen.getByRole('button', { name: 'node_modules list' }))
+      expect(screen.getByText('1 item, 1 ignored, 1 skipped')).toBeInTheDocument()
+
+      await fireEvent.click(skip('~/w/shop/.claude/worktrees/old-branch'))
+      await fireEvent.click(screen.getByRole('button', { name: 'Git worktrees list' }))
+      expect(screen.getByText('all skipped')).toBeInTheDocument()
+    })
+
+    it('drops the skip when the row is ignored, so Unignore brings back a plain row', async () => {
+      let protection: Protection[] = [null, 'ignored', 'ignored', null]
+      backend({ get_protection: () => protection })
+      await renderScanned()
+
+      await fireEvent.click(skip('~/w/api/core/node_modules'))
+      await fireEvent.click(screen.getByRole('button', { name: 'Ignore ~/w/api/core/node_modules' }))
+      await waitFor(() => expect(screen.getAllByText('ignored, never cleaned')).toHaveLength(2))
+
+      protection = [null, null, 'ignored', null]
+      await fireEvent.click(screen.getByRole('button', { name: 'Unignore ~/w/api/core/node_modules' }))
+
+      await waitFor(() => expect(box('api/core')).toBeEnabled())
+      expect(screen.queryByText('skipped this time')).not.toBeInTheDocument()
+      expect(skip('~/w/api/core/node_modules')).toHaveAttribute('aria-pressed', 'false')
+    })
+
+    it('holds Skip while a clean runs', async () => {
+      const run = deferred<RunResult[]>()
+      backend({ run_selected: () => run.promise })
+      await renderScanned()
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Clean selected' }))
+
+      expect(skip('~/w/shop/web/node_modules')).toBeDisabled()
+      run.resolve([])
+      await waitFor(() => expect(skip('~/w/shop/web/node_modules')).toBeEnabled())
+    })
+
+    it('clears every skip when a newer stored scan is shown', async () => {
+      let stored: VolumePreview[] = []
+      backend({ get_last_preview: () => stored })
+      await renderScanned()
+      await fireEvent.click(skip('~/w/api/core/node_modules'))
+
+      const later = volumes()
+      later[0].scanned_at = '2026-10-22T10:00:00Z'
+      stored = later
+      await emit('preview-changed')
+      await fireEvent.click(await screen.findByRole('button', { name: 'Show it' }))
+
+      await waitFor(() => expect(box('api/core')).toBeChecked())
+      expect(screen.queryByText('skipped this time')).not.toBeInTheDocument()
+    })
+
+    it('keeps the skips of two volumes apart when they list the same path', async () => {
+      const [first] = volumes()
+      const second: VolumePreview = { ...volumes()[0], name: 'Backup', mount: '/Volumes/Backup' }
+      const { sent } = backend({ preview: () => [first, second] })
+      await renderScanned()
+
+      const [onFirst] = screen.getAllByRole('button', { name: 'Skip ~/w/api/core/node_modules' })
+      await fireEvent.click(onFirst)
+
+      const boxes = screen.getAllByRole<HTMLInputElement>('checkbox', { name: /api\/core/ })
+      expect(boxes[0]).toBeDisabled()
+      expect(boxes[1]).toBeChecked()
+      await fireEvent.click(screen.getByRole('button', { name: 'Clean selected' }))
+      await waitFor(() => expect(sent('run_selected')).toHaveLength(1))
+      expect(sent('run_selected')).toEqual([
+        {
+          selections: [
+            { mount: '/', paths: [SHOP, WORKTREE] },
+            { mount: '/Volumes/Backup', paths: [SHOP, API, WORKTREE] },
+          ],
+        },
+      ])
+    })
+
+    it('counts ignored and skipped items when nothing in a category is left', async () => {
+      backend()
+      await renderScanned()
+
+      await fireEvent.click(skip('~/w/shop/web/node_modules'))
+      await fireEvent.click(skip('~/w/api/core/node_modules'))
+      await fireEvent.click(screen.getByRole('button', { name: 'node_modules list' }))
+
+      expect(screen.getByText('1 ignored, 2 skipped')).toBeInTheDocument()
+    })
   })
 
   describe('category toggle', () => {
