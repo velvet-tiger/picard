@@ -6,6 +6,16 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-25
+
+### Added
+
+- Each cleanable item has a **Skip** action. A skipped item is dimmed, unticked and left out of Clean, Select all and the totals for that scan. A new list clears the skipped state.
+
+### Fixed
+
+- A stale Git untracked cache can no longer make `git worktree remove` refuse an empty worktree after Picard has confirmed that it is clean.
+
 ## [0.7.1] - 2026-10-24
 
 ### Fixed
@@ -175,6 +185,7 @@ and removes build output and finished work when a drive runs low.
 - Disk image volume test (a918137).
 - Vitest tests for `api.ts`, Preview and Settings (5eeb28a).
 
+[0.8.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.8.0
 [0.7.1]: https://github.com/velvet-tiger/picard/releases/tag/v0.7.1
 [0.7.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.7.0
 [0.6.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.6.0
