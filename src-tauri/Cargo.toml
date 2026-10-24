@@ -1,6 +1,6 @@
 [package]
 name = "picard"
-version = "0.7.0"
+version = "0.7.1"
 description = "Menu bar app that watches free disk space and cleans up stale build output"
 authors = ["Velvet Tiger"]
 license = "MIT"

@@ -6,6 +6,12 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-24
+
+### Fixed
+
+- 0.7.0 was never published. A test failed on git 2.56, so the release stopped before the build. 0.7.1 holds every change listed under 0.7.0. The fix changes only tests.
+
 ## [0.7.0] - 2026-10-23
 
 ### Added
@@ -169,6 +175,7 @@ and removes build output and finished work when a drive runs low.
 - Disk image volume test (a918137).
 - Vitest tests for `api.ts`, Preview and Settings (5eeb28a).
 
+[0.7.1]: https://github.com/velvet-tiger/picard/releases/tag/v0.7.1
 [0.7.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.7.0
 [0.6.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.6.0
 [0.5.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.5.0
