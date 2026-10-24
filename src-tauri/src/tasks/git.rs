@@ -66,6 +66,11 @@ impl GitCmd {
             // that text, so repo config such as UTF-16 must not change it.
             "-c",
             "i18n.logOutputEncoding=UTF-8",
+            // A stale untracked cache can list an empty folder as untracked.
+            // `worktree remove` checks in the mode that reads the cache, so it
+            // refuses a worktree Picard found clean. `-c` reaches that check.
+            "-c",
+            "core.untrackedCache=false",
         ]);
         cmd.arg("-C").arg(dir).args(args);
         // Picard only reads, apart from `worktree remove`. Skipping optional
@@ -666,6 +671,21 @@ mod tests {
             .unwrap();
         let seen = git
             .output(dir.path(), &["config", "--bool", "core.commitGraph"])
+            .unwrap();
+        assert_eq!(seen.trim(), "false");
+    }
+
+    /// Repo config cannot turn on the untracked cache, which can go stale and
+    /// make `worktree remove` refuse a clean worktree.
+    #[test]
+    fn repo_config_cannot_turn_on_the_untracked_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitCmd::default();
+        git.output(dir.path(), &["init", "-q"]).unwrap();
+        git.output(dir.path(), &["config", "core.untrackedCache", "true"])
+            .unwrap();
+        let seen = git
+            .output(dir.path(), &["config", "--bool", "core.untrackedCache"])
             .unwrap();
         assert_eq!(seen.trim(), "false");
     }

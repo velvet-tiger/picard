@@ -1564,6 +1564,54 @@ mod tests {
         assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
     }
 
+    /// A stale untracked cache, set in worktree config, lists a folder that is
+    /// now empty. `worktree remove` reads that cache and would refuse, although
+    /// Picard's own status check finds the worktree clean.
+    #[test]
+    fn stale_untracked_cache_does_not_block_removal() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        git(&r, &["config", "extensions.worktreeConfig", "true"]);
+        let wt = worktree(&r, "stale-cache");
+        git(
+            &wt,
+            &["config", "--worktree", "core.untrackedCache", "true"],
+        );
+        // Not `.claude`, which a global excludes file may ignore.
+        let folder = wt.join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("settings.json"), "{}").unwrap();
+        age(&fx, &wt, 1);
+        // The cache records which exclude files built it, and git rebuilds it
+        // when they differ. So it is built with the same global config that
+        // Picard's git reads, not the fixture's isolated config.
+        let status = || {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&wt)
+                .args(["status", "--porcelain", "--untracked-files=normal"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        // Records `notes/` and its mtime in the index's untracked cache.
+        status();
+        // Emptying the folder and putting its mtime back leaves the cache stale.
+        let mtime = filetime::FileTime::from_last_modification_time(&folder.metadata().unwrap());
+        std::fs::remove_file(folder.join("settings.json")).unwrap();
+        filetime::set_file_mtime(&folder, mtime).unwrap();
+        assert_eq!(status(), "?? notes/\n");
+
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["stale-cache"]);
+        let report = t.run(&ctx, &found);
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(!wt.exists());
+    }
+
     #[test]
     fn locked_worktree_is_kept() {
         let fx = Fixture::new(&[]);
