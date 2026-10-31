@@ -199,7 +199,7 @@ fn format_scan(name: &str, space: DiskSpace, scans: &[TaskScan]) -> String {
             ));
         }
         match &s.result {
-            Err(e) => out.push_str(&format!("  {}: scan failed: {e}\n", s.task)),
+            Err(e) => out.push_str(&format!("  {}: scan failed: {}\n", s.task, printable(e))),
             Ok(c) if c.is_empty() => out.push_str(&format!("  {}: nothing to remove\n", s.task)),
             Ok(c) => {
                 for cand in c {
@@ -239,9 +239,10 @@ fn format_run(name: &str, run: &VolumeRun) -> String {
     }
     for (task, path, why) in &run.failed {
         out.push_str(&format!(
-            "  FAILED   {:<13} {}: {why}\n",
+            "  FAILED   {:<13} {}: {}\n",
             task,
-            printable(&path.display().to_string())
+            printable(&path.display().to_string()),
+            printable(why)
         ));
     }
     for (task, path, why) in &run.skipped {
@@ -296,6 +297,24 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_error_escapes_control_characters() {
+        let scans = vec![TaskScan {
+            task: "build_output",
+            result: Err("bad \u{1b}[2J".to_string()),
+            ignored: Default::default(),
+            holds_ignored: Default::default(),
+            notices: Vec::new(),
+        }];
+        let space = DiskSpace {
+            free_bytes: 1,
+            total_bytes: 2,
+        };
+        let text = format_scan("Disk", space, &scans);
+        assert!(text.contains(r"bad \u{1b}[2J"), "{text:?}");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+    }
+
+    #[test]
     fn every_listed_path_escapes_control_characters() {
         let path = PathBuf::from("/w/a\u{1b}[2J");
         let shown = r"/w/a\u{1b}[2J";
@@ -323,7 +342,7 @@ mod tests {
                     bytes: 1,
                 },
             )],
-            failed: vec![("node_modules", path.clone(), "busy".into())],
+            failed: vec![("node_modules", path.clone(), "held by \u{1b}[2J".into())],
             skipped: vec![("node_modules", path, "is ignored")],
             stopped: None,
         };
@@ -331,6 +350,7 @@ mod tests {
         assert!(scan.contains(shown) && !scan.contains('\u{1b}'), "{scan:?}");
         let text = format_run("Disk", &run);
         assert_eq!(text.matches(shown).count(), 3, "{text:?}");
+        assert!(text.contains(r"held by \u{1b}[2J"), "{text:?}");
         assert!(!text.contains('\u{1b}'), "{text:?}");
     }
 
