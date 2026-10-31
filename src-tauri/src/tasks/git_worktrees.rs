@@ -1079,13 +1079,9 @@ impl GitWorktrees {
             return Err("changed since the run started".to_string());
         }
         self.head_unmoved(&wt)?;
-        let path = c.path.to_string_lossy();
-        let mut args = vec!["worktree", "remove"];
-        if force {
-            args.push("--force");
-        }
-        args.push(&path);
-        self.git.output(&repo, &args).map_err(err_text)?;
+        self.git
+            .remove_worktree(&repo, &c.path, force)
+            .map_err(err_text)?;
         if wt.branch.is_none() {
             // No branch holds a detached worktree's own commits. Logging HEAD
             // lets someone find it with `git fsck --lost-found` before gc.
@@ -1500,6 +1496,42 @@ mod tests {
             .unwrap()
             .to_string();
         fx.age(&rel, days);
+    }
+
+    /// Real git, except that `worktree remove` starts a second late.
+    fn git_slow_to_remove(dir: &Path) -> GitCmd {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("slow-remove-git");
+        let script = "#!/bin/sh\n\
+            for a in \"$@\"; do [ \"$a\" = remove ] && sleep 1; done\n\
+            exec git \"$@\"\n";
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        GitCmd::new(path, std::env::var("PATH").unwrap())
+    }
+
+    /// `remove_one` must use the removal limit, whatever `GitCmd` offers.
+    #[test]
+    fn removing_a_worktree_runs_under_the_removal_limit() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "done");
+        git(&r, &["branch", "other", "done"]);
+        age(&fx, &wt, 1);
+        let used = InUse::from_cwds(vec![]);
+        let t = GitWorktrees::new(
+            git_slow_to_remove(fx.dir.path())
+                .with_limits(Duration::from_secs(60), Duration::from_millis(100)),
+            14,
+            Duration::from_secs(30 * 60),
+            Arc::new(move || Ok(used.clone())),
+        );
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["done"]);
+        let report = t.run(&ctx, &found);
+        assert!(report.failed[0].1.contains("timed out"), "{report:?}");
+        assert!(wt.exists());
     }
 
     #[test]

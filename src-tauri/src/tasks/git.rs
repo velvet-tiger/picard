@@ -12,6 +12,12 @@ use crate::proc::{self, Output};
 /// but bounded so a hung git (a stuck network filesystem) cannot stall a scan.
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// `git worktree remove` deletes every file in the worktree, which takes many
+/// minutes on a large `node_modules`. Stopping it part way leaves a broken
+/// worktree, so it gets far longer than a read. It still has a limit, so a
+/// stuck disk cannot hold the run lock for ever.
+const WORKTREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// Picard parses git listings to make safety decisions, so it must see all of
 /// them. Output past this size is treated as an error rather than trusted.
 const GIT_OUTPUT_CAP: usize = 256 * 1024 * 1024;
@@ -26,11 +32,26 @@ pub const SAFETY_STATUS: &[&str] = &[
     "--ignore-submodules=all",
 ];
 
+/// How long git may run before Picard stops it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GitLimits {
+    /// Every command except `worktree remove`.
+    normal: Duration,
+    /// `worktree remove` only.
+    removal: Duration,
+}
+
+const GIT_LIMITS: GitLimits = GitLimits {
+    normal: GIT_TIMEOUT,
+    removal: WORKTREE_REMOVE_TIMEOUT,
+};
+
 /// How to invoke git: which binary, and the PATH it runs with.
 #[derive(Debug, Clone)]
 pub struct GitCmd {
     program: PathBuf,
     path_var: Option<String>,
+    limits: GitLimits,
 }
 
 impl Default for GitCmd {
@@ -39,6 +60,7 @@ impl Default for GitCmd {
         Self {
             program: PathBuf::from("git"),
             path_var: None,
+            limits: GIT_LIMITS,
         }
     }
 }
@@ -102,14 +124,28 @@ impl GitCmd {
         Self {
             program,
             path_var: Some(path_var),
+            limits: GIT_LIMITS,
         }
     }
 
-    fn exec(&self, dir: &Path, args: &[&str], input: Option<String>) -> Result<Output> {
+    /// Replaces the time limits, so a test need not wait for the real ones.
+    #[cfg(test)]
+    pub(crate) fn with_limits(mut self, normal: Duration, removal: Duration) -> Self {
+        self.limits = GitLimits { normal, removal };
+        self
+    }
+
+    fn exec(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        input: Option<String>,
+        timeout: Duration,
+    ) -> Result<Output> {
         let cmd = self.command(dir, args);
         let out = match input {
-            None => proc::run(cmd, GIT_TIMEOUT, GIT_OUTPUT_CAP),
-            Some(text) => proc::run_with_input(cmd, text.into_bytes(), GIT_TIMEOUT, GIT_OUTPUT_CAP),
+            None => proc::run(cmd, timeout, GIT_OUTPUT_CAP),
+            Some(text) => proc::run_with_input(cmd, text.into_bytes(), timeout, GIT_OUTPUT_CAP),
         }
         .with_context(|| {
             format!(
@@ -136,8 +172,21 @@ impl GitCmd {
 
     /// Runs git in `dir` and returns stdout. Fails with stderr on a non-zero exit.
     pub fn output(&self, dir: &Path, args: &[&str]) -> Result<String> {
-        let out = self.exec(dir, args, None)?;
+        let out = self.exec(dir, args, None, self.limits.normal)?;
         stdout_of(out, dir, args)
+    }
+
+    /// Runs `git worktree remove` on `worktree` from `repo`, under the long
+    /// limit that only this command gets. `--force` is the caller's decision.
+    pub fn remove_worktree(&self, repo: &Path, worktree: &Path, force: bool) -> Result<()> {
+        let path = worktree.to_string_lossy();
+        let mut args = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.push(&path);
+        let out = self.exec(repo, &args, None, self.limits.removal)?;
+        stdout_of(out, repo, &args).map(drop)
     }
 
     /// Like `output`, but writes `input` to git's stdin, as `--stdin` options
@@ -145,14 +194,14 @@ impl GitCmd {
     /// command line, and git never reads one of them as a path. It takes the
     /// input by value, so a large one is not held twice.
     pub fn output_with_input(&self, dir: &Path, args: &[&str], input: String) -> Result<String> {
-        let out = self.exec(dir, args, Some(input))?;
+        let out = self.exec(dir, args, Some(input), self.limits.normal)?;
         stdout_of(out, dir, args)
     }
 
     /// Runs a git command whose exit status is the answer, like
     /// `merge-base --is-ancestor`: 0 is yes, 1 is no, anything else is an error.
     pub fn check(&self, dir: &Path, args: &[&str]) -> Result<bool> {
-        let out = self.exec(dir, args, None)?;
+        let out = self.exec(dir, args, None, self.limits.normal)?;
         match out.code {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -703,6 +752,57 @@ mod tests {
             .output(dir.path(), &["config", "i18n.logOutputEncoding"])
             .unwrap();
         assert_eq!(seen.trim(), "UTF-8");
+    }
+
+    /// A stand-in for git that takes a second over anything and then succeeds.
+    fn slow_git(dir: &Path) -> GitCmd {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-git");
+        std::fs::write(&path, "#!/bin/sh\nsleep 1\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        GitCmd::new(path, std::env::var("PATH").unwrap())
+    }
+
+    #[test]
+    fn worktree_removal_gets_a_longer_limit_than_a_read() {
+        assert_eq!(GIT_LIMITS.normal, Duration::from_secs(60));
+        assert_eq!(GIT_LIMITS.removal, Duration::from_secs(30 * 60));
+    }
+
+    /// The bug this guards against: a removal slower than the read limit was
+    /// killed part way, which left a half-deleted worktree.
+    #[test]
+    fn removal_is_not_held_to_the_short_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let git =
+            slow_git(dir.path()).with_limits(Duration::from_millis(100), Duration::from_secs(30));
+        git.remove_worktree(dir.path(), Path::new("/wt"), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn removal_stops_at_its_own_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let git =
+            slow_git(dir.path()).with_limits(Duration::from_secs(30), Duration::from_millis(100));
+        let err = git
+            .remove_worktree(dir.path(), Path::new("/wt"), false)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+    }
+
+    #[test]
+    fn prune_and_reads_keep_the_short_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let git =
+            slow_git(dir.path()).with_limits(Duration::from_millis(100), Duration::from_secs(30));
+        for args in [&["worktree", "prune"][..], SAFETY_STATUS] {
+            let err = git.output(dir.path(), args).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("timed out"),
+                "{args:?}: {err:#}"
+            );
+        }
     }
 
     #[test]
