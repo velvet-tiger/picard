@@ -1447,6 +1447,16 @@ mod tests {
         assert!(has_entries(&file).is_err());
     }
 
+    /// With no checkout to judge, only the walk itself can notice the stop.
+    #[test]
+    fn a_stopped_walk_ends_before_it_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.js"), "x").unwrap();
+        let stopped: Stop = &|| true;
+        let err = find_checkouts(dir.path(), &[], Search::Output, stopped).unwrap_err();
+        assert!(err.to_string().contains("stopped"), "{err:#}");
+    }
+
     #[test]
     fn a_stopped_search_is_an_error_and_runs_no_git() {
         let dir = tempfile::tempdir().unwrap();
