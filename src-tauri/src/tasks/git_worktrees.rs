@@ -11,7 +11,8 @@
 //!   is paused in it
 //! - each of its own refs, under `refs/worktree/` and `refs/bisect/`, points
 //!   at a commit that another local branch holds. Removal deletes them.
-//! - `git status --porcelain` is empty, so nothing uncommitted or untracked
+//! - `git status --porcelain` is empty, so nothing uncommitted or untracked.
+//!   The one exception is a partly deleted worktree, described below.
 //! - any checked-out submodule is clean and holds no commit missing from its
 //!   remote branches (`GitCmd::unsafe_to_inspect`)
 //! - it is done and the folder has been idle for `min_idle`, or it waits and
@@ -81,15 +82,25 @@
 //! worktree that waited says "idle 20 days" when it is only pushed, and "has
 //! commits on no branch, idle 20 days" when the reflog made it wait.
 //!
+//! A worktree whose status lists deleted tracked files and nothing else is
+//! partly deleted. A `git worktree remove` that was stopped part way leaves
+//! one, and the rest of it stays on disk for ever if nobody finishes the job.
+//! Git refuses it, so Picard removes it with `--force`, and only when its
+//! commits are safe by the rules above and nothing else has changed in it.
+//! A person can also be deleting files on purpose, so it always waits for
+//! `stale_days`, and the folder mtimes that record a deletion count towards
+//! its idle time. Its reason starts with "partly deleted".
+//!
 //! Each candidate is judged again just before removal, with the repo's
 //! worktrees and branches read afresh. One found done must still be done.
 //! Its HEAD is read once more right before `git worktree remove`, and a HEAD
 //! that moved keeps it.
 //!
 //! Removal is `git worktree remove` without `--force`, so git refuses anything
-//! dirty or locked as a second guard. The exception is a worktree with
-//! checked-out submodules, which git removes only with `--force`. One `--force`
-//! still refuses a locked worktree. Branches are never deleted.
+//! dirty or locked as a second guard. The exceptions are a worktree with
+//! checked-out submodules and a partly deleted one, which git removes only
+//! with `--force`. One `--force` still refuses a locked worktree. Branches are
+//! never deleted.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -101,7 +112,7 @@ use walkdir::WalkDir;
 
 use super::git::{GitCmd, SAFETY_STATUS, WorktreeEntry, parse_worktree_list};
 use super::in_use::InUse;
-use super::stale_dirs::{FINDER_METADATA, is_skipped, newest_mtime};
+use super::stale_dirs::{FINDER_METADATA, is_file, is_skipped, newest_mtime};
 use super::{Candidate, CleanupTask, Ctx, Estimate, Removed, Report, check_target};
 
 /// Folders never descended into while looking for repos.
@@ -134,6 +145,8 @@ enum Wait {
     /// It would be done, but its HEAD reflog shows commits made in it that
     /// no branch holds, with no copy on another branch.
     Unbranched,
+    /// Its status lists only deleted tracked files. See `Tree::PartlyDeleted`.
+    PartlyDeleted,
 }
 
 impl Wait {
@@ -145,6 +158,28 @@ impl Wait {
         match self {
             Wait::Pushed => "idle ",
             Wait::Unbranched => "has commits on no branch, idle ",
+            Wait::PartlyDeleted => "partly deleted, idle ",
+        }
+    }
+}
+
+/// What `git status` found in a worktree that is safe to judge.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Tree {
+    /// Nothing uncommitted or untracked.
+    Clean,
+    /// Deleted tracked files and nothing else. The usual cause is a `git
+    /// worktree remove` that stopped part way.
+    PartlyDeleted,
+}
+
+impl Standing {
+    /// The standing of a worktree with `tree`. A partly deleted one always
+    /// waits for `stale_days`, however done it is. An unsafe one stays unsafe.
+    fn with_tree(self, tree: Tree) -> Standing {
+        match (tree, self) {
+            (Tree::Clean, standing) | (_, standing @ Standing::Unsafe) => standing,
+            (Tree::PartlyDeleted, _) => Standing::Elsewhere(Wait::PartlyDeleted),
         }
     }
 }
@@ -152,7 +187,7 @@ impl Wait {
 /// True if candidate reason `reason` is one for a worktree that waited for
 /// `stale_days`, rather than one found done.
 fn waits_for_stale_days(reason: &str) -> bool {
-    [Wait::Pushed, Wait::Unbranched]
+    [Wait::Pushed, Wait::Unbranched, Wait::PartlyDeleted]
         .iter()
         .any(|w| reason.starts_with(w.prefix()))
 }
@@ -266,60 +301,67 @@ impl GitWorktrees {
         ctx: &Ctx,
         in_use: &InUse,
     ) -> Result<Option<String>> {
-        if !self.inspectable(state, wt, ctx, in_use)? {
+        let Some(tree) = self.inspectable(state, wt, ctx, in_use)? else {
             return Ok(None);
-        }
+        };
         // `standing` logs why a worktree is unsafe.
-        let standing = self.standing(repo, state, wt)?;
+        let standing = self.standing(repo, state, wt)?.with_tree(tree);
         Ok(self.reason(&standing, wt, ctx))
     }
 
-    /// True if nothing about the worktree itself rules it out, before its
-    /// commits are judged. Logs why it is ruled out.
+    /// What is in the worktree, if nothing about the worktree itself rules
+    /// it out, before its commits are judged. Logs why it is ruled out.
     fn inspectable(
         &self,
         state: &RepoState,
         wt: &WorktreeEntry,
         ctx: &Ctx,
         in_use: &InUse,
-    ) -> Result<bool> {
+    ) -> Result<Option<Tree>> {
         if wt.locked || wt.prunable || wt.bare {
-            return Ok(false);
+            return Ok(None);
         }
         if let Err(why) = check_target(&wt.path, ctx) {
             log::debug!("worktree {}: {why}", wt.path.display());
-            return Ok(false);
+            return Ok(None);
         }
         if in_use.contains(&wt.path) {
             log::debug!(
                 "worktree {}: in use by a running process",
                 wt.path.display()
             );
-            return Ok(false);
+            return Ok(None);
         }
         if let Some(why) = self.identity_problem(state, wt)? {
             log::warn!("worktree {}: skipped: {why}", wt.path.display());
-            return Ok(false);
+            return Ok(None);
         }
         if let Some(op) = self.git.operation_in_progress(&wt.path)? {
             log::debug!("worktree {}: has {op} in progress", wt.path.display());
-            return Ok(false);
+            return Ok(None);
         }
         if let Some(why) = self.git.unsafe_to_inspect(&wt.path)? {
             log::warn!("worktree {}: skipped: {why}", wt.path.display());
-            return Ok(false);
+            return Ok(None);
         }
-        if !self.git.output(&wt.path, SAFETY_STATUS)?.trim().is_empty() {
-            log::debug!("worktree {}: has uncommitted changes", wt.path.display());
-            return Ok(false);
+        let status = self.git.output(&wt.path, SAFETY_STATUS)?;
+        if status.trim().is_empty() {
+            return Ok(Some(Tree::Clean));
         }
-        Ok(true)
+        if deletions_only(&status) {
+            return Ok(Some(Tree::PartlyDeleted));
+        }
+        log::debug!("worktree {}: has uncommitted changes", wt.path.display());
+        Ok(None)
     }
 
     /// The candidate reason for a worktree with `standing`, or None while it
     /// has not been idle long enough.
     fn reason(&self, standing: &Standing, wt: &WorktreeEntry, ctx: &Ctx) -> Option<String> {
-        let newest = newest_mtime(&wt.path, &ctx.not_activity)?;
+        let newest = match standing {
+            Standing::Elsewhere(Wait::PartlyDeleted) => last_change(&wt.path, &ctx.not_activity)?,
+            _ => newest_mtime(&wt.path, &ctx.not_activity)?,
+        };
         let idle = ctx.now.duration_since(newest).ok()?;
         let stale = Duration::from_secs(u64::from(self.stale_days) * SECS_PER_DAY);
         let wait = match standing {
@@ -1055,6 +1097,27 @@ impl GitWorktrees {
         Ok(())
     }
 
+    /// Refuses removal if `c`'s status is not what its kind allows: nothing
+    /// for a clean worktree, and only deleted files for a partly deleted one.
+    /// The `.git` file must be there too. Without it, git run in the folder
+    /// finds the enclosing repo and reports on that one instead.
+    fn status_allows_removal(&self, c: &Candidate) -> Result<(), String> {
+        let status = self.git.output(&c.path, SAFETY_STATUS).map_err(err_text)?;
+        if !is_partly_deleted(c) {
+            return match status.trim() {
+                "" => Ok(()),
+                _ => Err("now has uncommitted changes".to_string()),
+            };
+        }
+        if !is_file(&c.path.join(".git")) {
+            return Err("no longer has its .git file".to_string());
+        }
+        if !deletions_only(&status) {
+            return Err("no longer only has deleted files".to_string());
+        }
+        Ok(())
+    }
+
     fn remove_one(&self, ctx: &Ctx, in_use: &InUse, c: &Candidate) -> Result<(), String> {
         let canon = check_target(&c.path, ctx)?;
         ctx.refuse_kept(&canon)?;
@@ -1065,22 +1128,25 @@ impl GitWorktrees {
         // stand in for git's own, which refuses every worktree with submodules.
         // Read before those checks: if submodules appear after it, plain
         // `worktree remove` refuses, so a late change cannot earn `--force`.
-        let force = self.git.has_submodule_stores(&c.path).map_err(err_text)?;
+        let stores = self.git.has_submodule_stores(&c.path).map_err(err_text)?;
+        let partly_deleted = is_partly_deleted(c);
         if let Some(why) = self.git.unsafe_to_inspect(&c.path).map_err(err_text)? {
             return Err(why);
         }
-        let dirty = self.git.output(&c.path, SAFETY_STATUS).map_err(err_text)?;
-        if !dirty.trim().is_empty() {
-            return Err("now has uncommitted changes".to_string());
-        }
+        self.status_allows_removal(c)?;
         let repo = self.repo_of(&c.path).map_err(err_text)?;
         let wt = self.recheck(&repo, c, &canon)?;
-        if self.written_during_run(c, ctx, force)? {
+        if self.written_during_run(c, ctx, stores)? {
             return Err("changed since the run started".to_string());
         }
         self.head_unmoved(&wt)?;
+        if partly_deleted {
+            // `--force` turns off git's own check for changes, so this is
+            // the last thing that can see one. It runs as late as it can.
+            self.status_allows_removal(c)?;
+        }
         self.git
-            .remove_worktree(&repo, &c.path, force)
+            .remove_worktree(&repo, &c.path, stores || partly_deleted)
             .map_err(err_text)?;
         if wt.branch.is_none() {
             // No branch holds a detached worktree's own commits. Logging HEAD
@@ -1225,6 +1291,38 @@ fn written_since(dir: &Path, since: SystemTime, skip_build: bool) -> bool {
                 .and_then(|m| m.modified().ok())
                 .is_none_or(|modified| modified > since),
         })
+}
+
+/// True if `status`, from `SAFETY_STATUS`, lists at least one deleted tracked
+/// file and nothing else. Anything else, even a line this does not expect,
+/// makes it false, because `--force` would delete whatever that line stands
+/// for. ` D` is deleted from the worktree and still in the index, so staged
+/// changes never match. Git quotes a path that holds a newline, so each line
+/// is one entry.
+fn deletions_only(status: &str) -> bool {
+    !status.is_empty() && status.lines().all(|line| line.starts_with(" D "))
+}
+
+/// True if `c` was found partly deleted by a scan.
+fn is_partly_deleted(c: &Candidate) -> bool {
+    c.reason.starts_with(Wait::PartlyDeleted.prefix())
+}
+
+/// The newest change under `dir` that left a trace, or None if `dir` cannot
+/// be read. `newest_mtime` skips folders, so it cannot see a deletion, and a
+/// worktree with no files left has no file mtime at all. Deleting a file does
+/// change its folder's mtime, so folders count here, however deep. Finder
+/// also touches folders, which can only make a worktree wait longer.
+fn last_change(dir: &Path, not_activity: &[String]) -> Option<SystemTime> {
+    let folders = WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !is_skipped(e.path(), &[]))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_dir())
+        .filter_map(|e| e.metadata().ok()?.modified().ok())
+        .max()?;
+    Some(newest_mtime(dir, not_activity).map_or(folders, |files| files.max(folders)))
 }
 
 /// The branch a reflog line belongs to, if the line records a `merge` that
@@ -1563,6 +1661,246 @@ mod tests {
             git(&r, &["branch", "--list", "done"]).contains("done"),
             "branch must survive"
         );
+    }
+
+    /// A worktree on a branch that `main` also holds, aged 20 days, with
+    /// one tracked file deleted and every folder aged again afterwards. The
+    /// idle time then comes from the fixture, as it would after 20 quiet days.
+    fn partly_deleted(fx: &Fixture, r: &Path, name: &str) -> PathBuf {
+        commit(r, "other");
+        let wt = worktree(r, name);
+        std::fs::remove_file(wt.join("other")).unwrap();
+        age(fx, &wt, 20);
+        wt
+    }
+
+    #[test]
+    fn partly_deleted_worktree_waits_for_stale_days_and_then_goes() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = partly_deleted(&fx, &r, "half");
+        let ctx = fx.ctx();
+        assert!(task(30, vec![]).scan(&ctx).unwrap().is_empty());
+
+        let t = task(14, vec![]);
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["half"]);
+        assert!(
+            found[0].reason.starts_with("partly deleted, idle 20 days"),
+            "{}",
+            found[0].reason
+        );
+        let report = t.run(&ctx, &found);
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(!wt.exists());
+        assert!(
+            git(&r, &["branch", "--list", "half"]).contains("half"),
+            "branch must survive"
+        );
+    }
+
+    /// Done worktrees normally go after `min_idle`, which is a day here. A
+    /// person may be deleting these files on purpose, so this one must not.
+    #[test]
+    fn a_done_partly_deleted_worktree_never_goes_at_min_idle() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = partly_deleted(&fx, &r, "half");
+        age(&fx, &wt, 1);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    /// File mtimes alone would call this worktree 20 days idle, though
+    /// someone deleted a file in it a moment ago.
+    #[test]
+    fn a_deletion_just_now_counts_as_activity_in_a_partly_deleted_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        commit(&r, "second");
+        let wt = partly_deleted(&fx, &r, "half");
+        std::fs::remove_file(wt.join("second")).unwrap();
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    /// With no file left there is no file mtime. It must still be found.
+    #[test]
+    fn a_worktree_with_every_file_deleted_is_found() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = partly_deleted(&fx, &r, "half");
+        std::fs::remove_file(wt.join("README")).unwrap();
+        age(&fx, &wt, 20);
+        let found = task(14, vec![]).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found), vec!["half"]);
+    }
+
+    #[test]
+    fn a_deletion_alongside_an_edit_is_kept() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = partly_deleted(&fx, &r, "half");
+        std::fs::write(wt.join("README"), "edited").unwrap();
+        age(&fx, &wt, 20);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_deletion_alongside_an_untracked_file_is_kept() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = partly_deleted(&fx, &r, "half");
+        std::fs::write(wt.join("notes"), "mine").unwrap();
+        age(&fx, &wt, 20);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_staged_deletion_is_kept() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = partly_deleted(&fx, &r, "half");
+        git(&wt, &["rm", "-q", "README"]);
+        age(&fx, &wt, 20);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_deletion_on_a_commit_no_branch_holds_is_kept() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = fx.root.join("repo/.claude/worktrees/detached");
+        git(
+            &r,
+            &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+        );
+        commit(&wt, "only-here");
+        std::fs::remove_file(wt.join("only-here")).unwrap();
+        age(&fx, &wt, 60);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_change_between_scan_and_removal_keeps_a_partly_deleted_worktree() {
+        let edit = |wt: &Path| std::fs::write(wt.join("README"), "edited").unwrap();
+        let add = |wt: &Path| std::fs::write(wt.join("notes"), "mine").unwrap();
+        for change in [&edit as &dyn Fn(&Path), &add] {
+            let fx = Fixture::new(&[]);
+            let r = repo(&fx);
+            let wt = partly_deleted(&fx, &r, "half");
+            let t = task(14, vec![]);
+            let ctx = fx.ctx();
+            let found = t.scan(&ctx).unwrap();
+            assert_eq!(names(&found), vec!["half"]);
+            change(&wt);
+            age(&fx, &wt, 20);
+            let report = t.run(&ctx, &found);
+            assert!(report.removed.is_empty(), "{report:?}");
+            assert_eq!(report.failed[0].1, "no longer only has deleted files");
+            assert!(wt.exists());
+        }
+    }
+
+    /// Real git, except that the second `status` after `armed` appears first
+    /// edits `file`. That is the last status before a forced removal.
+    fn git_editing_before_last_status(dir: &Path, armed: &Path, file: &Path) -> GitCmd {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("editing-git");
+        let count = dir.join("status-count");
+        let script = format!(
+            "#!/bin/sh\n\
+             case \" $* \" in *\" status \"*)\n\
+               if [ -f '{armed}' ]; then\n\
+                 n=$(($(cat '{count}' 2>/dev/null || echo 0) + 1)); echo $n > '{count}'\n\
+                 [ $n = 2 ] && echo edited > '{file}'\n\
+               fi;;\n\
+             esac\n\
+             exec git \"$@\"\n",
+            armed = armed.display(),
+            count = count.display(),
+            file = file.display(),
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        GitCmd::new(path, std::env::var("PATH").unwrap())
+    }
+
+    /// An edit made after every other check must still stop the `--force`.
+    #[test]
+    fn the_last_status_before_a_forced_removal_stops_it() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = partly_deleted(&fx, &r, "half");
+        let armed = fx.dir.path().join("armed");
+        let used = InUse::from_cwds(vec![]);
+        let t = GitWorktrees::new(
+            git_editing_before_last_status(fx.dir.path(), &armed, &wt.join("README")),
+            14,
+            Duration::from_secs(30 * 60),
+            Arc::new(move || Ok(used.clone())),
+        );
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["half"]);
+        std::fs::write(&armed, "").unwrap();
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(report.failed[0].1, "no longer only has deleted files");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("README")).unwrap(),
+            "edited\n"
+        );
+    }
+
+    /// A worktree found clean must never earn `--force` from a later deletion.
+    #[test]
+    fn a_clean_candidate_that_loses_a_file_is_refused() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        commit(&r, "other");
+        let wt = worktree(&r, "clean");
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["clean"]);
+        std::fs::remove_file(wt.join("other")).unwrap();
+        let report = t.run(&ctx, &found);
+        assert_eq!(report.failed[0].1, "now has uncommitted changes");
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn a_partly_deleted_worktree_that_lost_its_git_file_is_refused() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = partly_deleted(&fx, &r, "half");
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["half"]);
+        std::fs::remove_file(wt.join(".git")).unwrap();
+        let report = t.run(&ctx, &found);
+        assert_eq!(report.failed[0].1, "no longer has its .git file");
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn reads_only_deleted_files_as_deletions_only() {
+        assert!(deletions_only(" D a\n D \"b c\"\n"));
+        for other in [
+            "",
+            "\n",
+            " D a\n M b\n",
+            " D a\n?? b\n",
+            "D  a\n",
+            "DD a\n",
+            "AD a\n",
+            " Da\n",
+            "## main\n D a\n",
+            " D a\n\n",
+        ] {
+            assert!(!deletions_only(other), "{other:?}");
+        }
     }
 
     #[test]
