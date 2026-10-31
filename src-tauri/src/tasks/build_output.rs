@@ -24,9 +24,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use super::git::GitCmd;
+use super::git::{GitCmd, output_git_dirs};
+use super::git_worktrees::written_since;
 use super::stale_dirs::{find_pairs, idle_days, is_file};
-use super::{Candidate, CleanupTask, Ctx, Estimate, Report, check_target, remove_dirs};
+use super::{Candidate, CleanupTask, Ctx, Estimate, Report, Stop, check_target, remove_dirs};
 
 /// How deep to search under each root for projects.
 const SEARCH_DEPTH: usize = 8;
@@ -96,7 +97,7 @@ impl BuildOutput {
     }
 
     /// What vouches for `project/name`, or why it must be kept. Only reads.
-    fn judge(&self, project: &Path, name: &str) -> Result<Voucher, String> {
+    fn judge(&self, project: &Path, name: &str, stop: Stop) -> Result<Voucher, String> {
         let voucher = match self.git.in_repo(project) {
             Ok(true) => self.git_vouches(project, name)?,
             Ok(false) => tool_file_vouches(project, name)?,
@@ -104,7 +105,7 @@ impl BuildOutput {
         };
         match self
             .git
-            .output_checkout_problem(project, &project.join(name))
+            .output_checkout_problem(project, &project.join(name), stop)
         {
             Ok(None) => Ok(voucher),
             Ok(Some((repo, why))) => Err(format!("holds a git repo at {}: {why}", repo.display())),
@@ -144,14 +145,27 @@ impl BuildOutput {
 
     /// Judges candidate `c` again. A clone in it can have gained work since
     /// the scan.
-    fn judge_again(&self, c: &Candidate) -> Result<Voucher, String> {
+    fn judge_again(&self, c: &Candidate, stop: Stop) -> Result<Voucher, String> {
         let (Some(project), Some(name)) = (c.path.parent(), c.path.file_name()) else {
             return Err("has no parent folder".to_string());
         };
         let Some(name) = name.to_str() else {
             return Err("has a name that is not UTF-8".to_string());
         };
-        self.judge(project, name)
+        self.judge(project, name, stop)
+    }
+}
+
+/// True if a clone in candidate `c` changed after the run started, or if that
+/// cannot be told. A commit writes only to `.git`, and the check just before
+/// this one can have passed a moment too soon to see it.
+fn clone_written_during_run(c: &Candidate, ctx: &Ctx) -> bool {
+    match output_git_dirs(&c.path) {
+        Ok(dirs) => dirs.iter().any(|dir| written_since(dir, ctx.now, false)),
+        Err(e) => {
+            log::warn!("{}: {e:#}", c.path.display());
+            true
+        }
     }
 }
 
@@ -190,7 +204,7 @@ impl CleanupTask for BuildOutput {
             let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            match self.judge(&project, name) {
+            match self.judge(&project, name, ctx.stop) {
                 Ok(voucher) => found.push((target, voucher.reason(idle))),
                 Err(why) => log::debug!("build_output: keeping {}: {why}", target.display()),
             }
@@ -219,7 +233,14 @@ impl CleanupTask for BuildOutput {
                 report.halted = Some("the volume is no longer mounted".to_string());
                 break;
             }
-            if let Err(why) = self.judge_again(c) {
+            let why = match self.judge_again(c, ctx.stop) {
+                Err(why) => Some(why),
+                Ok(_) if clone_written_during_run(c, ctx) => {
+                    Some("a repo in it changed since the run started".to_string())
+                }
+                Ok(_) => None,
+            };
+            if let Some(why) = why {
                 log::warn!("not removing {}: {why}", c.path.display());
                 report.failed.push((c.path.clone(), why));
                 continue;
@@ -239,7 +260,8 @@ impl CleanupTask for BuildOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::Fixture;
+    use super::super::NEVER_STOP;
+    use super::super::test_support::{Fixture, git_with_hook};
     use super::*;
     use std::process::Command;
 
@@ -267,6 +289,10 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        GitCmd::default().output(dir, args).unwrap()
     }
 
     fn task() -> BuildOutput {
@@ -428,6 +454,10 @@ mod tests {
         git(dir, &["init", "-q"]);
         git(dir, &["add", "."]);
         git(dir, &["commit", "-q", "-m", "release"]);
+        git(
+            dir,
+            &["remote", "add", "origin", "https://example.invalid/a"],
+        );
         git(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
     }
 
@@ -556,6 +586,140 @@ mod tests {
         }));
     }
 
+    /// `update-ref` can make a ref under `refs/remotes/` by hand. Only the
+    /// fetch refspec of a configured remote makes one count.
+    #[test]
+    fn a_remote_ref_made_by_hand_does_not_count() {
+        assert!(!offered_after(|_, lib| {
+            git(lib, &["remote", "remove", "origin"]);
+            git(lib, &["update-ref", "refs/remotes/x/y", "HEAD"]);
+        }));
+        assert!(!offered_after(|_, lib| {
+            git(lib, &["update-ref", "-d", "refs/remotes/origin/main"]);
+            git(lib, &["update-ref", "refs/remotes/x/y", "HEAD"]);
+        }));
+    }
+
+    #[test]
+    fn a_remote_on_a_local_path_does_not_count() {
+        for url in [".", "/srv/git/a.git", "../a.git", "file:///srv/git/a.git"] {
+            assert!(
+                !offered_after(|_, lib| {
+                    git(lib, &["remote", "set-url", "origin", url]);
+                }),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clone_with_a_linked_worktree_is_kept() {
+        assert!(!offered_after(|fx, lib| {
+            let wt = fx.dir.path().join("linked");
+            git(
+                lib,
+                &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+            );
+        }));
+    }
+
+    #[test]
+    fn a_clone_whose_worktrees_folder_cannot_be_read_is_kept() {
+        assert!(!offered_after(|_, lib| {
+            std::fs::write(lib.join(".git/worktrees"), "").unwrap();
+        }));
+    }
+
+    #[test]
+    fn a_clone_with_a_paused_operation_is_kept() {
+        assert!(!offered_after(|_, lib| {
+            let head = git_stdout(lib, &["rev-parse", "HEAD"]);
+            std::fs::write(lib.join(".git/MERGE_HEAD"), head).unwrap();
+        }));
+    }
+
+    #[test]
+    fn a_clone_with_a_hidden_edit_is_kept() {
+        for flag in ["--skip-worktree", "--assume-unchanged"] {
+            assert!(
+                !offered_after(|fx, lib| {
+                    git(lib, &["update-index", flag, "src/A.php"]);
+                    fx.file("p/vendor/acme/lib/src/A.php", 2);
+                }),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_folder_holding_a_repo_git_cannot_judge_is_kept() {
+        for make in [".hg", ".svn"] {
+            let fx = Fixture::new(&[]);
+            repo(&fx, "p");
+            fx.file(&format!("p/dist/acme/{make}/store"), 1);
+            fx.age("p", 60);
+            assert!(task().scan(&fx.ctx()).unwrap().is_empty(), "{make}");
+        }
+    }
+
+    #[test]
+    fn a_bare_repo_inside_output_is_kept() {
+        let fx = Fixture::new(&[]);
+        repo(&fx, "p");
+        fx.file("p/dist/a.js", 1);
+        std::fs::create_dir_all(fx.root.join("p/dist/mirror")).unwrap();
+        git(&fx.root.join("p/dist/mirror"), &["init", "-q", "--bare"]);
+        fx.age("p", 60);
+        assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn output_that_is_itself_a_bare_repo_is_kept() {
+        let fx = Fixture::new(&[]);
+        repo(&fx, "p");
+        std::fs::create_dir_all(fx.root.join("p/dist")).unwrap();
+        git(&fx.root.join("p/dist"), &["init", "-q", "--bare"]);
+        fx.age("p", 60);
+        assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    /// `rev-list` is the last thing asked of the clone, so this write lands
+    /// after every check of it has passed.
+    #[test]
+    fn a_commit_in_a_clone_after_its_check_is_refused() {
+        let fx = Fixture::new(&[]);
+        let dir = vendored(&fx, "p");
+        fx.age("p", 60);
+        let armed = fx.dir.path().join("armed");
+        let lib = dir.join("vendor/acme/lib");
+        let write = format!("echo commit > '{}/.git/new-ref'", lib.display());
+        let t = BuildOutput::new(
+            git_with_hook(fx.dir.path(), "rev-list", 1, &armed, &write),
+            vec!["vendor".into()],
+            30,
+        );
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(found.len(), 1);
+        std::fs::write(&armed, "").unwrap();
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(
+            report.failed[0].1,
+            "a repo in it changed since the run started"
+        );
+        assert!(lib.exists());
+    }
+
+    #[test]
+    fn a_stopped_scan_judges_no_more_clones() {
+        let fx = Fixture::new(&[]);
+        let dir = vendored(&fx, "p");
+        let stopped: Stop = &|| true;
+        let why = task().judge(&dir, "vendor", stopped).unwrap_err();
+        assert!(why.contains("stopped"), "{why}");
+    }
+
     #[test]
     fn a_clone_with_no_remote_branch_is_kept() {
         assert!(!offered_after(|_, lib| {
@@ -637,7 +801,7 @@ mod tests {
         std::fs::write(dir.join(".gitignore"), "vendor/\n").unwrap();
         fx.file("p/vendor/acme/lib/src/A.php", 1);
         git(&dir.join("vendor/acme/lib"), &["init", "-q"]);
-        let why = task().judge(&dir, "vendor").unwrap_err();
+        let why = task().judge(&dir, "vendor", NEVER_STOP).unwrap_err();
         assert!(why.ends_with("has uncommitted changes"), "{why}");
     }
 

@@ -602,6 +602,36 @@ pub(crate) mod test_support {
     use super::*;
     use std::fs;
 
+    /// Real git, except that once the file `armed` exists, the `nth` command
+    /// with the word `word` first runs `shell`. It lets a test change things
+    /// at an exact point between the checks of a removal.
+    pub fn git_with_hook(
+        dir: &Path,
+        word: &str,
+        nth: u32,
+        armed: &Path,
+        shell: &str,
+    ) -> git::GitCmd {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("hooked-git");
+        let count = dir.join("hook-count");
+        let script = format!(
+            "#!/bin/sh\n\
+             case \" $* \" in *\" {word} \"*)\n\
+               if [ -f '{armed}' ]; then\n\
+                 n=$(($(cat '{count}' 2>/dev/null || echo 0) + 1)); echo $n > '{count}'\n\
+                 if [ $n = {nth} ]; then {shell}; fi\n\
+               fi;;\n\
+             esac\n\
+             exec git \"$@\"\n",
+            armed = armed.display(),
+            count = count.display(),
+        );
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        git::GitCmd::new(path, std::env::var("PATH").unwrap())
+    }
+
     /// A temporary root plus everything needed to build a `Ctx` over it.
     pub struct Fixture {
         pub dir: tempfile::TempDir,

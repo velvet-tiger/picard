@@ -1,11 +1,14 @@
 //! Runs `git` and parses the bits of its output Picard needs.
 
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use super::{NEVER_STOP, Stop};
 use crate::proc::{self, Output};
 
 /// Generous, because `git status` on a large repo with a cold cache is slow,
@@ -21,6 +24,13 @@ const WORKTREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Picard parses git listings to make safety decisions, so it must see all of
 /// them. Output past this size is treated as an error rather than trusted.
 const GIT_OUTPUT_CAP: usize = 256 * 1024 * 1024;
+
+/// What git prints, with `LC_ALL=C`, once it has searched every parent folder
+/// for a repo. The second is for a search that stopped at a mount point.
+const NO_REPO_FOUND: &[&str] = &[
+    "not a git repository (or any of the parent directories)",
+    "not a git repository (or any parent up to mount point",
+];
 
 /// `git status` for deciding whether removing a checkout loses work. Untracked
 /// files are listed explicitly, because `status.showUntrackedFiles=no` in repo
@@ -201,7 +211,9 @@ impl GitCmd {
     /// True if `dir` is in a git repo, false if git says plainly that it is
     /// not. Any other failure is an error, so the caller can keep a folder it
     /// cannot judge. Git prints a similar line for a broken `.git` file, so
-    /// only the wording for "searched every parent" counts, and a `.git` entry
+    /// only the wording for "searched every parent" counts. On an external
+    /// drive that search ends at the mount point, with wording of its own. A
+    /// `.git` entry
     /// in `dir` or any parent means something is there that git cannot read.
     pub fn in_repo(&self, dir: &Path) -> Result<bool> {
         let args = ["rev-parse", "--git-dir"];
@@ -213,10 +225,8 @@ impl GitCmd {
         if out.success() {
             return Ok(true);
         }
-        let searched = out.code == Some(128)
-            && out
-                .stderr
-                .contains("not a git repository (or any of the parent directories)");
+        let searched =
+            out.code == Some(128) && NO_REPO_FOUND.iter().any(|m| out.stderr.contains(m));
         let dot_git = dir
             .ancestors()
             .map(|a| a.join(".git"))
@@ -400,8 +410,11 @@ impl GitCmd {
         let has_stores = std::fs::symlink_metadata(&modules).is_ok();
         let index = self.output(dir, &["ls-files", "--stage", "-z"])?;
         let submodules: Vec<PathBuf> = index_gitlinks(&index).iter().map(|g| dir.join(g)).collect();
-        let others = find_checkouts(dir, &submodules, Search::Worktree)?;
-        if let Some((other, why)) = self.first_refused(dir, &others)? {
+        if let Some(why) = self.hidden_changes(dir)? {
+            return Ok(Some(why));
+        }
+        let others = find_checkouts(dir, &submodules, Search::Worktree, NEVER_STOP)?;
+        if let Some((other, why)) = self.first_refused(dir, &others.git, NEVER_STOP)? {
             log::debug!("nested checkout {}: {why}", other.display());
             return Ok(Some(format!(
                 "holds another git checkout at {}",
@@ -430,13 +443,29 @@ impl GitCmd {
         Ok(None)
     }
 
+    /// Why `git status` cannot be trusted in `dir`, if it cannot. It does not
+    /// look at a file marked skip-worktree or assume-unchanged, so an edit
+    /// there stays hidden, and removal would delete it. `ls-files -v` tags any
+    /// such file with something other than `H`. A sparse checkout is refused
+    /// too, because its skipped files carry the same mark.
+    pub fn hidden_changes(&self, dir: &Path) -> Result<Option<String>> {
+        let raw = self.output(dir, &["ls-files", "-v", "-z"])?;
+        Ok(unverified_entry(&raw)
+            .map(|path| format!("git status does not check {path}, so it could hide an edit")))
+    }
+
     /// The first of `checkouts` inside `outer` that must be kept, with why.
+    /// A stopped scan gets an error, so it keeps the folder and asks no more.
     fn first_refused(
         &self,
         outer: &Path,
         checkouts: &[PathBuf],
+        stop: Stop,
     ) -> Result<Option<(PathBuf, String)>> {
         for checkout in checkouts {
+            if stop() {
+                bail!("stopped while checking {}", outer.display());
+            }
             if let Some(why) = self.nested_checkout_problem(outer, checkout)? {
                 return Ok(Some((checkout.clone(), why)));
             }
@@ -444,15 +473,30 @@ impl GitCmd {
         Ok(None)
     }
 
-    /// The first git checkout inside build output folder `output` of `project`
-    /// that must be kept, with why. A folder that cannot be read is an error,
-    /// so the output is kept.
+    /// The first repo inside build output folder `output` of `project` that
+    /// must be kept, with why. A folder that cannot be read is an error, so
+    /// the output is kept.
     pub fn output_checkout_problem(
         &self,
         project: &Path,
         output: &Path,
+        stop: Stop,
     ) -> Result<Option<(PathBuf, String)>> {
-        self.first_refused(project, &find_checkouts(output, &[], Search::Output)?)
+        let found = find_checkouts(output, &[], Search::Output, stop)?;
+        if let Some(other) = found.other {
+            return Ok(Some(other));
+        }
+        self.first_refused(project, &found.git, stop)
+    }
+
+    /// The `.git` folders of the checkouts in worktree `dir`, other than
+    /// submodules. `written_since` skips `.git`, so a commit in one of these
+    /// shows only here.
+    pub fn nested_git_dirs(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+        let index = self.output(dir, &["ls-files", "--stage", "-z"])?;
+        let submodules: Vec<PathBuf> = index_gitlinks(&index).iter().map(|g| dir.join(g)).collect();
+        let found = find_checkouts(dir, &submodules, Search::Worktree, NEVER_STOP)?;
+        Ok(found.git.iter().map(|c| c.join(".git")).collect())
     }
 
     /// Why deleting the git checkout at `checkout`, inside `outer`, could lose
@@ -466,9 +510,11 @@ impl GitCmd {
     /// - `outer` ignores it, so `outer` never meant to keep it
     /// - git run there really reads this `.git` folder and this folder
     /// - it has no `info/grafts`, which can make history look pushed
+    /// - it has no linked worktrees, whose repository is this one
+    /// - no operation is paused in it, whose state removal would delete
     /// - no repo filters, no submodules and nothing uncommitted
-    ///   (`contents_problem`), and no commit missing from its remote branches
-    ///   (`store_problem`)
+    ///   (`contents_problem`), and no commit missing from what it fetched from
+    ///   a real remote (`clone_store_problem`)
     ///
     /// Ignored files inside it are not checked, as for a worktree. A git error
     /// is returned, so the caller keeps the folder.
@@ -499,10 +545,16 @@ impl GitCmd {
                 "has info/grafts, which can make history look pushed".to_string(),
             ));
         }
+        if has_entries(&git_dir.join("worktrees"))? {
+            return Ok(Some("has linked worktrees of its own".to_string()));
+        }
+        if let Some(op) = self.operation_in_progress(checkout)? {
+            return Ok(Some(format!("has {op} in progress")));
+        }
         if let Some(why) = self.contents_problem(checkout)? {
             return Ok(Some(why));
         }
-        self.store_problem(&git_dir)
+        self.clone_store_problem(&git_dir)
     }
 
     /// True if git run in `folder` works on `folder`, with `git_dir` as both
@@ -592,7 +644,8 @@ impl GitCmd {
     }
 
     /// Why git cannot vouch for the files in checkout `folder`, if it cannot:
-    /// repo filters, submodules of its own, or anything uncommitted. Call it
+    /// repo filters, submodules of its own, files `status` does not check, or
+    /// anything uncommitted. Call it
     /// only once `folder` is known to be the checkout git will read, because
     /// `status` otherwise reports on another folder.
     fn contents_problem(&self, folder: &Path) -> Result<Option<String>> {
@@ -607,6 +660,9 @@ impl GitCmd {
         if !index_gitlinks(&index).is_empty() {
             return Ok(Some("has submodules of its own".to_string()));
         }
+        if let Some(why) = self.hidden_changes(folder)? {
+            return Ok(Some(why));
+        }
         let status = self.output(folder, SAFETY_STATUS)?;
         if !status.trim().is_empty() {
             return Ok(Some("has uncommitted changes".to_string()));
@@ -616,10 +672,17 @@ impl GitCmd {
 
     /// Why deleting the submodule repository at `store` would lose work, if it
     /// would. Every commit reachable from its HEAD, branches, tags, stash and
-    /// reflogs must also be on one of its remote-tracking branches. The reflog
-    /// counts because `submodule update` moves HEAD off work done on a
+    /// reflogs must also be reachable from a ref under `refs/remotes/`. The
+    /// reflog counts because `submodule update` moves HEAD off work done on a
     /// detached HEAD, and the reflog is then the only way back to it. A repo
-    /// with no remote therefore always fails. Nothing is fetched.
+    /// with no such ref fails unless it has no commits.
+    ///
+    /// Nothing is fetched, so this shows what the last fetch saw. A branch
+    /// deleted or force-pushed on the remote since then still counts, and no
+    /// offline check can tell. Any ref there counts, even one made by hand.
+    /// `clone_store_problem` is stricter, for repos that nothing else vouches
+    /// for. A submodule's commit is named by its parent repo, and its remote
+    /// can be a local path, so this keeps accepting those.
     fn store_problem(&self, store: &Path) -> Result<Option<String>> {
         if std::fs::symlink_metadata(store.join("modules")).is_ok() {
             return Ok(Some("has submodules of its own".to_string()));
@@ -642,6 +705,144 @@ impl GitCmd {
                 "has {n} commit(s) that are on no remote branch"
             ))),
         }
+    }
+
+    /// Why deleting the nested clone's repository at `git_dir` would lose
+    /// work, if it would. It works like `store_problem`, but a ref counts only
+    /// when the fetch refspec of a configured remote writes it, and that
+    /// remote's URLs are all on the network. A local path can vanish with
+    /// the folder, and `git update-ref` can make any ref by hand. The limit
+    /// described at `store_problem` still applies: nothing here is fetched.
+    fn clone_store_problem(&self, git_dir: &Path) -> Result<Option<String>> {
+        if std::fs::symlink_metadata(git_dir.join("modules")).is_ok() {
+            return Ok(Some("has submodules of its own".to_string()));
+        }
+        let config = self.output(
+            git_dir,
+            &["--git-dir=.", "config", "--local", "--list", "-z"],
+        )?;
+        let patterns = fetched_ref_patterns(&config);
+        let refs = self.output(
+            git_dir,
+            &[
+                "--git-dir=.",
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/remotes/",
+            ],
+        )?;
+        let exclusions: String = refs
+            .lines()
+            .filter(|r| patterns.iter().any(|p| ref_matches(p, r)))
+            .map(|r| format!("^{r}\n"))
+            .collect();
+        let unique = self.output_with_input(
+            git_dir,
+            &[
+                "--git-dir=.",
+                "rev-list",
+                "--count",
+                "--all",
+                "--reflog",
+                "--stdin",
+            ],
+            exclusions,
+        )?;
+        match unique.trim() {
+            "0" => Ok(None),
+            n => Ok(Some(format!(
+                "has {n} commit(s) that no fetch from a network remote brought in"
+            ))),
+        }
+    }
+}
+
+/// True if `dir` holds anything. A missing folder holds nothing. Anything
+/// unreadable is an error, so the caller keeps what it was judging.
+fn has_entries(dir: &Path) -> Result<bool> {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => Ok(entries.next().is_some()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("reading {}", dir.display())),
+    }
+}
+
+/// The path of the first entry in `git ls-files -v -z` output whose tag is not
+/// `H`, which is a cached file that `status` checks. Lowercase means
+/// assume-unchanged and `S` means skip-worktree. A line this cannot read
+/// counts too, so it can only refuse.
+fn unverified_entry(raw: &str) -> Option<&str> {
+    raw.split('\0')
+        .filter(|entry| !entry.is_empty())
+        .find_map(|entry| match entry.split_once(' ') {
+            Some(("H", _)) => None,
+            Some((_, path)) => Some(path),
+            None => Some(entry),
+        })
+}
+
+/// True if `url` reaches another machine. Local paths, `file:` URLs and
+/// transport helpers such as `ext::` do not count, nor does any scheme not
+/// listed. An scp-style `host:path` counts.
+fn is_network_url(url: &str) -> bool {
+    const SCHEMES: &[&str] = &["https", "http", "ssh", "git", "git+ssh", "ssh+git"];
+    if let Some((scheme, _)) = url.split_once("://") {
+        return SCHEMES.iter().any(|s| s.eq_ignore_ascii_case(scheme));
+    }
+    match url.split_once(':') {
+        Some((host, path)) => {
+            !host.is_empty()
+                && !host.contains('/')
+                && !host.eq_ignore_ascii_case("file")
+                && !path.is_empty()
+                && !path.starts_with(':')
+        }
+        None => false,
+    }
+}
+
+/// The destinations under `refs/remotes/` of the fetch refspecs of remotes
+/// whose URLs are all on the network, from `git config --list -z` output.
+/// Each record is `key NEWLINE value NUL`. `url.*.insteadOf` can rewrite a
+/// network URL to a local path, so a config with one trusts nothing.
+fn fetched_ref_patterns(raw: &str) -> Vec<&str> {
+    let mut urls: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut fetches: Vec<(&str, &str)> = Vec::new();
+    for record in raw.split('\0') {
+        let (key, value) = record.split_once('\n').unwrap_or((record, ""));
+        if key.starts_with("url.") {
+            return Vec::new();
+        }
+        let Some(rest) = key.strip_prefix("remote.") else {
+            continue;
+        };
+        if let Some(name) = rest.strip_suffix(".url") {
+            urls.entry(name).or_default().push(value);
+        } else if let Some(name) = rest.strip_suffix(".fetch") {
+            fetches.push((name, value));
+        }
+    }
+    fetches
+        .into_iter()
+        .filter(|(name, _)| {
+            urls.get(name)
+                .is_some_and(|list| list.iter().all(|u| is_network_url(u)))
+        })
+        .filter_map(|(_, spec)| {
+            let spec = spec.strip_prefix('+').unwrap_or(spec);
+            let (source, dest) = spec.split_once(':')?;
+            (!source.starts_with('^') && dest.starts_with("refs/remotes/")).then_some(dest)
+        })
+        .collect()
+}
+
+/// True if ref `name` matches refspec side `pattern`, which holds at most one `*`.
+fn ref_matches(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((start, end)) => {
+            name.len() >= start.len() + end.len() && name.starts_with(start) && name.ends_with(end)
+        }
+        None => pattern == name,
     }
 }
 
@@ -674,18 +875,54 @@ fn in_package_folder(path: &Path) -> bool {
         || above.windows(2).any(|w| w == [".terraform", "modules"])
 }
 
+/// What `find_checkouts` found.
+#[derive(Debug, Default)]
+struct Checkouts {
+    /// Folders holding a `.git`.
+    git: Vec<PathBuf>,
+    /// The first repo that no check here can judge, with why it must be kept.
+    /// Only `Search::Output` looks for these.
+    other: Option<(PathBuf, String)>,
+}
+
+/// Why folder `dir` is a repo Picard cannot judge, if it is. A bare repo holds
+/// its commits with no `.git`, and Mercurial and Subversion keep theirs in
+/// folders of their own.
+fn unjudged_repo(dir: &Path, name: &OsStr) -> Option<String> {
+    if name == ".hg" || name == ".svn" {
+        return Some(format!("holds a {} folder", name.to_string_lossy()));
+    }
+    is_git_store(dir).then(|| "is a bare git repository".to_string())
+}
+
 /// Every git checkout inside `dir` other than its submodule checkouts, which
 /// `unsafe_to_inspect` verifies. Claude Code puts worktrees in
 /// `.claude/worktrees/`, which git ignores, so `status` never lists their
 /// untracked files, yet removing `dir` deletes them. No depth limit. An
-/// unreadable folder is an error, so `dir` is kept.
-fn find_checkouts(dir: &Path, submodules: &[PathBuf], search: Search) -> Result<Vec<PathBuf>> {
+/// unreadable folder is an error, so `dir` is kept, and so is a stopped scan.
+fn find_checkouts(
+    dir: &Path,
+    submodules: &[PathBuf],
+    search: Search,
+    stop: Stop,
+) -> Result<Checkouts> {
     let mut found = Vec::new();
+    if search == Search::Output
+        && let Some(why) = unjudged_repo(dir, OsStr::new(""))
+    {
+        return Ok(Checkouts {
+            git: found,
+            other: Some((dir.to_path_buf(), why)),
+        });
+    }
     let mut walk = walkdir::WalkDir::new(dir)
         .follow_links(false)
         .min_depth(1)
         .into_iter();
     while let Some(entry) = walk.next() {
+        if stop() {
+            bail!("stopped while looking for checkouts in {}", dir.display());
+        }
         let e = entry.with_context(|| format!("looking for checkouts in {}", dir.display()))?;
         let name = e.file_name();
         if name == ".git" {
@@ -702,6 +939,15 @@ fn find_checkouts(dir: &Path, submodules: &[PathBuf], search: Search) -> Result<
             }
             continue;
         }
+        if search == Search::Output
+            && e.file_type().is_dir()
+            && let Some(why) = unjudged_repo(e.path(), name)
+        {
+            return Ok(Checkouts {
+                git: found,
+                other: Some((e.path().to_path_buf(), why)),
+            });
+        }
         if search == Search::Worktree
             && e.file_type().is_dir()
             && name.to_str().is_some_and(|n| NOT_SEARCHED.contains(&n))
@@ -714,7 +960,16 @@ fn find_checkouts(dir: &Path, submodules: &[PathBuf], search: Search) -> Result<
             walk.skip_current_dir();
         }
     }
-    Ok(found)
+    Ok(Checkouts {
+        git: found,
+        other: None,
+    })
+}
+
+/// The `.git` folders of the checkouts inside build output folder `output`.
+pub fn output_git_dirs(output: &Path) -> Result<Vec<PathBuf>> {
+    let found = find_checkouts(output, &[], Search::Output, NEVER_STOP)?;
+    Ok(found.git.iter().map(|c| c.join(".git")).collect())
 }
 
 /// The submodule repositories under `modules`. A submodule's name can contain
@@ -758,7 +1013,7 @@ pub fn submodule_stores(modules: &Path) -> Result<Vec<PathBuf>> {
     Ok(stores)
 }
 
-fn is_git_store(dir: &Path) -> bool {
+pub(super) fn is_git_store(dir: &Path) -> bool {
     std::fs::symlink_metadata(dir.join("HEAD")).is_ok_and(|m| m.is_file())
         && std::fs::symlink_metadata(dir.join("objects")).is_ok_and(|m| m.is_dir())
 }
@@ -1061,6 +1316,35 @@ mod tests {
         assert!(git.in_repo(Path::new("/no/such/folder")).is_err());
     }
 
+    /// A stand-in for git that always fails with `stderr`.
+    fn git_failing_with(dir: &Path, stderr: &str) -> GitCmd {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-git");
+        let script = format!("#!/bin/sh\ncat >&2 <<'E'\n{stderr}\nE\nexit 128\n");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        GitCmd::new(path, std::env::var("PATH").unwrap())
+    }
+
+    /// What git prints on an external drive, where the search ends at the
+    /// mount point. Proven build output there must not be kept for ever.
+    #[test]
+    fn in_repo_reads_the_search_that_stopped_at_a_mount_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = git_failing_with(
+            dir.path(),
+            "fatal: not a git repository (or any parent up to mount point /Volumes)\n\
+             Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).",
+        );
+        assert!(!git.in_repo(dir.path()).unwrap());
+
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert!(
+            git.in_repo(dir.path()).is_err(),
+            "a .git above still counts"
+        );
+    }
+
     #[test]
     fn in_repo_treats_another_git_failure_as_an_error() {
         use std::os::unix::fs::PermissionsExt;
@@ -1074,6 +1358,112 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let git = GitCmd::new(path, std::env::var("PATH").unwrap());
         assert!(git.in_repo(dir.path()).is_err());
+    }
+
+    #[test]
+    fn only_a_network_url_counts_as_a_remote() {
+        for yes in [
+            "https://github.com/a/b.git",
+            "HTTPS://github.com/a/b.git",
+            "ssh://git@github.com/a/b",
+            "git://example.com/a",
+            "git@github.com:a/b.git",
+            "github.com:a/b.git",
+        ] {
+            assert!(is_network_url(yes), "{yes}");
+        }
+        for no in [
+            "",
+            ".",
+            "..",
+            "/srv/git/a.git",
+            "../a",
+            "./a",
+            "a/b",
+            "a/b:c",
+            "file:///srv/a",
+            "FILE:///srv/a",
+            "file:/srv/a",
+            "ext::sh -c x",
+            "fd::3",
+            "ftp://example.com/a",
+        ] {
+            assert!(!is_network_url(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn only_fetch_refspecs_of_network_remotes_are_trusted() {
+        let config = "core.bare\nfalse\0\
+            remote.origin.url\nhttps://example.com/a\0\
+            remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0\
+            remote.up.url\ngit@example.com:a\0\
+            remote.up.fetch\nrefs/heads/main:refs/remotes/up/main\0\
+            remote.up.fetch\n^refs/heads/x:refs/remotes/up/x\0\
+            remote.up.fetch\nrefs/tags/*:refs/tags/*\0\
+            remote.disk.url\n/srv/a\0\
+            remote.disk.fetch\n+refs/heads/*:refs/remotes/disk/*\0\
+            remote.both.url\nhttps://example.com/a\0\
+            remote.both.url\n/srv/a\0\
+            remote.both.fetch\n+refs/heads/*:refs/remotes/both/*\0\
+            remote.nourl.fetch\n+refs/heads/*:refs/remotes/nourl/*\0";
+        assert_eq!(
+            fetched_ref_patterns(config),
+            vec!["refs/remotes/origin/*", "refs/remotes/up/main"]
+        );
+        let rewritten = format!("{config}url./srv/.insteadof\nhttps://example.com/\0");
+        assert!(fetched_ref_patterns(&rewritten).is_empty());
+    }
+
+    #[test]
+    fn matches_a_ref_against_a_refspec_side() {
+        let p = "refs/remotes/origin/*";
+        assert!(ref_matches(p, "refs/remotes/origin/main"));
+        assert!(ref_matches(p, "refs/remotes/origin/a/b"));
+        assert!(!ref_matches(p, "refs/remotes/originals/main"));
+        assert!(ref_matches("refs/remotes/o/main", "refs/remotes/o/main"));
+        assert!(!ref_matches("refs/remotes/o/main", "refs/remotes/o/mai"));
+        assert!(!ref_matches("refs/remotes/a*a", "refs/remotes/a"));
+    }
+
+    #[test]
+    fn only_tag_h_counts_as_a_file_status_checks() {
+        assert_eq!(unverified_entry(""), None);
+        assert_eq!(unverified_entry("H a\0H b c\0"), None);
+        assert_eq!(unverified_entry("H a\0S b c\0"), Some("b c"));
+        assert_eq!(unverified_entry("h a\0"), Some("a"));
+        assert_eq!(unverified_entry("M a\0"), Some("a"));
+        assert_eq!(unverified_entry("odd\0"), Some("odd"));
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_read_as_a_folder_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_entries(&dir.path().join("missing")).unwrap());
+        assert!(!has_entries(dir.path()).unwrap());
+        let file = dir.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(has_entries(dir.path()).unwrap());
+        assert!(has_entries(&file).is_err());
+    }
+
+    #[test]
+    fn a_stopped_search_is_an_error_and_runs_no_git() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/.git")).unwrap();
+        let stopped: Stop = &|| true;
+        // This git fails with a message of its own, so an error naming the
+        // stop shows that git never ran.
+        let git = git_failing_with(dir.path(), "fatal: git ran");
+        let output = dir.path().join("a");
+        let err = git
+            .output_checkout_problem(dir.path(), dir.path(), stopped)
+            .unwrap_err();
+        assert!(err.to_string().contains("stopped"), "{err:#}");
+        let err = git
+            .first_refused(dir.path(), &[output], stopped)
+            .unwrap_err();
+        assert!(err.to_string().contains("stopped"), "{err:#}");
     }
 
     #[test]

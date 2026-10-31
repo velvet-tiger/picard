@@ -1081,13 +1081,17 @@ impl GitWorktrees {
     /// skips git's own. A file written since the run started, even an ignored
     /// one that status does not list, means someone is working here. A commit
     /// in a submodule writes only to its repository, so those are walked too
-    /// when `force` is about to delete them.
-    fn written_during_run(&self, c: &Candidate, ctx: &Ctx, force: bool) -> Result<bool, String> {
+    /// when `stores` says removal will delete them. A commit in a nested clone
+    /// writes only to its `.git`, which the walk of the worktree skips, so
+    /// each of those is walked as well.
+    fn written_during_run(&self, c: &Candidate, ctx: &Ctx, stores: bool) -> Result<bool, String> {
         let mut walked = vec![(c.path.clone(), true)];
-        if force {
+        if stores {
             let modules = self.git.submodule_store_root(&c.path).map_err(err_text)?;
             walked.push((modules, false));
         }
+        let clones = self.git.nested_git_dirs(&c.path).map_err(err_text)?;
+        walked.extend(clones.into_iter().map(|dir| (dir, false)));
         Ok(walked
             .iter()
             .any(|(dir, skip_build)| written_since(dir, ctx.now, *skip_build)))
@@ -1125,7 +1129,11 @@ impl GitWorktrees {
         if !deletions_only(&status) {
             return Err("no longer only has deleted files".to_string());
         }
-        Ok(())
+        // `--force` deletes anything `status` cannot see.
+        match self.git.hidden_changes(&c.path).map_err(err_text)? {
+            Some(why) => Err(why),
+            None => Ok(()),
+        }
     }
 
     fn remove_one(&self, ctx: &Ctx, in_use: &InUse, c: &Candidate) -> Result<(), String> {
@@ -1359,7 +1367,7 @@ fn is_submodule_repo(git_path: &Path) -> bool {
 /// this guards a removal: it has no depth limit and fails closed. With
 /// `skip_build`, regenerable build folders and `.git` are not walked, as in
 /// the scan. Finder's `.DS_Store` never counts as work.
-fn written_since(dir: &Path, since: SystemTime, skip_build: bool) -> bool {
+pub(super) fn written_since(dir: &Path, since: SystemTime, skip_build: bool) -> bool {
     WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
@@ -1583,7 +1591,7 @@ fn format_idle(idle: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::Fixture;
+    use super::super::test_support::{Fixture, git_with_hook};
     use super::*;
     use std::process::Command;
 
@@ -1885,30 +1893,6 @@ mod tests {
         }
     }
 
-    /// Real git, except that the second `status` after `armed` appears first
-    /// edits `file`. That is the last status before a forced removal.
-    fn git_editing_before_last_status(dir: &Path, armed: &Path, file: &Path) -> GitCmd {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("editing-git");
-        let count = dir.join("status-count");
-        let script = format!(
-            "#!/bin/sh\n\
-             case \" $* \" in *\" status \"*)\n\
-               if [ -f '{armed}' ]; then\n\
-                 n=$(($(cat '{count}' 2>/dev/null || echo 0) + 1)); echo $n > '{count}'\n\
-                 [ $n = 2 ] && echo edited > '{file}'\n\
-               fi;;\n\
-             esac\n\
-             exec git \"$@\"\n",
-            armed = armed.display(),
-            count = count.display(),
-            file = file.display(),
-        );
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        GitCmd::new(path, std::env::var("PATH").unwrap())
-    }
-
     /// An edit made after every other check must still stop the `--force`.
     #[test]
     fn the_last_status_before_a_forced_removal_stops_it() {
@@ -1916,9 +1900,10 @@ mod tests {
         let r = repo(&fx);
         let wt = partly_deleted(&fx, &r, "half");
         let armed = fx.dir.path().join("armed");
+        let edit = format!("echo edited > '{}'", wt.join("README").display());
         let used = InUse::from_cwds(vec![]);
         let t = GitWorktrees::new(
-            git_editing_before_last_status(fx.dir.path(), &armed, &wt.join("README")),
+            git_with_hook(fx.dir.path(), "status", 2, &armed, &edit),
             14,
             Duration::from_secs(30 * 60),
             Arc::new(move || Ok(used.clone())),
@@ -2064,6 +2049,118 @@ mod tests {
         assert_eq!(task(1, vec![]).notices(&fx.ctx()), vec![]);
     }
 
+    /// A repo at `lib` with one commit, as fetched from a network remote.
+    fn make_clone(lib: &Path) {
+        std::fs::create_dir_all(lib).unwrap();
+        git(lib, &["init", "-q"]);
+        commit(lib, "A.php");
+        git(
+            lib,
+            &["remote", "add", "origin", "https://example.invalid/a"],
+        );
+        git(lib, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    }
+
+    #[test]
+    fn a_worktree_with_a_hidden_edit_is_kept() {
+        for flag in ["--skip-worktree", "--assume-unchanged"] {
+            let fx = Fixture::new(&[]);
+            let r = repo(&fx);
+            let wt = worktree(&r, "hidden");
+            git(&wt, &["update-index", flag, "README"]);
+            std::fs::write(wt.join("README"), "edited").unwrap();
+            age(&fx, &wt, 1);
+            assert_eq!(
+                git(&wt, &["status", "--porcelain"]),
+                "",
+                "status must not see it, or this test proves nothing"
+            );
+            assert!(
+                task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty(),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hidden_edit_made_after_the_scan_is_refused() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "hidden");
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["hidden"]);
+        git(&wt, &["update-index", "--skip-worktree", "README"]);
+        let report = t.run(&ctx, &found);
+        assert!(
+            report.failed[0].1.contains("could hide an edit"),
+            "{report:?}"
+        );
+        assert!(wt.exists());
+    }
+
+    /// Hiding a file after every other check must still stop the `--force`.
+    #[test]
+    fn a_hidden_edit_stops_a_forced_removal_at_the_last_moment() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = partly_deleted(&fx, &r, "half");
+        let armed = fx.dir.path().join("armed");
+        let hide = format!(
+            "git -C '{}' update-index --skip-worktree README",
+            wt.display()
+        );
+        let used = InUse::from_cwds(vec![]);
+        let t = GitWorktrees::new(
+            git_with_hook(fx.dir.path(), "status", 2, &armed, &hide),
+            14,
+            Duration::from_secs(30 * 60),
+            Arc::new(move || Ok(used.clone())),
+        );
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["half"]);
+        std::fs::write(&armed, "").unwrap();
+        let report = t.run(&ctx, &found);
+        assert!(
+            report.failed[0].1.contains("could hide an edit"),
+            "{report:?}"
+        );
+        assert!(wt.exists());
+    }
+
+    /// `written_since` skips `.git`, so a commit in the clone after the last
+    /// check of it would otherwise go unseen. `worktree list` runs in the
+    /// re-judging, after `unsafe_to_inspect` has passed the clone.
+    #[test]
+    fn a_commit_in_a_vendor_clone_after_its_check_is_refused() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let (wt, lib) = vendored_worktree(&r);
+        age(&fx, &wt, 1);
+        let armed = fx.dir.path().join("armed");
+        let write = format!("echo commit > '{}/.git/new-ref'", lib.display());
+        let used = InUse::from_cwds(vec![]);
+        let t = GitWorktrees::new(
+            git_with_hook(fx.dir.path(), "worktree", 1, &armed, &write),
+            14,
+            Duration::from_secs(30 * 60),
+            Arc::new(move || Ok(used.clone())),
+        );
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["packages"]);
+        std::fs::write(&armed, "").unwrap();
+        let report = t.run(&ctx, &found);
+        assert_eq!(
+            report.failed[0].1, "changed since the run started",
+            "{report:?}"
+        );
+        assert!(wt.exists());
+    }
+
     /// A clone at `wt/vendor/acme/lib`, in a worktree that ignores `vendor/`,
     /// with its one commit on a remote branch.
     fn vendored_worktree(r: &Path) -> (PathBuf, PathBuf) {
@@ -2072,10 +2169,7 @@ mod tests {
         git(r, &["commit", "-qm", "ignore vendor"]);
         let wt = worktree(r, "packages");
         let lib = wt.join("vendor/acme/lib");
-        std::fs::create_dir_all(&lib).unwrap();
-        git(&lib, &["init", "-q"]);
-        commit(&lib, "A.php");
-        git(&lib, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        make_clone(&lib);
         (wt, lib)
     }
 
@@ -2131,10 +2225,7 @@ mod tests {
         git(&r, &["commit", "-qm", "ignore"]);
         let wt = worktree(&r, "outer");
         let lib = wt.join(".claude/worktrees/inner/vendor/lib");
-        std::fs::create_dir_all(&lib).unwrap();
-        git(&lib, &["init", "-q"]);
-        commit(&lib, "A.php");
-        git(&lib, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        make_clone(&lib);
         age(&fx, &wt, 1);
         assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
     }
