@@ -8,14 +8,15 @@ All notable changes to Picard are recorded here. The format follows
 
 ### Added
 
-- A broken worktree is a folder whose `.git` file names a worktree record that no longer exists. A failed removal leaves one. `picard scan` and the Clean window now list these under **Needs you**, with path and size. Picard never removes one, and they are not counted in any total. Submodules are not reported.
-- A partly deleted worktree is one whose status lists deleted tracked files and nothing else, as a `git worktree remove` that stopped part way leaves it. It is now removed with `--force`, but only after `stale_days`, never `min_idle_minutes`, and only if another branch or a remote holds its commits. Any other change in it keeps it. Its reason says "partly deleted". Deletions count as activity for this wait.
-- A clean clone in a package folder no longer keeps a worktree or a build output folder for ever. This covers a checkout below `vendor` or `.terraform/modules`, with a `.git` folder, that the repo around it ignores. It must have no repo filters, no submodules and no uncommitted changes, and every commit must be on one of its remote branches. Picard checks again just before removal. Any other checkout is still refused, and so is anything in `.claude/worktrees` inside the worktree or project.
-- Outside any git repo, `.next` with a `BUILD_ID` file and `vendor` with a `composer/installed.json` file are now cleaned from stale projects. Every other name stays kept there, including `dist` and `build`. A git failure does not count as "outside a repo".
+- A broken worktree is a folder whose `.git` file names a worktree record that no longer exists. A failed removal leaves one. `picard scan` and the Clean window now list these under **Needs you**, with path and size. Picard never removes one, and they are not counted in any total. Submodules are not reported, and neither is a record on a drive that is not mounted. `picard scan` escapes control characters in these paths.
+- A partly deleted worktree is one whose status lists deleted tracked files and nothing else, as a `git worktree remove` that stopped part way leaves it. It is now removed with `--force`, but only after `stale_days`, never `min_idle_minutes`, and only if another branch or a remote holds its commits. Any other change in it keeps it. Its reason says "partly deleted". Deletions count as activity for this wait, and Picard judges the wait and the submodule repositories again just before removal. If the root `.gitignore` is among the deleted files, ignored folders look like new work, so the worktree is listed under **Needs you** and never removed.
+- A clean clone in a package folder no longer keeps a worktree or a build output folder for ever. This covers a checkout below `vendor` or `.terraform/modules`, with a `.git` folder, that the repo around it ignores. It must have no repo filters, no submodules, no linked worktrees, no paused operation and no uncommitted changes. Every commit must have been fetched from a configured network remote. A local path, a `file:` URL or a ref made by hand does not count. Picard cannot see what changed on the remote since the last fetch. It checks again just before removal, and keeps the folder if the clone's `.git` was written to after the run started. Any other checkout is still refused, and so is anything in `.claude/worktrees` inside the worktree or project.
+- Outside any git repo, `.next` with a `BUILD_ID` file and `vendor` with a `composer/installed.json` file are now cleaned from stale projects. This includes external drives. Every other name stays kept there, including `dist` and `build`. A git failure does not count as "outside a repo".
 
 ### Changed
 
-- `.terraform` and `storybook-static` are now on the default `dirs` list of `build_output`. A `dirs` list in your config replaces the defaults, so add them there to use them.
+- `.terraform` and `storybook-static` are now on the default `dirs` list of `build_output`. A `dirs` list in your config replaces the defaults, so add them there to use them. After `.terraform` is removed, `terraform init` must run again, possibly with `-backend-config` flags, and the selected workspace may be lost.
+- A worktree, submodule checkout or nested clone with a file marked skip-worktree or assume-unchanged is now kept, because `git status` does not check those files. This includes sparse checkouts.
 - `.idea` and `.phpstorm.meta.php` are now on the default list of changes that do not count as work. A custom `activity_ignore` list is not changed.
 - The log starts a new file at 5 MB and keeps three old ones. It used to start again at 40 kB, which lost the history a bug report needs. Each `build_output` scan logs one summary line, and the line for each folder moved to debug level.
 
@@ -24,6 +25,7 @@ All notable changes to Picard are recorded here. The format follows
 - `git worktree remove` now has 30 minutes instead of 60 seconds. A large worktree could reach the old limit, and stopping it part way left the worktree half deleted.
 - `build_output` now judges each folder again just before removing it. It used to act on the scan's answer alone.
 - `build_output` used to skip a folder it could not read while looking for nested repos, so a repo inside it went unseen. It now keeps the output folder.
+- `build_output` now keeps a folder that holds a bare git repo, or a `.hg` or `.svn` folder. A cancelled scan stops searching output folders at once.
 
 ## [0.8.0] - 2026-10-25
 

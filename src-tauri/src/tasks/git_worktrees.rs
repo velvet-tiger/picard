@@ -116,7 +116,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, anyhow};
 use walkdir::WalkDir;
 
-use super::git::{GitCmd, SAFETY_STATUS, WorktreeEntry, parse_worktree_list};
+use super::git::{GitCmd, SAFETY_STATUS, WorktreeEntry, is_git_store, parse_worktree_list};
 use super::in_use::InUse;
 use super::stale_dirs::{FINDER_METADATA, is_file, is_skipped, newest_mtime};
 use super::{Candidate, CleanupTask, Ctx, Estimate, Notice, Removed, Report, check_target};
@@ -1362,10 +1362,14 @@ fn find_repos(ctx: &Ctx) -> Vec<PathBuf> {
 /// What to tell the user about `folder` if it is a broken worktree: its `.git`
 /// file names a worktree record that does not exist. A folder that merely
 /// cannot be read is not reported. The file is only read, and the paths it
-/// names are only checked for existence, so a hostile one can do no harm.
+/// names are only checked for existence, so a hostile one can do no harm. A
+/// record on a drive that is not mounted is only out of reach, not gone.
 fn broken_worktree(folder: &Path) -> Option<&'static str> {
     let contents = read_small_file(&folder.join(".git"), GIT_FILE_LIMIT).ok()??;
     let record = worktree_record(folder, &contents)?;
+    if on_unmounted_volume(&record) {
+        return None;
+    }
     match std::fs::symlink_metadata(&record) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         _ => return None,
@@ -1385,24 +1389,54 @@ fn broken_worktree(folder: &Path) -> Option<&'static str> {
 fn worktree_record(folder: &Path, contents: &[u8]) -> Option<PathBuf> {
     let line = std::str::from_utf8(contents).ok()?.strip_suffix('\n')?;
     let target = Path::new(line.strip_prefix("gitdir: ")?);
-    if line.contains('\n') || target.file_name().is_none() || is_submodule_repo(target) {
+    if line.contains('\n') || target.file_name().is_none() {
         return None;
     }
-    let parent = target.parent()?;
-    (parent.file_name() == Some(OsStr::new("worktrees"))).then(|| folder.join(target))
+    let record = folder.join(target);
+    let parent = record.parent()?;
+    let shaped = parent.file_name() == Some(OsStr::new("worktrees"));
+    (shaped && !is_submodule_repo(parent.parent()?)).then_some(record)
 }
 
-/// True if `git_path` is inside `<git dir>/modules`, where git keeps submodule
-/// repositories. A submodule can be called `worktrees/x`, so its `.git` file
-/// can look like a worktree's. A repo in a folder called `modules` is not one
-/// of these, because that folder comes before the git dir.
-fn is_submodule_repo(git_path: &Path) -> bool {
-    let is_git_dir = |c: &OsStr| c.to_str().is_some_and(|n| n.ends_with(".git"));
-    git_path
+/// True if `path` is under `/Volumes/<name>` and nothing is there.
+fn on_unmounted_volume(path: &Path) -> bool {
+    let mut parts = path.components().map(|c| c.as_os_str());
+    let (Some(_root), Some(volumes), Some(name)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    path.has_root()
+        && volumes == "Volumes"
+        && std::fs::symlink_metadata(Path::new("/Volumes").join(name)).is_err()
+}
+
+/// True if the `.git` file naming `<git_dir>/worktrees/<id>` is really a
+/// submodule's. Git keeps those repositories in `<git dir>/modules`, and a
+/// submodule can be called `worktrees/x`, so its `.git` file can look like a
+/// worktree's.
+///
+/// A `git_dir` that is a repository settles it: this is a worktree of that
+/// repo, even a submodule's own at `.git/modules/sub`. Otherwise the path
+/// decides. It is a submodule's if `git_dir` is itself a `modules` folder, or
+/// if `modules` follows a git dir, or follows a repository of any name, such
+/// as a bare repo. A repo in a folder called `modules` is not one of these,
+/// because that folder comes before the git dir.
+fn is_submodule_repo(git_dir: &Path) -> bool {
+    if is_git_store(git_dir) {
+        return false;
+    }
+    let is_modules = |p: &Path| p.file_name() == Some(OsStr::new("modules"));
+    let is_git_name = |c: &OsStr| c.to_str().is_some_and(|n| n.ends_with(".git"));
+    let after_a_git_dir = git_dir
         .components()
         .map(|c| c.as_os_str())
-        .skip_while(|c| !is_git_dir(c))
-        .any(|c| c == "modules")
+        .skip_while(|c| !is_git_name(c))
+        .any(|c| c == "modules");
+    is_modules(git_dir)
+        || after_a_git_dir
+        || git_dir
+            .ancestors()
+            .any(|a| is_modules(a) && a.parent().is_some_and(is_git_store))
 }
 
 /// True if any file under `dir` was modified after `since`, or if any part
@@ -2128,6 +2162,69 @@ mod tests {
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert_eq!(notices[0].path, moved.canonicalize().unwrap());
         assert!(notices[0].message.contains("its repo is gone"));
+    }
+
+    /// A worktree of a submodule lives in `.git/modules/sub/worktrees/x`.
+    #[test]
+    fn a_broken_worktree_of_a_submodule_is_reported() {
+        let fx = Fixture::new(&[]);
+        let store = fx.root.join("r/.git/modules/sub");
+        std::fs::create_dir_all(store.join("objects")).unwrap();
+        std::fs::write(store.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fx.file("wt/a", 1);
+        let line = format!("gitdir: {}/worktrees/x\n", store.display());
+        std::fs::write(fx.root.join("wt/.git"), line).unwrap();
+        assert_eq!(task(1, vec![]).notices(&fx.ctx()).len(), 1);
+    }
+
+    /// A submodule of a bare repo that has no `.git` in its name.
+    #[test]
+    fn a_submodule_of_a_plainly_named_bare_repo_is_not_a_broken_worktree() {
+        let fx = Fixture::new(&[]);
+        let bare = fx.root.join("mirror");
+        std::fs::create_dir(&bare).unwrap();
+        git(&bare, &["init", "-q", "--bare"]);
+        for name in ["worktrees/lib", "a/worktrees/lib"] {
+            fx.file("sub/a", 1);
+            let line = format!("gitdir: {}/modules/{name}\n", bare.display());
+            std::fs::write(fx.root.join("sub/.git"), line).unwrap();
+            assert_eq!(task(1, vec![]).notices(&fx.ctx()), vec![], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_bare_repo_called_modules_can_have_a_broken_worktree() {
+        let fx = Fixture::new(&[]);
+        let bare = fx.root.join("modules");
+        std::fs::create_dir(&bare).unwrap();
+        git(&bare, &["init", "-q", "--bare"]);
+        fx.file("wt/a", 1);
+        let line = format!("gitdir: {}/worktrees/x\n", bare.display());
+        std::fs::write(fx.root.join("wt/.git"), line).unwrap();
+        assert_eq!(task(1, vec![]).notices(&fx.ctx()).len(), 1);
+    }
+
+    /// The drive may simply be unplugged, so nothing is broken.
+    #[test]
+    fn a_worktree_of_a_repo_on_an_unmounted_drive_is_not_reported() {
+        let fx = Fixture::new(&[]);
+        fx.file("wt/a", 1);
+        let gone = "gitdir: /Volumes/picard-no-such-drive/r/.git/worktrees/x\n";
+        std::fs::write(fx.root.join("wt/.git"), gone).unwrap();
+        assert_eq!(task(1, vec![]).notices(&fx.ctx()), vec![]);
+    }
+
+    #[test]
+    fn only_a_path_under_a_missing_volume_counts_as_unmounted() {
+        assert!(on_unmounted_volume(Path::new(
+            "/Volumes/picard-no-such-drive/r"
+        )));
+        assert!(on_unmounted_volume(Path::new(
+            "/Volumes/picard-no-such-drive"
+        )));
+        assert!(!on_unmounted_volume(Path::new("/gone/r/.git/worktrees/x")));
+        assert!(!on_unmounted_volume(Path::new("Volumes/gone/r")));
+        assert!(!on_unmounted_volume(Path::new("/Volumes")));
     }
 
     #[test]

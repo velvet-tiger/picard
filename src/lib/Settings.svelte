@@ -471,7 +471,7 @@
                         .map((d) => d.trim())
                         .filter(Boolean))
                   }
-                  placeholder="dist, build, .next, vendor, .terraform"
+                  placeholder="dist, build, .next, vendor, .terraform, storybook-static"
                 />
               </div>
               <p class="muted">Only folders git ignores, or proven Next.js and Composer output.</p>

@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import { mockWindows } from '@tauri-apps/api/mocks'
 import { afterEach, describe, expect, it } from 'vitest'
 import SettingsView from './Settings.svelte'
-import { BUILT_IN_TASKS, TASK_LABELS, type Settings } from './api'
+import { BUILT_IN_TASKS, TASK_LABELS, newTask, type Settings } from './api'
 import { fakeBackend, type Handler } from './fake-backend'
 
 function config(): Settings {
@@ -55,6 +55,14 @@ const timeInput = () => document.querySelector<HTMLInputElement>('input[type="ti
 describe('Settings', () => {
   afterEach(() => {
     delete document.documentElement.dataset.theme
+  })
+
+  it('shows the default build folder names as the placeholder', async () => {
+    const task = newTask('build_output')
+    backend({ get_settings: () => ({ ...config(), tasks: [task] }) })
+    await renderLoaded()
+    if (task.type !== 'build_output') throw new Error('wrong task type')
+    expect(screen.getByPlaceholderText(task.dirs.join(', '))).toBeInTheDocument()
   })
 
   it('shows the load error', async () => {

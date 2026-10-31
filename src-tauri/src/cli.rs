@@ -172,6 +172,20 @@ fn run(config: &Config, config_path: &std::path::Path, env: &ToolEnv) -> Result<
     Ok(code)
 }
 
+/// `text` with control characters written as escapes. A folder name can hold
+/// any byte, and a terminal would act on the ones that control it.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 fn format_scan(name: &str, space: DiskSpace, scans: &[TaskScan]) -> String {
     let mut out = format!("{name}: {}\n", disk::format_free(space));
     let mut total = 0;
@@ -180,7 +194,7 @@ fn format_scan(name: &str, space: DiskSpace, scans: &[TaskScan]) -> String {
             out.push_str(&format!(
                 "  needs you     {:>9}  {}  ({})\n",
                 disk::format_bytes(n.bytes),
-                n.path.display(),
+                printable(&n.path.display().to_string()),
                 n.message
             ));
         }
@@ -279,6 +293,28 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("total: 0 MB"), "{text}");
+    }
+
+    #[test]
+    fn a_notice_escapes_control_characters_in_its_path() {
+        let scans = vec![TaskScan {
+            task: "git_worktrees",
+            result: Ok(vec![]),
+            ignored: Default::default(),
+            holds_ignored: Default::default(),
+            notices: vec![Notice {
+                path: PathBuf::from("/w/a\u{1b}[2J\nb é"),
+                bytes: 0,
+                message: "broken".into(),
+            }],
+        }];
+        let space = DiskSpace {
+            free_bytes: 1,
+            total_bytes: 2,
+        };
+        let text = format_scan("Disk", space, &scans);
+        assert!(text.contains(r"/w/a\u{1b}[2J\nb é  (broken)"), "{text:?}");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
     }
 
     #[test]

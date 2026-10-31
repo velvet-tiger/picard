@@ -21,8 +21,8 @@ Picard only works inside the folders you list as **roots**, such as `~/working`.
 These rules always hold:
 
 - Nothing outside your roots is removed, and symlinks are never followed out of them. Tool caches are the exception: Picard never deletes them itself. It asks each tool to prune its own cache.
-- Git branches are never deleted. Worktrees are removed with `git worktree remove`. A worktree with checked-out submodules needs `--force`, so Picard first checks each submodule itself: it must be clean, and every commit in it must be on a remote branch. A partly deleted worktree needs `--force` too, so Picard checks its status again right before removal.
-- A worktree with uncommitted or untracked changes is never removed. The exception is a partly deleted one, whose only change is deleted tracked files. A worktree that holds another git checkout, such as a Claude Code worktree in `.claude/worktrees/`, is never removed either. The exception is a clean clone in a package folder.
+- Git branches are never deleted. Worktrees are removed with `git worktree remove`. A worktree with checked-out submodules needs `--force`, so Picard first checks each submodule itself: it must be clean, and every commit in it must be on a remote branch. A partly deleted worktree needs `--force` too, so Picard checks its status, its idle time and its submodule repositories again right before removal.
+- A worktree with uncommitted or untracked changes is never removed, and neither is one with a file marked skip-worktree or assume-unchanged, because `git status` does not check those. That includes a sparse checkout. The exception is a partly deleted one, whose only change is deleted tracked files. A worktree that holds another git checkout, such as a Claude Code worktree in `.claude/worktrees/`, is never removed either. The exception is a clean clone in a package folder.
 - A broken worktree is never removed. Picard shows it under **Needs you** for you to deal with.
 - A worktree with a paused rebase, `git am`, merge, cherry-pick, revert, bisect or notes merge is never removed. Removing it would delete that operation's state.
 - A worktree's own refs, under `refs/worktree/` and `refs/bisect/`, are deleted with it. A worktree is never removed while one of them points at a commit that no other local branch holds, or at anything that is not a commit, such as a tag object.
@@ -61,7 +61,9 @@ One thing to know: removing a worktree also deletes files git ignores inside it,
 
 A **partly deleted** worktree is still registered, and git status lists deleted tracked files and nothing else. Picard treats it like any other worktree, with two differences. It always waits for `stale_days`, because you might be deleting those files on purpose. A deletion counts as a change here, so the wait starts again after each one. The **Clean…** list says "partly deleted". If anything else has changed in it, such as an edit or a new file, Picard keeps it. A worktree whose commits exist nowhere else is kept too.
 
-A **broken** worktree is a folder whose `.git` file names a worktree record that no longer exists. Git cannot run there, so nothing shows whether its files matter. Picard never removes one. `picard scan` and the **Clean…** window list it under **Needs you**, with its path and size. Check it for work, then delete it yourself. To stop Picard listing a folder, add it to `exclude`. This search runs only when `git_worktrees` is on, and it uses the same depth limit and skipped folders as the search for repos.
+If the root `.gitignore` is one of the deleted files, ignored folders show as untracked. Picard cannot tell those from new work, so it lists the worktree under **Needs you** and never removes it.
+
+A **broken** worktree is a folder whose `.git` file names a worktree record that no longer exists. Git cannot run there, so nothing shows whether its files matter. Picard never removes one. `picard scan` and the **Clean…** window list it under **Needs you**, with its path and size. Check it for work, then delete it yourself. To stop Picard listing a folder, add it to `exclude`. A record on a drive under `/Volumes` that is not mounted is not reported, because the drive may only be unplugged. This search runs only when `git_worktrees` is on, and it uses the same depth limit and skipped folders as the search for repos.
 
 ### Clones in package folders
 
@@ -72,9 +74,19 @@ Some package managers install real git clones, such as Composer with `--prefer-s
 - The repo around it ignores it.
 - Git run there really uses its own `.git` folder, and that folder has no `info/grafts`.
 - Its own repo config defines no filters, and it has no submodules.
-- `git status` is clean, and every commit, stash and reflog entry is on one of its remote branches.
+- It has no linked worktrees of its own, and no merge, rebase or similar is paused in it.
+- `git status` is clean, and no file is marked skip-worktree or assume-unchanged, because `status` does not check those.
+- Every commit, stash and reflog entry was fetched from a remote. Only the refs that a configured remote's fetch refspec writes count, and that remote's URLs must all be on the network. A local path, a `file:` URL or a ref made by hand does not count.
 
-An error from git, or a folder Picard cannot read, keeps the worktree or folder. Picard runs the same check just before removal. Files that the clone's own `.gitignore` covers are not checked, so they are lost with it.
+Picard works offline, so this shows what the last fetch saw. If a branch was deleted or force-pushed on the remote since then, its commits may exist nowhere else, and Picard cannot tell. Submodules work the same way, except that any remote-tracking ref counts there.
+
+An error from git, or a folder Picard cannot read, keeps the worktree or folder. Picard runs the same check just before removal, and keeps the folder if the clone's `.git` was written to after the run started. Files that the clone's own `.gitignore` covers are not checked, so they are lost with it.
+
+A folder that holds a bare git repo, or a `.hg` or `.svn` folder, is kept. So is a build output folder that is itself a bare repo.
+
+### Removing `.terraform`
+
+`.terraform` is on the default list, and it rebuilds, but not by itself. Run `terraform init` again afterwards. A project with a partial backend config needs its `-backend-config` flags again. The selected workspace is stored in `.terraform/environment`, so it may go back to `default`. Check it with `terraform workspace show` before you apply.
 
 ### Build output outside a git repo
 
@@ -258,7 +270,7 @@ The app binary also works as a command-line tool:
 /Applications/Picard.app/Contents/MacOS/picard run --yes
 ```
 
-`scan` lists what would be removed and changes nothing. It also prints a `needs you` line for each broken worktree, which is not counted in the total. `run --yes` cleans each drive that is below its target. Both accept `--config <path>`.
+`scan` lists what would be removed and changes nothing. It also prints a `needs you` line for each worktree that needs a person, which is not counted in the total. `run --yes` cleans each drive that is below its target. Both accept `--config <path>`.
 
 ## Troubleshooting
 
