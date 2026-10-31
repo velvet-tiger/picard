@@ -2064,6 +2064,81 @@ mod tests {
         assert_eq!(task(1, vec![]).notices(&fx.ctx()), vec![]);
     }
 
+    /// A clone at `wt/vendor/acme/lib`, in a worktree that ignores `vendor/`,
+    /// with its one commit on a remote branch.
+    fn vendored_worktree(r: &Path) -> (PathBuf, PathBuf) {
+        std::fs::write(r.join(".gitignore"), "vendor/\n").unwrap();
+        git(r, &["add", "."]);
+        git(r, &["commit", "-qm", "ignore vendor"]);
+        let wt = worktree(r, "packages");
+        let lib = wt.join("vendor/acme/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        git(&lib, &["init", "-q"]);
+        commit(&lib, "A.php");
+        git(&lib, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        (wt, lib)
+    }
+
+    #[test]
+    fn a_worktree_with_a_clean_pushed_vendor_clone_is_removed() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let (wt, _) = vendored_worktree(&r);
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["packages"]);
+        let report = t.run(&ctx, &found);
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(!wt.exists());
+    }
+
+    #[test]
+    fn a_worktree_with_a_vendor_clone_holding_local_work_is_kept() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let (wt, lib) = vendored_worktree(&r);
+        commit(&lib, "fix.php");
+        age(&fx, &wt, 1);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    /// `remove_one` runs the same check, so work added after the scan keeps it.
+    #[test]
+    fn a_vendor_clone_that_gains_work_after_the_scan_keeps_its_worktree() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let (wt, lib) = vendored_worktree(&r);
+        age(&fx, &wt, 1);
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["packages"]);
+        commit(&lib, "fix.php");
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(report.failed[0].1.contains("holds another git checkout"));
+        assert!(lib.join("fix.php").exists());
+    }
+
+    #[test]
+    fn a_clone_in_an_agent_worktree_inside_a_worktree_stays_refused() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        std::fs::write(r.join(".gitignore"), ".claude/\nvendor/\n").unwrap();
+        git(&r, &["add", "."]);
+        git(&r, &["commit", "-qm", "ignore"]);
+        let wt = worktree(&r, "outer");
+        let lib = wt.join(".claude/worktrees/inner/vendor/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        git(&lib, &["init", "-q"]);
+        commit(&lib, "A.php");
+        git(&lib, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        age(&fx, &wt, 1);
+        assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
     /// A worktree found clean must never earn `--force` from a later deletion.
     #[test]
     fn a_clean_candidate_that_loses_a_file_is_refused() {

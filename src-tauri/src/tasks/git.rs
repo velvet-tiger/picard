@@ -366,7 +366,9 @@ impl GitCmd {
         let has_stores = std::fs::symlink_metadata(&modules).is_ok();
         let index = self.output(dir, &["ls-files", "--stage", "-z"])?;
         let submodules: Vec<PathBuf> = index_gitlinks(&index).iter().map(|g| dir.join(g)).collect();
-        if let Some(other) = other_checkout(dir, &submodules)? {
+        let others = find_checkouts(dir, &submodules, Search::Worktree)?;
+        if let Some((other, why)) = self.first_refused(dir, &others)? {
+            log::debug!("nested checkout {}: {why}", other.display());
             return Ok(Some(format!(
                 "holds another git checkout at {}",
                 other.display()
@@ -392,6 +394,119 @@ impl GitCmd {
             }
         }
         Ok(None)
+    }
+
+    /// The first of `checkouts` inside `outer` that must be kept, with why.
+    fn first_refused(
+        &self,
+        outer: &Path,
+        checkouts: &[PathBuf],
+    ) -> Result<Option<(PathBuf, String)>> {
+        for checkout in checkouts {
+            if let Some(why) = self.nested_checkout_problem(outer, checkout)? {
+                return Ok(Some((checkout.clone(), why)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The first git checkout inside build output folder `output` of `project`
+    /// that must be kept, with why. A folder that cannot be read is an error,
+    /// so the output is kept.
+    pub fn output_checkout_problem(
+        &self,
+        project: &Path,
+        output: &Path,
+    ) -> Result<Option<(PathBuf, String)>> {
+        self.first_refused(project, &find_checkouts(output, &[], Search::Output)?)
+    }
+
+    /// Why deleting the git checkout at `checkout`, inside `outer`, could lose
+    /// work, if it could. A package manager that installs from source, such as
+    /// Composer with `--prefer-source` or Terraform's module installer, leaves
+    /// a real clone in its package folder. That clone is safe to delete only
+    /// when all of this holds:
+    /// - its `.git` is a folder. A `.git` file is a linked worktree or a
+    ///   submodule, whose repository lives somewhere else.
+    /// - it sits in a package folder (`in_package_folder`)
+    /// - `outer` ignores it, so `outer` never meant to keep it
+    /// - git run there really reads this `.git` folder and this folder
+    /// - it has no `info/grafts`, which can make history look pushed
+    /// - no repo filters, no submodules and nothing uncommitted
+    ///   (`contents_problem`), and no commit missing from its remote branches
+    ///   (`store_problem`)
+    ///
+    /// Ignored files inside it are not checked, as for a worktree. A git error
+    /// is returned, so the caller keeps the folder.
+    pub fn nested_checkout_problem(&self, outer: &Path, checkout: &Path) -> Result<Option<String>> {
+        let inside = checkout
+            .strip_prefix(outer)
+            .with_context(|| format!("{} is outside {}", checkout.display(), outer.display()))?;
+        let git_dir = checkout.join(".git");
+        if !std::fs::symlink_metadata(&git_dir).is_ok_and(|m| m.is_dir()) {
+            return Ok(Some("its .git is not a folder".to_string()));
+        }
+        if !in_package_folder(inside) {
+            return Ok(Some(
+                "is not in a vendor or .terraform/modules folder".to_string(),
+            ));
+        }
+        let path = format!("./{}", inside.display());
+        if !self.check(outer, &["check-ignore", "-q", "--", &path])? {
+            return Ok(Some("the repo around it does not ignore it".to_string()));
+        }
+        if !self.reads_its_own_git_dir(checkout, &git_dir)? {
+            return Ok(Some(
+                "git there does not use its own .git folder".to_string(),
+            ));
+        }
+        if std::fs::symlink_metadata(git_dir.join("info/grafts")).is_ok() {
+            return Ok(Some(
+                "has info/grafts, which can make history look pushed".to_string(),
+            ));
+        }
+        if let Some(why) = self.contents_problem(checkout)? {
+            return Ok(Some(why));
+        }
+        self.store_problem(&git_dir)
+    }
+
+    /// True if git run in `folder` works on `folder`, with `git_dir` as both
+    /// its git dir and its common dir. An invalid `.git` folder makes git use
+    /// the repo around it, `core.worktree` can name another folder, and a
+    /// `commondir` file makes git read another repo's refs. Each would make
+    /// the checks that follow judge the wrong thing.
+    fn reads_its_own_git_dir(&self, folder: &Path, git_dir: &Path) -> Result<bool> {
+        let raw = self.output(
+            folder,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+                "--show-toplevel",
+            ],
+        )?;
+        let same = |seen: &str, want: &Path| {
+            Ok::<bool, anyhow::Error>(
+                Path::new(seen)
+                    .canonicalize()
+                    .with_context(|| format!("resolving {seen}"))?
+                    == want
+                        .canonicalize()
+                        .with_context(|| format!("resolving {}", want.display()))?,
+            )
+        };
+        let mut lines = raw.lines();
+        let (Some(dir), Some(common), Some(top), None) =
+            (lines.next(), lines.next(), lines.next(), lines.next())
+        else {
+            bail!(
+                "git rev-parse in {}: unexpected output {raw:?}",
+                folder.display()
+            );
+        };
+        Ok(same(dir, git_dir)? && same(common, git_dir)? && same(top, folder)?)
     }
 
     /// True if `dir` has submodule repositories that `git worktree remove`
@@ -439,6 +554,14 @@ impl GitCmd {
                 "is not empty and is not a submodule checkout".to_string(),
             ));
         }
+        self.contents_problem(folder)
+    }
+
+    /// Why git cannot vouch for the files in checkout `folder`, if it cannot:
+    /// repo filters, submodules of its own, or anything uncommitted. Call it
+    /// only once `folder` is known to be the checkout git will read, because
+    /// `status` otherwise reports on another folder.
+    fn contents_problem(&self, folder: &Path) -> Result<Option<String>> {
         let filters = self.untrusted_filters(folder)?;
         if !filters.is_empty() {
             return Ok(Some(format!(
@@ -492,12 +615,38 @@ impl GitCmd {
 /// dependencies, which can be huge, and which Picard removes anyway.
 const NOT_SEARCHED: &[&str] = &["node_modules", "target", ".next"];
 
-/// The first git checkout inside worktree `dir` other than its submodule
-/// checkouts, which `unsafe_to_inspect` verifies. Claude Code puts worktrees
-/// in `.claude/worktrees/`, which git ignores, so `status` never lists their
+/// What `find_checkouts` is searching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Search {
+    /// A worktree. It is a checkout itself, so a `.git` at its top is its own,
+    /// and `NOT_SEARCHED` folders are left out.
+    Worktree,
+    /// A build output folder. Everything is searched, and a `.git` at the top
+    /// makes the folder itself a checkout.
+    Output,
+}
+
+/// True if `path`, relative to the repo around it, is below a folder that
+/// package managers install into: a `vendor` folder at any depth, or
+/// `.terraform/modules`. Anything in `.claude/worktrees` is an agent's working
+/// copy rather than a package, so it never counts.
+fn in_package_folder(path: &Path) -> bool {
+    let names: Vec<_> = path.iter().collect();
+    if names.windows(2).any(|w| w == [".claude", "worktrees"]) {
+        return false;
+    }
+    let above = &names[..names.len().saturating_sub(1)];
+    above.iter().any(|name| *name == "vendor")
+        || above.windows(2).any(|w| w == [".terraform", "modules"])
+}
+
+/// Every git checkout inside `dir` other than its submodule checkouts, which
+/// `unsafe_to_inspect` verifies. Claude Code puts worktrees in
+/// `.claude/worktrees/`, which git ignores, so `status` never lists their
 /// untracked files, yet removing `dir` deletes them. No depth limit. An
-/// unreadable folder is an error, so the worktree is kept.
-pub fn other_checkout(dir: &Path, submodules: &[PathBuf]) -> Result<Option<PathBuf>> {
+/// unreadable folder is an error, so `dir` is kept.
+fn find_checkouts(dir: &Path, submodules: &[PathBuf], search: Search) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
     let mut walk = walkdir::WalkDir::new(dir)
         .follow_links(false)
         .min_depth(1)
@@ -510,25 +659,28 @@ pub fn other_checkout(dir: &Path, submodules: &[PathBuf]) -> Result<Option<PathB
                 walk.skip_current_dir();
             }
             // The worktree's own `.git` file sits at the top.
-            if e.depth() == 1 {
+            if e.depth() == 1 && search == Search::Worktree {
                 continue;
             }
             let checkout = e.path().parent().unwrap_or(dir);
             if !submodules.iter().any(|s| s == checkout) {
-                return Ok(Some(checkout.to_path_buf()));
+                found.push(checkout.to_path_buf());
             }
             continue;
         }
-        if e.file_type().is_dir() && name.to_str().is_some_and(|n| NOT_SEARCHED.contains(&n)) {
+        if search == Search::Worktree
+            && e.file_type().is_dir()
+            && name.to_str().is_some_and(|n| NOT_SEARCHED.contains(&n))
+        {
             // A checkout can itself be called `target`, so look before skipping.
             let is_checkout = std::fs::symlink_metadata(e.path().join(".git")).is_ok();
             if is_checkout && !submodules.iter().any(|s| s == e.path()) {
-                return Ok(Some(e.path().to_path_buf()));
+                found.push(e.path().to_path_buf());
             }
             walk.skip_current_dir();
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// The submodule repositories under `modules`. A submodule's name can contain
@@ -840,6 +992,68 @@ mod tests {
         git.output(dir.path(), &["init", "-q"]).unwrap();
         let err = git.output(dir.path(), &args).unwrap_err().to_string();
         assert!(err.len() < 2_000, "{} chars: {err}", err.len());
+    }
+
+    #[test]
+    fn package_folders_are_vendor_and_terraform_modules_only() {
+        for yes in [
+            "vendor/acme/lib",
+            "vendor/lib",
+            "app/vendor/acme/lib",
+            ".terraform/modules/vpc",
+            "a/.terraform/modules/vpc/inner",
+        ] {
+            assert!(in_package_folder(Path::new(yes)), "{yes}");
+        }
+        for no in [
+            "vendor",
+            "lib",
+            "src/lib",
+            ".terraform/modules",
+            ".terraform/vpc",
+            "modules/vpc",
+            "vendored/lib",
+            ".claude/worktrees/x/vendor/lib",
+            "vendor/.claude/worktrees/x",
+            "vendor/a/.claude/worktrees/x/y",
+        ] {
+            assert!(!in_package_folder(Path::new(no)), "{no}");
+        }
+    }
+
+    /// `.git` in a linked worktree is a file, which must never pass, and the
+    /// repo around a clone must ignore it. A build output folder is already
+    /// ignored, so only a direct call shows this second condition.
+    #[test]
+    fn a_nested_checkout_needs_a_git_folder_and_an_ignoring_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().canonicalize().unwrap();
+        let git = GitCmd::default();
+        git.output(&outer, &["init", "-q"]).unwrap();
+        let lib = outer.join("vendor/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        git.output(&lib, &["init", "-q"]).unwrap();
+        let why = git.nested_checkout_problem(&outer, &lib).unwrap().unwrap();
+        assert_eq!(why, "the repo around it does not ignore it");
+
+        std::fs::remove_dir_all(lib.join(".git")).unwrap();
+        std::fs::write(lib.join(".git"), "gitdir: /x/.git/worktrees/y\n").unwrap();
+        let why = git.nested_checkout_problem(&outer, &lib).unwrap().unwrap();
+        assert_eq!(why, "its .git is not a folder");
+    }
+
+    #[test]
+    fn a_git_error_on_a_nested_checkout_is_an_error_not_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().canonicalize().unwrap();
+        let lib = outer.join("vendor/lib");
+        std::fs::create_dir_all(lib.join(".git")).unwrap();
+        // `outer` is no repo, so `check-ignore` fails.
+        assert!(
+            GitCmd::default()
+                .nested_checkout_problem(&outer, &lib)
+                .is_err()
+        );
     }
 
     #[test]

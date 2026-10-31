@@ -6,13 +6,16 @@
 //! folder is a candidate only when git vouches for it: git must ignore the
 //! folder and track nothing inside it. A folder outside any git repo is kept,
 //! because nothing can vouch for it. A folder that holds a git repo of its own
-//! (Composer's `--prefer-source` installs do) is kept too, because that repo
-//! may hold work that exists nowhere else.
+//! is kept too, because that repo may hold work that exists nowhere else. The
+//! exception is a clean clone that a package manager installed from source,
+//! such as Composer's `--prefer-source` installs, whose commits are all on its
+//! remote branches. `GitCmd::nested_checkout_problem` lists the conditions.
+//!
+//! Each folder is judged again just before it is removed.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use walkdir::WalkDir;
 
 use super::git::GitCmd;
 use super::stale_dirs::{find_pairs, idle_days};
@@ -65,20 +68,27 @@ impl BuildOutput {
             Ok(_) => return Some("git tracks files inside it".to_string()),
             Err(e) => return Some(format!("cannot list its tracked files: {e:#}")),
         }
-        nested_repo(&project.join(name))
-            .map(|repo| format!("holds a git repo at {}", repo.display()))
+        match self
+            .git
+            .output_checkout_problem(project, &project.join(name))
+        {
+            Ok(None) => None,
+            Ok(Some((repo, why))) => Some(format!("holds a git repo at {}: {why}", repo.display())),
+            Err(e) => Some(format!("cannot check it for git repos: {e:#}")),
+        }
     }
-}
 
-/// The first `.git` file or folder inside `dir`, if any. Never follows symlinks.
-fn nested_repo(dir: &Path) -> Option<PathBuf> {
-    WalkDir::new(dir)
-        .follow_links(false)
-        .min_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .find(|e| e.file_name() == ".git")
-        .map(|e| e.into_path())
+    /// Why candidate `c` must be kept now, if anything. A clone in it can
+    /// have gained work since the scan.
+    fn keep_reason_now(&self, c: &Candidate) -> Option<String> {
+        let (Some(project), Some(name)) = (c.path.parent(), c.path.file_name()) else {
+            return Some("has no parent folder".to_string());
+        };
+        let Some(name) = name.to_str() else {
+            return Some("has a name that is not UTF-8".to_string());
+        };
+        self.keep_reason(project, name)
+    }
 }
 
 impl CleanupTask for BuildOutput {
@@ -130,7 +140,27 @@ impl CleanupTask for BuildOutput {
     }
 
     fn run(&self, ctx: &Ctx, candidates: &[Candidate]) -> Report {
-        remove_dirs(ctx, candidates)
+        let mut report = Report::default();
+        for c in candidates {
+            if !ctx.volume_present() {
+                report.halted = Some("the volume is no longer mounted".to_string());
+                break;
+            }
+            if let Some(why) = self.keep_reason_now(c) {
+                log::warn!("not removing {}: {why}", c.path.display());
+                report.failed.push((c.path.clone(), why));
+                continue;
+            }
+            // One at a time, so each folder is removed right after its check.
+            let done = remove_dirs(ctx, std::slice::from_ref(c));
+            report.removed.extend(done.removed);
+            report.failed.extend(done.failed);
+            report.halted = done.halted;
+            if report.halted.is_some() {
+                break;
+            }
+        }
+        report
     }
 }
 
@@ -306,6 +336,223 @@ mod tests {
         git(&dir.join("vendor/acme/lib"), &["init", "-q"]);
         fx.age("p", 60);
         assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    /// A git repo at `rel` that ignores `vendor/`, whose `vendor/acme/lib` is
+    /// a clean clone with every commit on a remote branch. This is the one
+    /// accepted shape. Each tripwire below breaks one thing about it.
+    fn vendored(fx: &Fixture, rel: &str) -> PathBuf {
+        let dir = repo(fx, rel);
+        std::fs::write(dir.join(".gitignore"), "vendor/\n").unwrap();
+        fx.file(&format!("{rel}/vendor/acme/lib/src/A.php"), 1);
+        let lib = dir.join("vendor/acme/lib");
+        clone_like(&lib);
+        dir
+    }
+
+    /// Makes `dir` a repo with one commit, which a remote branch also holds.
+    fn clone_like(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "release"]);
+        git(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    }
+
+    /// True if a stale project built by `vendored` still offers its `vendor`
+    /// after `change` runs in the clone.
+    fn offered_after(change: impl Fn(&Fixture, &Path)) -> bool {
+        let fx = Fixture::new(&[]);
+        let dir = vendored(&fx, "p");
+        change(&fx, &dir.join("vendor/acme/lib"));
+        fx.age("p", 60);
+        !task().scan(&fx.ctx()).unwrap().is_empty()
+    }
+
+    #[test]
+    fn a_clean_pushed_clone_in_vendor_is_accepted_and_removed() {
+        let fx = Fixture::new(&[]);
+        let dir = vendored(&fx, "p");
+        fx.age("p", 60);
+        let ctx = fx.ctx();
+        let t = task();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/vendor"]);
+        let report = t.run(&ctx, &found);
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(!dir.join("vendor").exists());
+    }
+
+    #[test]
+    fn a_clone_in_terraform_modules_is_accepted() {
+        let fx = Fixture::new(&[]);
+        let dir = repo(&fx, "p");
+        std::fs::write(dir.join(".gitignore"), ".terraform/\n").unwrap();
+        fx.file("p/.terraform/modules/vpc/main.tf", 1);
+        clone_like(&dir.join(".terraform/modules/vpc"));
+        fx.age("p", 60);
+        let t = BuildOutput::new(GitCmd::default(), vec![".terraform".into()], 30);
+        let found = t.scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/.terraform"]);
+    }
+
+    #[test]
+    fn a_clone_elsewhere_is_kept() {
+        let fx = Fixture::new(&[]);
+        repo(&fx, "p");
+        fx.file("p/dist/acme/lib/a.js", 1);
+        clone_like(&fx.root.join("p/dist/acme/lib"));
+        fx.age("p", 60);
+        assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_vendor_folder_that_is_itself_a_clone_is_kept() {
+        let fx = Fixture::new(&[]);
+        let dir = repo(&fx, "p");
+        std::fs::write(dir.join(".gitignore"), "vendor/\n").unwrap();
+        fx.file("p/vendor/a.php", 1);
+        clone_like(&dir.join("vendor"));
+        fx.age("p", 60);
+        assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_clone_with_a_git_file_is_kept() {
+        assert!(!offered_after(|_, lib| {
+            std::fs::remove_dir_all(lib.join(".git")).unwrap();
+            std::fs::write(lib.join(".git"), "gitdir: /elsewhere/.git/worktrees/x\n").unwrap();
+        }));
+    }
+
+    #[test]
+    fn a_clone_with_repo_filters_is_kept() {
+        assert!(!offered_after(|_, lib| {
+            git(lib, &["config", "filter.x.clean", "cat"]);
+        }));
+    }
+
+    #[test]
+    fn a_clone_with_a_gitlink_is_kept() {
+        assert!(!offered_after(|_, lib| {
+            let id = "1111111111111111111111111111111111111111";
+            git(
+                lib,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{id},sub"),
+                ],
+            );
+            git(lib, &["commit", "-q", "-m", "submodule"]);
+            git(lib, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        }));
+    }
+
+    #[test]
+    fn a_clone_with_an_edit_or_a_new_file_is_kept() {
+        assert!(!offered_after(|fx, _| {
+            fx.file("p/vendor/acme/lib/src/A.php", 2);
+        }));
+        assert!(!offered_after(|fx, _| {
+            fx.file("p/vendor/acme/lib/notes.txt", 1);
+        }));
+    }
+
+    #[test]
+    fn a_clone_with_a_commit_on_no_remote_branch_is_kept() {
+        assert!(!offered_after(|fx, lib| {
+            fx.file("p/vendor/acme/lib/fix.php", 1);
+            git(lib, &["add", "."]);
+            git(lib, &["commit", "-q", "-m", "local fix"]);
+        }));
+    }
+
+    /// `--reflog` and `--all` count these though no branch holds them.
+    #[test]
+    fn a_clone_with_work_only_in_a_stash_or_the_reflog_is_kept() {
+        assert!(!offered_after(|fx, lib| {
+            fx.file("p/vendor/acme/lib/src/A.php", 2);
+            git(lib, &["stash", "-q"]);
+        }));
+        assert!(!offered_after(|fx, lib| {
+            fx.file("p/vendor/acme/lib/fix.php", 1);
+            git(lib, &["add", "."]);
+            git(lib, &["commit", "-q", "-m", "local fix"]);
+            git(lib, &["reset", "-q", "--hard", "refs/remotes/origin/main"]);
+        }));
+    }
+
+    #[test]
+    fn a_clone_with_no_remote_branch_is_kept() {
+        assert!(!offered_after(|_, lib| {
+            git(lib, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        }));
+    }
+
+    #[test]
+    fn a_clone_with_grafts_is_kept() {
+        assert!(!offered_after(|_, lib| {
+            std::fs::create_dir_all(lib.join(".git/info")).unwrap();
+            std::fs::write(lib.join(".git/info/grafts"), "").unwrap();
+        }));
+    }
+
+    /// Git would report on another folder, so a clean status proves nothing.
+    #[test]
+    fn a_clone_pointing_git_at_another_folder_is_kept() {
+        assert!(!offered_after(|fx, lib| {
+            fx.file("p/vendor/acme/other/keep.txt", 1);
+            let other = fx.root.join("p/vendor/acme/other");
+            git(lib, &["config", "core.worktree", other.to_str().unwrap()]);
+        }));
+    }
+
+    #[test]
+    fn a_clone_reading_another_repos_refs_is_kept() {
+        assert!(!offered_after(|_, lib| {
+            std::fs::write(lib.join(".git/commondir"), "../../other/.git\n").unwrap();
+        }));
+    }
+
+    /// Git walks up past an invalid `.git` folder and reads the repo around it.
+    #[test]
+    fn a_broken_git_folder_is_kept() {
+        assert!(!offered_after(|_, lib| {
+            std::fs::remove_dir_all(lib.join(".git")).unwrap();
+            std::fs::create_dir(lib.join(".git")).unwrap();
+        }));
+    }
+
+    #[test]
+    fn an_unreadable_folder_keeps_the_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = Fixture::new(&[]);
+        repo(&fx, "p");
+        fx.file("p/dist/locked/a.js", 1);
+        fx.age("p", 60);
+        let locked = fx.root.join("p/dist/locked");
+        let mode = |m| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(&locked, mode(0o000)).unwrap();
+        let found = task().scan(&fx.ctx()).unwrap();
+        std::fs::set_permissions(&locked, mode(0o755)).unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn a_clone_that_changes_between_scan_and_removal_is_kept() {
+        let fx = Fixture::new(&[]);
+        let dir = vendored(&fx, "p");
+        fx.age("p", 60);
+        let ctx = fx.ctx();
+        let t = task();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/vendor"]);
+        fx.file("p/vendor/acme/lib/notes.txt", 1);
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(report.failed[0].1.contains("has uncommitted changes"));
+        assert!(dir.join("vendor/acme/lib/notes.txt").exists());
     }
 
     #[test]
