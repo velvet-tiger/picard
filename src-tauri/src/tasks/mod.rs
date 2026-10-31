@@ -168,9 +168,10 @@ impl IgnoreList {
     }
 }
 
-/// Agent config that tools such as Automatic rewrite on every sync. A change
-/// to these is not someone working on the project, so it never resets a
-/// project's idle time. Matched against each file and folder name at any depth.
+/// Agent config that tools such as Automatic rewrite on every sync, and files
+/// that JetBrains IDEs rewrite whenever a project is opened. A change to these
+/// is not someone working on the project, so it never resets a project's idle
+/// time. Matched against each file and folder name at any depth.
 /// The default for the config's `activity_ignore`, which can replace it.
 pub const NOT_ACTIVITY: &[&str] = &[
     ".agents",
@@ -180,9 +181,11 @@ pub const NOT_ACTIVITY: &[&str] = &[
     ".codex",
     ".cursor",
     ".gemini",
+    ".idea",
     ".junie",
     ".mcp.json",
     ".opencode",
+    ".phpstorm.meta.php",
     ".windsurf",
     "AGENTS.md",
     "CLAUDE.md",
@@ -658,6 +661,20 @@ mod tests {
     use super::test_support::Fixture;
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn not_activity_is_sorted_and_holds_the_ide_files() {
+        let mut sorted = NOT_ACTIVITY.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(NOT_ACTIVITY, sorted);
+        for name in [".idea", ".phpstorm.meta.php"] {
+            assert!(NOT_ACTIVITY.contains(&name), "{name}");
+        }
+        // A commit can change these, so they can be real work.
+        for name in [".vscode", ".gitignore"] {
+            assert!(!NOT_ACTIVITY.contains(&name), "{name}");
+        }
+    }
 
     #[test]
     fn allows_a_plain_folder_inside_the_root() {

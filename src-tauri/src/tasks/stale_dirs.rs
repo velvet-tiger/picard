@@ -419,6 +419,17 @@ mod tests {
         assert_eq!(found[0].reason, "untouched for 40 days");
     }
 
+    /// Opening a project in a JetBrains IDE rewrites these.
+    #[test]
+    fn ide_files_do_not_make_a_project_fresh() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 100, 60);
+        fx.file("p/.idea/workspace.xml", 1);
+        fx.file("p/.phpstorm.meta.php", 1);
+        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
+    }
+
     #[test]
     fn agent_config_rewrites_do_not_make_a_project_fresh() {
         let fx = Fixture::new(&[]);
