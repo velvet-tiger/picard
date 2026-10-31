@@ -147,7 +147,14 @@ describe('newTask', () => {
     first.dirs.push('out')
     const second = newTask('build_output')
     if (second.type !== 'build_output') throw new Error('expected a build_output task')
-    expect(second.dirs).toEqual(['dist', 'build', '.next', 'vendor'])
+    expect(second.dirs).toEqual([
+      'dist',
+      'build',
+      '.next',
+      'vendor',
+      '.terraform',
+      'storybook-static',
+    ])
   })
 })
 

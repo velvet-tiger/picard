@@ -234,7 +234,12 @@ export function newTask(type: TaskType): Task {
     case 'python_venv':
       return { type, enabled: true, stale_days: 30 }
     case 'build_output':
-      return { type, enabled: true, stale_days: 30, dirs: ['dist', 'build', '.next', 'vendor'] }
+      return {
+        type,
+        enabled: true,
+        stale_days: 30,
+        dirs: ['dist', 'build', '.next', 'vendor', '.terraform', 'storybook-static'],
+      }
     case 'tool_caches':
       return { type, enabled: true, uv: true, homebrew: true, simulators: true, bun: true }
     case 'command':

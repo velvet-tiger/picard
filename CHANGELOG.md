@@ -15,6 +15,7 @@ All notable changes to Picard are recorded here. The format follows
 
 ### Changed
 
+- `.terraform` and `storybook-static` are now on the default `dirs` list of `build_output`. A `dirs` list in your config replaces the defaults, so add them there to use them.
 - `.idea` and `.phpstorm.meta.php` are now on the default list of changes that do not count as work. A custom `activity_ignore` list is not changed.
 - The log starts a new file at 5 MB and keeps three old ones. It used to start again at 40 kB, which lost the history a bug report needs. Each `build_output` scan logs one summary line, and the line for each folder moved to debug level.
 

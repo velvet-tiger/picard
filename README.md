@@ -14,7 +14,7 @@ Picard only works inside the folders you list as **roots**, such as `~/working`.
 | `node_modules` | `node_modules` next to a `package.json` | The project has not changed for `stale_days`. |
 | `cargo_clean` | `target/` next to a `Cargo.toml` | The project has not changed for `stale_days`, or every project with `mode = "all"`. |
 | `python_venv` | `.venv` or `venv` holding a `pyvenv.cfg`, next to a `pyproject.toml`, `requirements.txt`, `setup.py`, `setup.cfg` or `Pipfile` | The project has not changed for `stale_days`. |
-| `build_output` | Folders named in `dirs` (`dist`, `build`, `.next`, `vendor` by default) | The project has not changed for `stale_days`, git ignores the folder, git tracks nothing inside it, and it holds no git repo of its own apart from clean clones in a package folder. Outside any git repo, only `.next` with a `BUILD_ID` file and `vendor` with a `composer/installed.json` file qualify. |
+| `build_output` | Folders named in `dirs` (`dist`, `build`, `.next`, `vendor`, `.terraform`, `storybook-static` by default) | The project has not changed for `stale_days`, git ignores the folder, git tracks nothing inside it, and it holds no git repo of its own apart from clean clones in a package folder. Outside any git repo, only `.next` with a `BUILD_ID` file and `vendor` with a `composer/installed.json` file qualify. |
 | `tool_caches` | Whatever each tool's own prune command removes | The tool is installed, switched on, and keeps its cache on the low drive. Off unless you add it. |
 | `command` | Whatever your script removes | It is enabled. |
 
@@ -181,9 +181,9 @@ type = "python_venv"
 stale_days = 30
 
 [[task]]
-type = "build_output"      # only folders git ignores and tracks nothing in
+type = "build_output"      # folders git ignores, or proven Next.js and Composer output
 stale_days = 30
-dirs = ["dist", "build", ".next", "vendor"]
+dirs = ["dist", "build", ".next", "vendor", ".terraform", "storybook-static"]
 
 [[task]]
 type = "tool_caches"       # not in the default config; add it to opt in

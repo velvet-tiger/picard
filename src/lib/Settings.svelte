@@ -471,10 +471,10 @@
                         .map((d) => d.trim())
                         .filter(Boolean))
                   }
-                  placeholder="dist, build, .next, vendor"
+                  placeholder="dist, build, .next, vendor, .terraform"
                 />
               </div>
-              <p class="muted">Only folders git ignores and tracks nothing in.</p>
+              <p class="muted">Only folders git ignores, or proven Next.js and Composer output.</p>
             {:else if task.type === 'tool_caches'}
               <p class="muted">Runs each tool's own prune command. Missing tools are skipped.</p>
               <label class="field check">
