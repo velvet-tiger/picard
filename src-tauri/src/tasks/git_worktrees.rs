@@ -110,7 +110,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
@@ -283,6 +283,9 @@ pub struct GitWorktrees {
     in_use: InUseSource,
     /// `REFLOG_COPY_LIMIT`, lowered in tests.
     reflog_copy_limit: usize,
+    /// Worktrees the latest scan found with their `.gitignore` deleted. The
+    /// scan already ran `status` in each, so `notices` need not run it again.
+    gitignore_lost: Mutex<Vec<PathBuf>>,
 }
 
 impl GitWorktrees {
@@ -293,6 +296,7 @@ impl GitWorktrees {
             min_idle,
             in_use,
             reflog_copy_limit: REFLOG_COPY_LIMIT,
+            gitignore_lost: Mutex::default(),
         }
     }
 
@@ -360,6 +364,12 @@ impl GitWorktrees {
         }
         if deletions_only(&status) {
             return Ok(Some(Tree::PartlyDeleted));
+        }
+        if lost_its_gitignore(&status) {
+            self.gitignore_lost
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(wt.path.clone());
         }
         log::debug!("worktree {}: has uncommitted changes", wt.path.display());
         Ok(None)
@@ -1115,6 +1125,19 @@ impl GitWorktrees {
     /// for a clean worktree, and only deleted files for a partly deleted one.
     /// The `.git` file must be there too. Without it, git run in the folder
     /// finds the enclosing repo and reports on that one instead.
+    /// Refuses removal if partly deleted `c` has changed within `stale_days`.
+    /// A deletion leaves no file to see, so the checks that look for writes
+    /// since the run started cannot catch one made after the scan.
+    fn stale_days_passed(&self, c: &Candidate, ctx: &Ctx) -> Result<(), String> {
+        let stale = Duration::from_secs(u64::from(self.stale_days) * SECS_PER_DAY);
+        let idle = last_change(&c.path, &ctx.not_activity)
+            .and_then(|newest| ctx.now.duration_since(newest).ok());
+        match idle {
+            Some(idle) if idle >= stale => Ok(()),
+            _ => Err("changed too recently, so it waits for stale_days".to_string()),
+        }
+    }
+
     fn status_allows_removal(&self, c: &Candidate) -> Result<(), String> {
         let status = self.git.output(&c.path, SAFETY_STATUS).map_err(err_text)?;
         if !is_partly_deleted(c) {
@@ -1146,6 +1169,8 @@ impl GitWorktrees {
         // stand in for git's own, which refuses every worktree with submodules.
         // Read before those checks: if submodules appear after it, plain
         // `worktree remove` refuses, so a late change cannot earn `--force`.
+        // A partly deleted worktree always gets `--force`, so it reads this
+        // again at the end.
         let stores = self.git.has_submodule_stores(&c.path).map_err(err_text)?;
         let partly_deleted = is_partly_deleted(c);
         if let Some(why) = self.git.unsafe_to_inspect(&c.path).map_err(err_text)? {
@@ -1154,6 +1179,9 @@ impl GitWorktrees {
         self.status_allows_removal(c)?;
         let repo = self.repo_of(&c.path).map_err(err_text)?;
         let wt = self.recheck(&repo, c, &canon)?;
+        if partly_deleted {
+            self.stale_days_passed(c, ctx)?;
+        }
         if self.written_during_run(c, ctx, stores)? {
             return Err("changed since the run started".to_string());
         }
@@ -1162,6 +1190,9 @@ impl GitWorktrees {
             // `--force` turns off git's own check for changes, so this is
             // the last thing that can see one. It runs as late as it can.
             self.status_allows_removal(c)?;
+            if self.git.has_submodule_stores(&c.path).map_err(err_text)? != stores {
+                return Err("its submodule repositories changed".to_string());
+            }
         }
         self.git
             .remove_worktree(&repo, &c.path, stores || partly_deleted)
@@ -1190,6 +1221,10 @@ impl CleanupTask for GitWorktrees {
     fn scan(&self, ctx: &Ctx) -> Result<Vec<Candidate>> {
         // Without a working in-use list nothing is safe to remove, so the scan fails.
         let in_use = (self.in_use)().context("checking which worktrees are in use")?;
+        self.gitignore_lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         let mut found = Vec::new();
         let repos = find_repos(ctx);
         for repo in &repos {
@@ -1253,16 +1288,24 @@ impl CleanupTask for GitWorktrees {
         report
     }
 
-    /// Broken worktrees in this volume's roots. Only reads. Each is reported
-    /// on the volume that holds it, so `ctx.roots` is searched, not
-    /// `ctx.search_roots`, which spans every volume.
+    /// Broken worktrees in this volume's roots, and worktrees the latest scan
+    /// found with their `.gitignore` deleted. Only reads. Each is reported on
+    /// the volume that holds it, so `ctx.roots` is searched, not
+    /// `ctx.search_roots`, which spans every volume. The scan already limited
+    /// the second kind to this volume.
     fn notices(&self, ctx: &Ctx) -> Vec<Notice> {
-        let found: Vec<(PathBuf, &str)> = folders_under(ctx, &ctx.roots)
+        let mut found: Vec<(PathBuf, &str)> = folders_under(ctx, &ctx.roots)
             .filter_map(|e| {
                 let message = broken_worktree(e.path())?;
                 Some((e.into_path(), message))
             })
             .collect();
+        let lost = self
+            .gitignore_lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        found.extend(lost.iter().map(|p| (p.clone(), GITIGNORE_LOST)));
+        drop(lost);
         let paths: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
         let sizes = ctx.measure_all(&paths);
         found
@@ -1394,6 +1437,24 @@ pub(super) fn written_since(dir: &Path, since: SystemTime, skip_build: bool) -> 
 /// is one entry.
 fn deletions_only(status: &str) -> bool {
     !status.is_empty() && status.lines().all(|line| line.starts_with(" D "))
+}
+
+/// What to tell the user about a worktree `lost_its_gitignore` matches.
+const GITIGNORE_LOST: &str = "partly deleted git worktree: its .gitignore is gone, so Picard cannot tell ignored files from new work. Picard will not remove it. Check it for work, then delete it yourself";
+
+/// True if `status`, from `SAFETY_STATUS`, shows the root `.gitignore` deleted,
+/// other tracked files deleted and at least one untracked entry. A removal
+/// that stops part way can leave this. With the `.gitignore` gone, ignored
+/// folders show as untracked, so `deletions_only` is false and the worktree is
+/// kept. Those entries could also be new work, so this only reports it.
+fn lost_its_gitignore(status: &str) -> bool {
+    let is_lost = |line: &str| line == " D .gitignore";
+    let is_untracked = |line: &str| line.starts_with("?? ");
+    status.lines().any(is_lost)
+        && status.lines().any(is_untracked)
+        && status
+            .lines()
+            .all(|line| line.starts_with(" D ") || is_untracked(line))
 }
 
 /// True if `c` was found partly deleted by a scan.
@@ -1870,6 +1931,115 @@ mod tests {
         std::fs::remove_file(wt.join("only-here")).unwrap();
         age(&fx, &wt, 60);
         assert!(task(14, vec![]).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    /// A deletion leaves no file behind, so only the wait can catch one made
+    /// after the scan.
+    #[test]
+    fn a_deletion_after_the_scan_restarts_the_wait() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        commit(&r, "second");
+        let wt = partly_deleted(&fx, &r, "half");
+        let t = task(14, vec![]);
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["half"]);
+        std::fs::remove_file(wt.join("second")).unwrap();
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(
+            report.failed[0].1,
+            "changed too recently, so it waits for stale_days"
+        );
+        assert!(wt.exists());
+    }
+
+    /// `--force` deletes the store with the worktree, unchecked.
+    #[test]
+    fn a_submodule_store_that_appears_late_stops_a_forced_removal() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = partly_deleted(&fx, &r, "half");
+        let armed = fx.dir.path().join("armed");
+        let store = r.join(".git/worktrees/half/modules/lib");
+        let make = format!("mkdir -p '{}'", store.display());
+        let used = InUse::from_cwds(vec![]);
+        let t = GitWorktrees::new(
+            git_with_hook(fx.dir.path(), "status", 2, &armed, &make),
+            14,
+            Duration::from_secs(30 * 60),
+            Arc::new(move || Ok(used.clone())),
+        );
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found), vec!["half"]);
+        std::fs::write(&armed, "").unwrap();
+        let report = t.run(&ctx, &found);
+        assert_eq!(report.failed[0].1, "its submodule repositories changed");
+        assert!(wt.exists());
+        assert!(store.exists());
+    }
+
+    /// A worktree with an ignored `target` and its `.gitignore` deleted, as a
+    /// removal that stopped part way can leave it.
+    fn lost_gitignore(fx: &Fixture, r: &Path) -> PathBuf {
+        std::fs::write(r.join(".gitignore"), "target/\n").unwrap();
+        git(r, &["add", "."]);
+        git(r, &["commit", "-qm", "ignore target"]);
+        let wt = worktree(r, "half");
+        std::fs::create_dir(wt.join("target")).unwrap();
+        std::fs::write(wt.join("target/out"), "built").unwrap();
+        std::fs::remove_file(wt.join(".gitignore")).unwrap();
+        age(fx, &wt, 60);
+        wt
+    }
+
+    #[test]
+    fn a_worktree_that_lost_its_gitignore_is_reported_and_never_a_candidate() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = lost_gitignore(&fx, &r);
+        let t = task(1, vec![]);
+        let ctx = fx.ctx();
+        assert!(t.scan(&ctx).unwrap().is_empty());
+        let notices = t.notices(&ctx);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].path, wt.canonicalize().unwrap());
+        assert!(notices[0].message.contains(".gitignore is gone"));
+        assert!(wt.exists());
+    }
+
+    /// The list belongs to the latest scan.
+    #[test]
+    fn a_fixed_worktree_leaves_the_notices_at_the_next_scan() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = lost_gitignore(&fx, &r);
+        let t = task(1, vec![]);
+        let ctx = fx.ctx();
+        t.scan(&ctx).unwrap();
+        std::fs::remove_dir_all(wt.join("target")).unwrap();
+        t.scan(&ctx).unwrap();
+        assert_eq!(t.notices(&ctx), vec![]);
+    }
+
+    #[test]
+    fn reads_a_lost_gitignore_from_status() {
+        assert!(lost_its_gitignore(" D .gitignore\n?? target/out\n"));
+        assert!(lost_its_gitignore(" D a\n D .gitignore\n?? b\n?? c\n"));
+        for other in [
+            "",
+            " D .gitignore\n",
+            "?? a\n",
+            " D a\n?? b\n",
+            " D sub/.gitignore\n?? b\n",
+            "D  .gitignore\n?? b\n",
+            " D .gitignore\n M a\n?? b\n",
+            " D .gitignore\nA  a\n?? b\n",
+        ] {
+            assert!(!lost_its_gitignore(other), "{other:?}");
+        }
     }
 
     #[test]
