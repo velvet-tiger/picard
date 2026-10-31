@@ -215,7 +215,7 @@ fn format_scan(name: &str, space: DiskSpace, scans: &[TaskScan]) -> String {
                         "  {:<13} {:>9}  {}  ({}){}\n",
                         s.task,
                         cand.size_text(),
-                        cand.path.display(),
+                        printable(&cand.path.display().to_string()),
                         cand.reason,
                         mark
                     ));
@@ -234,21 +234,21 @@ fn format_run(name: &str, run: &VolumeRun) -> String {
             "  removed  {:<13} {:>9}  {}\n",
             task,
             disk::format_bytes(r.bytes),
-            r.path.display()
+            printable(&r.path.display().to_string())
         ));
     }
     for (task, path, why) in &run.failed {
         out.push_str(&format!(
             "  FAILED   {:<13} {}: {why}\n",
             task,
-            path.display()
+            printable(&path.display().to_string())
         ));
     }
     for (task, path, why) in &run.skipped {
         out.push_str(&format!(
             "  skipped  {:<13} {}: {why}\n",
             task,
-            path.display()
+            printable(&path.display().to_string())
         ));
     }
     if let Some(why) = &run.stopped {
@@ -293,6 +293,45 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("total: 0 MB"), "{text}");
+    }
+
+    #[test]
+    fn every_listed_path_escapes_control_characters() {
+        let path = PathBuf::from("/w/a\u{1b}[2J");
+        let shown = r"/w/a\u{1b}[2J";
+        let scans = vec![TaskScan {
+            task: "node_modules",
+            result: Ok(vec![Candidate {
+                path: path.clone(),
+                bytes: 1,
+                reason: "old".into(),
+                estimate: Estimate::Exact,
+            }]),
+            ignored: Default::default(),
+            holds_ignored: Default::default(),
+            notices: Vec::new(),
+        }];
+        let space = DiskSpace {
+            free_bytes: 1,
+            total_bytes: 2,
+        };
+        let run = VolumeRun {
+            removed: vec![(
+                "node_modules",
+                Removed {
+                    path: path.clone(),
+                    bytes: 1,
+                },
+            )],
+            failed: vec![("node_modules", path.clone(), "busy".into())],
+            skipped: vec![("node_modules", path, "is ignored")],
+            stopped: None,
+        };
+        let scan = format_scan("Disk", space, &scans);
+        assert!(scan.contains(shown) && !scan.contains('\u{1b}'), "{scan:?}");
+        let text = format_run("Disk", &run);
+        assert_eq!(text.matches(shown).count(), 3, "{text:?}");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
     }
 
     #[test]

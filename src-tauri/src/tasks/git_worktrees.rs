@@ -181,6 +181,19 @@ enum Tree {
     /// Deleted tracked files and nothing else. The usual cause is a `git
     /// worktree remove` that stopped part way.
     PartlyDeleted,
+    /// The root `.gitignore` is deleted, and untracked entries show. See
+    /// `lost_its_gitignore`. It is reported, and never removed.
+    GitignoreLost,
+}
+
+/// What a scan decided about one worktree.
+#[derive(Debug, PartialEq)]
+enum Assessed {
+    /// It can be removed, for this reason.
+    Candidate(String),
+    /// It stays, and a person should look at it.
+    GitignoreLost,
+    Kept,
 }
 
 impl Standing {
@@ -190,6 +203,7 @@ impl Standing {
         match (tree, self) {
             (Tree::Clean, standing) | (_, standing @ Standing::Unsafe) => standing,
             (Tree::PartlyDeleted, _) => Standing::Elsewhere(Wait::PartlyDeleted),
+            (Tree::GitignoreLost, _) => Standing::Unsafe,
         }
     }
 }
@@ -285,6 +299,8 @@ pub struct GitWorktrees {
     reflog_copy_limit: usize,
     /// Worktrees the latest scan found with their `.gitignore` deleted. The
     /// scan already ran `status` in each, so `notices` need not run it again.
+    /// `CleanupTask` calls them separately, through a shared reference, so
+    /// the list needs the lock.
     gitignore_lost: Mutex<Vec<PathBuf>>,
 }
 
@@ -314,13 +330,17 @@ impl GitWorktrees {
         wt: &WorktreeEntry,
         ctx: &Ctx,
         in_use: &InUse,
-    ) -> Result<Option<String>> {
-        let Some(tree) = self.inspectable(state, wt, ctx, in_use)? else {
-            return Ok(None);
+    ) -> Result<Assessed> {
+        let tree = match self.inspectable(state, wt, ctx, in_use)? {
+            Some(Tree::GitignoreLost) => return Ok(Assessed::GitignoreLost),
+            Some(tree) => tree,
+            None => return Ok(Assessed::Kept),
         };
         // `standing` logs why a worktree is unsafe.
         let standing = self.standing(repo, state, wt)?.with_tree(tree);
-        Ok(self.reason(&standing, wt, ctx))
+        Ok(self
+            .reason(&standing, wt, ctx)
+            .map_or(Assessed::Kept, Assessed::Candidate))
     }
 
     /// What is in the worktree, if nothing about the worktree itself rules
@@ -366,10 +386,7 @@ impl GitWorktrees {
             return Ok(Some(Tree::PartlyDeleted));
         }
         if lost_its_gitignore(&status) {
-            self.gitignore_lost
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(wt.path.clone());
+            return Ok(Some(Tree::GitignoreLost));
         }
         log::debug!("worktree {}: has uncommitted changes", wt.path.display());
         Ok(None)
@@ -1029,7 +1046,14 @@ impl GitWorktrees {
         })
     }
 
-    fn scan_repo(&self, repo: &Path, ctx: &Ctx, in_use: &InUse) -> Result<Vec<(PathBuf, String)>> {
+    /// The candidates in `repo`. Adds worktrees that need a person to `lost`.
+    fn scan_repo(
+        &self,
+        repo: &Path,
+        ctx: &Ctx,
+        in_use: &InUse,
+        lost: &mut Vec<PathBuf>,
+    ) -> Result<Vec<(PathBuf, String)>> {
         let worktrees = self.worktrees(repo)?;
         let state = self.repo_state(repo, &worktrees)?;
         let mut found = Vec::new();
@@ -1038,8 +1062,9 @@ impl GitWorktrees {
                 break;
             }
             match self.assess(repo, &state, wt, ctx, in_use) {
-                Ok(Some(reason)) => found.push((wt.path.clone(), reason)),
-                Ok(None) => {}
+                Ok(Assessed::Candidate(reason)) => found.push((wt.path.clone(), reason)),
+                Ok(Assessed::GitignoreLost) => lost.push(wt.path.clone()),
+                Ok(Assessed::Kept) => {}
                 Err(e) => log::warn!("worktree {}: {e:#}", wt.path.display()),
             }
         }
@@ -1121,10 +1146,6 @@ impl GitWorktrees {
         Ok(())
     }
 
-    /// Refuses removal if `c`'s status is not what its kind allows: nothing
-    /// for a clean worktree, and only deleted files for a partly deleted one.
-    /// The `.git` file must be there too. Without it, git run in the folder
-    /// finds the enclosing repo and reports on that one instead.
     /// Refuses removal if partly deleted `c` has changed within `stale_days`.
     /// A deletion leaves no file to see, so the checks that look for writes
     /// since the run started cannot catch one made after the scan.
@@ -1138,6 +1159,10 @@ impl GitWorktrees {
         }
     }
 
+    /// Refuses removal if `c`'s status is not what its kind allows: nothing
+    /// for a clean worktree, and only deleted files for a partly deleted one.
+    /// The `.git` file must be there too. Without it, git run in the folder
+    /// finds the enclosing repo and reports on that one instead.
     fn status_allows_removal(&self, c: &Candidate) -> Result<(), String> {
         let status = self.git.output(&c.path, SAFETY_STATUS).map_err(err_text)?;
         if !is_partly_deleted(c) {
@@ -1219,23 +1244,29 @@ impl CleanupTask for GitWorktrees {
     }
 
     fn scan(&self, ctx: &Ctx) -> Result<Vec<Candidate>> {
-        // Without a working in-use list nothing is safe to remove, so the scan fails.
-        let in_use = (self.in_use)().context("checking which worktrees are in use")?;
+        // Cleared first, so a scan that fails cannot show the last one's list.
         self.gitignore_lost
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        // Without a working in-use list nothing is safe to remove, so the scan fails.
+        let in_use = (self.in_use)().context("checking which worktrees are in use")?;
+        let mut lost = Vec::new();
         let mut found = Vec::new();
         let repos = find_repos(ctx);
         for repo in &repos {
             if ctx.stopped() {
                 break;
             }
-            match self.scan_repo(repo, ctx, &in_use) {
+            match self.scan_repo(repo, ctx, &in_use, &mut lost) {
                 Ok(mut f) => found.append(&mut f),
                 Err(e) => log::warn!("{}: {e:#}", repo.display()),
             }
         }
+        *self
+            .gitignore_lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = lost;
         // Per-worktree reasons for skipping are at debug level; with many
         // worktrees they would otherwise flood the log on every scan.
         log::info!(
@@ -2055,6 +2086,33 @@ mod tests {
         t.scan(&ctx).unwrap();
         std::fs::remove_dir_all(wt.join("target")).unwrap();
         t.scan(&ctx).unwrap();
+        assert_eq!(t.notices(&ctx), vec![]);
+    }
+
+    #[test]
+    fn a_failed_scan_shows_no_notices_from_the_scan_before_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        lost_gitignore(&fx, &r);
+        let broken = Arc::new(AtomicBool::new(false));
+        let lsof_broken = Arc::clone(&broken);
+        let t = GitWorktrees::new(
+            GitCmd::default(),
+            1,
+            Duration::from_secs(30 * 60),
+            Arc::new(move || {
+                if lsof_broken.load(Ordering::SeqCst) {
+                    anyhow::bail!("lsof broke");
+                }
+                Ok(InUse::from_cwds(vec![]))
+            }),
+        );
+        let ctx = fx.ctx();
+        t.scan(&ctx).unwrap();
+        assert_eq!(t.notices(&ctx).len(), 1);
+        broken.store(true, Ordering::SeqCst);
+        assert!(t.scan(&ctx).is_err());
         assert_eq!(t.notices(&ctx), vec![]);
     }
 

@@ -76,7 +76,7 @@ Some package managers install real git clones, such as Composer with `--prefer-s
 - Its own repo config defines no filters, and it has no submodules.
 - It has no linked worktrees of its own, and no merge, rebase or similar is paused in it.
 - `git status` is clean, and no file is marked skip-worktree or assume-unchanged, because `status` does not check those.
-- Every commit, stash and reflog entry was fetched from a remote. Only the refs that a configured remote's fetch refspec writes count, and that remote's URLs must all be on the network. A local path, a `file:` URL or a ref made by hand does not count.
+- Every commit, stash and reflog entry was fetched from a remote. Only the refs that a configured remote's fetch refspec writes count, and that remote's URLs must all be on the network. A local path or a `file:` URL does not count. A ref made by hand does not count alone, but a repo that also forges its remote config cannot be detected offline.
 
 Picard works offline, so this shows what the last fetch saw. If a branch was deleted or force-pushed on the remote since then, its commits may exist nowhere else, and Picard cannot tell. Submodules work the same way, except that any remote-tracking ref counts there.
 

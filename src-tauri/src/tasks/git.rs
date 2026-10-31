@@ -711,8 +711,10 @@ impl GitCmd {
     /// work, if it would. It works like `store_problem`, but a ref counts only
     /// when the fetch refspec of a configured remote writes it, and that
     /// remote's URLs are all on the network. A local path can vanish with
-    /// the folder, and `git update-ref` can make any ref by hand. The limit
-    /// described at `store_problem` still applies: nothing here is fetched.
+    /// the folder, and a ref made by hand with `git update-ref` does not count
+    /// alone. A repo that also forges its remote config cannot be detected
+    /// offline. The limit described at `store_problem` still applies: nothing
+    /// here is fetched.
     fn clone_store_problem(&self, git_dir: &Path) -> Result<Option<String>> {
         if std::fs::symlink_metadata(git_dir.join("modules")).is_ok() {
             return Ok(Some("has submodules of its own".to_string()));
