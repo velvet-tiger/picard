@@ -20,7 +20,7 @@ use crate::disk;
 use crate::env::ToolEnv;
 use crate::history::{self, Entry};
 use crate::tasks::{
-    self, Candidate, CleanupTask, Ctx, IgnoreList, Protected, Removed, SizeCache, Stop,
+    self, Candidate, CleanupTask, Ctx, IgnoreList, Notice, Protected, Removed, SizeCache, Stop,
 };
 use crate::volume::Volume;
 
@@ -115,6 +115,8 @@ pub struct TaskScan {
     /// The candidate paths in `result` that hold an ignored folder, such as a
     /// worktree with an ignored `node_modules`. No run removes them either.
     pub holds_ignored: HashSet<PathBuf>,
+    /// What a person should look at. See `Notice`.
+    pub notices: Vec<Notice>,
 }
 
 impl TaskScan {
@@ -158,6 +160,7 @@ pub fn preview(tasks: &[Box<dyn CleanupTask>], ctx: &Ctx, ignore: &IgnoreList) -
                 result,
                 ignored,
                 holds_ignored,
+                notices: t.notices(ctx),
             }
         })
         .collect()

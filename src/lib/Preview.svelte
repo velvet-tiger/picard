@@ -781,6 +781,7 @@
     <p class="muted">No mounted volumes hold a configured root.</p>
   {:else}
     {#each volumes as v, vi}
+      {@const notices = v.tasks.flatMap((t) => t.notices ?? [])}
       <div class="panel">
         <div class="row">
           <h2>{v.name}</h2>
@@ -789,6 +790,22 @@
           <span class="spacer"></span>
           <span class="muted">up to {formatBytes(volumeTotal(v))}</span>
         </div>
+        {#if notices.length > 0}
+          <section class="notices" aria-label="Needs you">
+            <h3>Needs you</h3>
+            <ul>
+              {#each notices as n}
+                <li class="notice">
+                  <span class="text">
+                    <span class="title" title={tildePath(n.path)}>{shortPath(n.path)}</span>
+                    <span class="reason">{n.message}</span>
+                  </span>
+                  <span class="size">{n.size_text}</span>
+                </li>
+              {/each}
+            </ul>
+          </section>
+        {/if}
         {#each v.tasks as t, ti}
           {@const tk = key(v.mount, t.task)}
           {@const label = TASK_LABELS[t.task] ?? t.task}
@@ -946,6 +963,19 @@
     --task-gap: 6px;
   }
   /* chevron | checkbox and name | summary when closed */
+  .notices h3 {
+    margin: 0;
+  }
+  .notice {
+    display: flex;
+    gap: 8px;
+  }
+  .notice .text {
+    flex: 1;
+  }
+  .notice .reason {
+    margin-left: 0;
+  }
   .task {
     display: flex;
     align-items: center;

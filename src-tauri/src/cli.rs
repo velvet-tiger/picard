@@ -176,6 +176,14 @@ fn format_scan(name: &str, space: DiskSpace, scans: &[TaskScan]) -> String {
     let mut out = format!("{name}: {}\n", disk::format_free(space));
     let mut total = 0;
     for s in scans {
+        for n in &s.notices {
+            out.push_str(&format!(
+                "  needs you     {:>9}  {}  ({})\n",
+                disk::format_bytes(n.bytes),
+                n.path.display(),
+                n.message
+            ));
+        }
         match &s.result {
             Err(e) => out.push_str(&format!("  {}: scan failed: {e}\n", s.task)),
             Ok(c) if c.is_empty() => out.push_str(&format!("  {}: nothing to remove\n", s.task)),
@@ -242,10 +250,35 @@ fn format_run(name: &str, run: &VolumeRun) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::{Candidate, Estimate, Removed};
+    use crate::tasks::{Candidate, Estimate, Notice, Removed};
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn scan_shows_notices_and_leaves_them_out_of_the_total() {
+        let scans = vec![TaskScan {
+            task: "git_worktrees",
+            result: Ok(vec![]),
+            ignored: Default::default(),
+            holds_ignored: Default::default(),
+            notices: vec![Notice {
+                path: PathBuf::from("/w/stuck"),
+                bytes: 3_000_000_000,
+                message: "broken git worktree".into(),
+            }],
+        }];
+        let space = DiskSpace {
+            free_bytes: 1,
+            total_bytes: 2,
+        };
+        let text = format_scan("Disk", space, &scans);
+        assert!(
+            text.contains("needs you        3.0 GB  /w/stuck  (broken git worktree)"),
+            "{text}"
+        );
+        assert!(text.contains("total: 0 MB"), "{text}");
     }
 
     #[test]
@@ -296,6 +329,7 @@ mod tests {
                 ]),
                 ignored: [PathBuf::from("/w/b/node_modules")].into_iter().collect(),
                 holds_ignored: Default::default(),
+                notices: Vec::new(),
             },
             TaskScan {
                 task: "command",
@@ -307,12 +341,14 @@ mod tests {
                 }]),
                 ignored: Default::default(),
                 holds_ignored: Default::default(),
+                notices: Vec::new(),
             },
             TaskScan {
                 task: "cargo_clean",
                 result: Ok(vec![]),
                 ignored: Default::default(),
                 holds_ignored: Default::default(),
+                notices: Vec::new(),
             },
         ];
         let text = format_scan(

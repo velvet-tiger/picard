@@ -91,6 +91,11 @@
 //! `stale_days`, and the folder mtimes that record a deletion count towards
 //! its idle time. Its reason starts with "partly deleted".
 //!
+//! Picard also looks for broken worktrees: folders whose `.git` file names a
+//! worktree record that no longer exists. A failed removal leaves one. Git
+//! cannot run there and no longer lists it, so nothing shows whether work
+//! would be lost. They are reported as notices, and nothing ever removes them.
+//!
 //! Each candidate is judged again just before removal, with the repo's
 //! worktrees and branches read afresh. One found done must still be done.
 //! Its HEAD is read once more right before `git worktree remove`, and a HEAD
@@ -103,6 +108,7 @@
 //! never deleted.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -113,12 +119,16 @@ use walkdir::WalkDir;
 use super::git::{GitCmd, SAFETY_STATUS, WorktreeEntry, parse_worktree_list};
 use super::in_use::InUse;
 use super::stale_dirs::{FINDER_METADATA, is_file, is_skipped, newest_mtime};
-use super::{Candidate, CleanupTask, Ctx, Estimate, Removed, Report, check_target};
+use super::{Candidate, CleanupTask, Ctx, Estimate, Notice, Removed, Report, check_target};
 
 /// Folders never descended into while looking for repos.
 const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git"];
 const SEARCH_DEPTH: usize = 8;
 const SECS_PER_DAY: u64 = 86_400;
+
+/// The largest `.git` file Picard reads. Git writes one line holding a path,
+/// so anything larger is not one of git's.
+const GIT_FILE_LIMIT: u64 = 16 * 1024;
 
 /// Supplies the in-use list. `lsof` in the app, a fixed list in tests.
 pub type InUseSource = Arc<dyn Fn() -> Result<InUse> + Send + Sync>;
@@ -1234,39 +1244,114 @@ impl CleanupTask for GitWorktrees {
         }
         report
     }
+
+    /// Broken worktrees in this volume's roots. Only reads. Each is reported
+    /// on the volume that holds it, so `ctx.roots` is searched, not
+    /// `ctx.search_roots`, which spans every volume.
+    fn notices(&self, ctx: &Ctx) -> Vec<Notice> {
+        let found: Vec<(PathBuf, &str)> = folders_under(ctx, &ctx.roots)
+            .filter_map(|e| {
+                let message = broken_worktree(e.path())?;
+                Some((e.into_path(), message))
+            })
+            .collect();
+        let paths: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
+        let sizes = ctx.measure_all(&paths);
+        found
+            .into_iter()
+            .zip(sizes)
+            .map(|((path, message), bytes)| Notice {
+                path,
+                bytes,
+                message: message.to_string(),
+            })
+            .collect()
+    }
+}
+
+/// The folders under `roots` that are worth searching for checkouts, until
+/// the scan stops. Never follows symlinks.
+fn folders_under<'a>(
+    ctx: &'a Ctx,
+    roots: &'a [PathBuf],
+) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
+    roots
+        .iter()
+        .flat_map(move |root| {
+            WalkDir::new(root)
+                .follow_links(false)
+                .max_depth(SEARCH_DEPTH)
+                .into_iter()
+                .filter_entry(move |e| {
+                    e.depth() == 0
+                        || (e.file_type().is_dir()
+                            && !e
+                                .file_name()
+                                .to_str()
+                                .is_some_and(|n| SKIP_DIRS.contains(&n))
+                            && !ctx.exclude.is_match(e.path()))
+                })
+                .filter_map(|e| e.ok())
+        })
+        .take_while(move |_| !ctx.stopped())
 }
 
 /// Main repos (folders holding a `.git` directory) under the search roots.
 /// Linked worktrees hold a `.git` file instead and are reached through their repo.
 fn find_repos(ctx: &Ctx) -> Vec<PathBuf> {
-    let mut repos = Vec::new();
-    for root in &ctx.search_roots {
-        let walker = WalkDir::new(root)
-            .follow_links(false)
-            .max_depth(SEARCH_DEPTH)
-            .into_iter()
-            .filter_entry(|e| {
-                e.depth() == 0
-                    || (e.file_type().is_dir()
-                        && !e
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|n| SKIP_DIRS.contains(&n))
-                        && !ctx.exclude.is_match(e.path()))
-            });
-        for entry in walker.filter_map(|e| e.ok()) {
-            if ctx.stopped() {
-                break;
-            }
-            let dot_git = entry.path().join(".git");
-            if std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_dir()) {
-                repos.push(entry.path().to_path_buf());
-            }
-        }
-    }
+    let mut repos: Vec<PathBuf> = folders_under(ctx, &ctx.search_roots)
+        .filter(|e| std::fs::symlink_metadata(e.path().join(".git")).is_ok_and(|m| m.is_dir()))
+        .map(walkdir::DirEntry::into_path)
+        .collect();
     repos.sort();
     repos.dedup();
     repos
+}
+
+/// What to tell the user about `folder` if it is a broken worktree: its `.git`
+/// file names a worktree record that does not exist. A folder that merely
+/// cannot be read is not reported. The file is only read, and the paths it
+/// names are only checked for existence, so a hostile one can do no harm.
+fn broken_worktree(folder: &Path) -> Option<&'static str> {
+    let contents = read_small_file(&folder.join(".git"), GIT_FILE_LIMIT).ok()??;
+    let record = worktree_record(folder, &contents)?;
+    match std::fs::symlink_metadata(&record) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return None,
+    }
+    // `<git dir>/worktrees/<id>`, so two levels up is the repo's git dir.
+    let git_dir = record.parent()?.parent()?;
+    Some(if std::fs::symlink_metadata(git_dir).is_ok() {
+        "broken git worktree: its repo no longer lists it. Picard will not remove it. Check it for work, then delete it yourself"
+    } else {
+        "broken git worktree: its repo is gone. Picard will not remove it. Check it for work, then delete it yourself"
+    })
+}
+
+/// The path a `.git` file names, if the file has the form a linked worktree's
+/// does: `gitdir: <git dir>/worktrees/<id>`, with one id. A relative path
+/// starts at `folder`. The contents are untrusted, so anything else gives None.
+fn worktree_record(folder: &Path, contents: &[u8]) -> Option<PathBuf> {
+    let line = std::str::from_utf8(contents).ok()?.strip_suffix('\n')?;
+    let target = Path::new(line.strip_prefix("gitdir: ")?);
+    if line.contains('\n') || target.file_name().is_none() || is_submodule_repo(target) {
+        return None;
+    }
+    let parent = target.parent()?;
+    (parent.file_name() == Some(OsStr::new("worktrees"))).then(|| folder.join(target))
+}
+
+/// True if `git_path` is inside `<git dir>/modules`, where git keeps submodule
+/// repositories. A submodule can be called `worktrees/x`, so its `.git` file
+/// can look like a worktree's. A repo in a folder called `modules` is not one
+/// of these, because that folder comes before the git dir.
+fn is_submodule_repo(git_path: &Path) -> bool {
+    let is_git_dir = |c: &OsStr| c.to_str().is_some_and(|n| n.ends_with(".git"));
+    git_path
+        .components()
+        .map(|c| c.as_os_str())
+        .skip_while(|c| !is_git_dir(c))
+        .any(|c| c == "modules")
 }
 
 /// True if any file under `dir` was modified after `since`, or if any part
@@ -1849,6 +1934,134 @@ mod tests {
             std::fs::read_to_string(wt.join("README")).unwrap(),
             "edited\n"
         );
+    }
+
+    /// A worktree at `repo/.claude/worktrees/<name>` that its repo no longer
+    /// knows, as a failed removal leaves it.
+    fn broken(fx: &Fixture, r: &Path, name: &str) -> PathBuf {
+        let wt = worktree(r, name);
+        fx.file(&format!("repo/.claude/worktrees/{name}/target/out"), 5_000);
+        std::fs::remove_dir_all(r.join(".git/worktrees").join(name)).unwrap();
+        wt
+    }
+
+    #[test]
+    fn a_broken_worktree_is_reported_and_never_a_candidate() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = broken(&fx, &r, "stuck");
+        age(&fx, &wt, 60);
+        let t = task(1, vec![]);
+        let ctx = fx.ctx();
+        assert!(t.scan(&ctx).unwrap().is_empty());
+        let notices = t.notices(&ctx);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].path, wt.canonicalize().unwrap());
+        assert!(notices[0].bytes >= 5_000, "{}", notices[0].bytes);
+        assert!(notices[0].message.contains("no longer lists it"));
+    }
+
+    #[test]
+    fn a_broken_worktree_of_a_deleted_repo_says_the_repo_is_gone() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let wt = worktree(&r, "orphan");
+        let moved = fx.root.join("orphan");
+        std::fs::rename(&wt, &moved).unwrap();
+        std::fs::remove_dir_all(&r).unwrap();
+        let notices = task(1, vec![]).notices(&fx.ctx());
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].path, moved.canonicalize().unwrap());
+        assert!(notices[0].message.contains("its repo is gone"));
+    }
+
+    #[test]
+    fn a_relative_git_file_is_read_from_its_own_folder() {
+        let fx = Fixture::new(&[]);
+        fx.file("wt/a", 1);
+        std::fs::write(fx.root.join("wt/.git"), "gitdir: ../r/.git/worktrees/wt\n").unwrap();
+        assert_eq!(task(1, vec![]).notices(&fx.ctx()).len(), 1);
+    }
+
+    #[test]
+    fn healthy_checkouts_and_submodules_are_not_broken_worktrees() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        worktree(&r, "fine");
+        // A submodule whose name makes its `.git` file look like a worktree's.
+        for line in [
+            "gitdir: ../.git/modules/worktrees/lib\n",
+            "gitdir: /gone/s.git/modules/worktrees/lib\n",
+        ] {
+            fx.file("repo/sub/a", 1);
+            std::fs::write(fx.root.join("repo/sub/.git"), line).unwrap();
+            assert_eq!(task(1, vec![]).notices(&fx.ctx()), vec![], "{line}");
+        }
+    }
+
+    #[test]
+    fn a_repo_in_a_folder_called_modules_can_have_a_broken_worktree() {
+        let wt = Path::new("/w");
+        assert_eq!(
+            worktree_record(wt, b"gitdir: /x/modules/r/.git/worktrees/a\n"),
+            Some(PathBuf::from("/x/modules/r/.git/worktrees/a"))
+        );
+    }
+
+    #[test]
+    fn reads_only_the_exact_form_of_a_worktree_git_file() {
+        let wt = Path::new("/w");
+        for bad in [
+            &b""[..],
+            b"gitdir: /r/.git/worktrees/a",
+            b"gitdir: /r/.git/worktrees/\n",
+            b"gitdir: /r/.git/worktrees/..\n",
+            b"gitdir: /r/.git/worktrees/a/b\n",
+            b"gitdir: /r/.git\n",
+            b"gitdir: \n",
+            b"gitdir: /r/.git/worktrees/a\nmore\n",
+            b"gitdir:/r/.git/worktrees/a\n",
+            b"nonsense /r/.git/worktrees/a\n",
+            b"gitdir: /r/\xff/worktrees/a\n",
+        ] {
+            assert_eq!(worktree_record(wt, bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_symlinked_git_file_is_not_followed() {
+        let fx = Fixture::new(&[]);
+        fx.file("wt/a", 1);
+        let bait = fx.file("bait", 1);
+        std::fs::write(&bait, "gitdir: /gone/.git/worktrees/a\n").unwrap();
+        std::os::unix::fs::symlink(&bait, fx.root.join("wt/.git")).unwrap();
+        assert_eq!(task(1, vec![]).notices(&fx.ctx()), vec![]);
+    }
+
+    #[test]
+    fn a_git_file_past_the_limit_is_not_read() {
+        let fx = Fixture::new(&[]);
+        fx.file("wt/a", 1);
+        let long = format!("gitdir: /gone/.git/worktrees/{}\n", "a".repeat(20_000));
+        std::fs::write(fx.root.join("wt/.git"), long).unwrap();
+        assert_eq!(task(1, vec![]).notices(&fx.ctx()), vec![]);
+    }
+
+    #[test]
+    fn the_search_for_broken_worktrees_keeps_the_walk_limits() {
+        let fx = Fixture::new(&["**/private/**"]);
+        let gone = "gitdir: /gone/.git/worktrees/a\n";
+        let deep = format!("{}wt/.git", "d/".repeat(SEARCH_DEPTH));
+        for path in [
+            "node_modules/x/.git",
+            "target/.git",
+            "private/x/.git",
+            &deep,
+        ] {
+            fx.file(path, 1);
+            std::fs::write(fx.root.join(path), gone).unwrap();
+        }
+        assert_eq!(task(1, vec![]).notices(&fx.ctx()), vec![]);
     }
 
     /// A worktree found clean must never earn `--force` from a later deletion.

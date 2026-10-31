@@ -65,11 +65,21 @@ pub struct PreviewItem {
     pub holds_ignored: bool,
 }
 
+/// See `tasks::Notice`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewNotice {
+    pub path: String,
+    pub size_text: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PreviewTask {
     pub task: String,
     pub items: Vec<PreviewItem>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<PreviewNotice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -508,27 +518,40 @@ pub(crate) fn preview_view(
 ) -> VolumePreview {
     let tasks: Vec<PreviewTask> = scans
         .iter()
-        .map(|s| match &s.result {
-            Ok(cands) => PreviewTask {
-                task: s.task.to_string(),
-                items: cands
-                    .iter()
-                    .map(|c| PreviewItem {
-                        path: c.path.display().to_string(),
-                        bytes: c.bytes,
-                        size_text: c.size_text(),
-                        reason: c.reason.clone(),
-                        ignored: s.ignored.contains(&c.path),
-                        holds_ignored: s.holds_ignored.contains(&c.path),
-                    })
-                    .collect(),
-                error: None,
-            },
-            Err(e) => PreviewTask {
-                task: s.task.to_string(),
-                items: Vec::new(),
-                error: Some(e.clone()),
-            },
+        .map(|s| {
+            let notices = s
+                .notices
+                .iter()
+                .map(|n| PreviewNotice {
+                    path: n.path.display().to_string(),
+                    size_text: disk::format_bytes(n.bytes),
+                    message: n.message.clone(),
+                })
+                .collect();
+            match &s.result {
+                Ok(cands) => PreviewTask {
+                    task: s.task.to_string(),
+                    items: cands
+                        .iter()
+                        .map(|c| PreviewItem {
+                            path: c.path.display().to_string(),
+                            bytes: c.bytes,
+                            size_text: c.size_text(),
+                            reason: c.reason.clone(),
+                            ignored: s.ignored.contains(&c.path),
+                            holds_ignored: s.holds_ignored.contains(&c.path),
+                        })
+                        .collect(),
+                    error: None,
+                    notices,
+                },
+                Err(e) => PreviewTask {
+                    task: s.task.to_string(),
+                    items: Vec::new(),
+                    error: Some(e.clone()),
+                    notices,
+                },
+            }
         })
         .collect();
     let total_bytes = scans.iter().map(TaskScan::cleanable_bytes).sum();
@@ -593,7 +616,7 @@ fn run_view(name: &str, result: Result<VolumeRun, String>) -> RunResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::{Candidate, Estimate, Removed};
+    use crate::tasks::{Candidate, Estimate, Notice, Removed};
 
     #[test]
     fn not_activity_lists_the_default_names() {
@@ -617,6 +640,47 @@ mod tests {
         free_bytes: 20_000_000_000,
         total_bytes: 994_000_000_000,
     };
+
+    #[test]
+    fn preview_shows_notices_even_when_the_scan_failed_and_never_counts_them() {
+        let notice = Notice {
+            path: PathBuf::from("/w/stuck"),
+            bytes: 3_000_000_000,
+            message: "broken".into(),
+        };
+        let scan = |result| TaskScan {
+            task: "git_worktrees",
+            result,
+            ignored: Default::default(),
+            holds_ignored: Default::default(),
+            notices: vec![notice.clone()],
+        };
+        for s in [scan(Ok(vec![])), scan(Err("lsof broke".into()))] {
+            let view = preview_view(&volume(), SPACE, &[s], Utc::now());
+            assert_eq!(view.total_bytes, 0);
+            assert_eq!(
+                view.tasks[0].notices,
+                vec![PreviewNotice {
+                    path: "/w/stuck".into(),
+                    size_text: "3.0 GB".into(),
+                    message: "broken".into(),
+                }]
+            );
+        }
+    }
+
+    /// api.ts reads a missing `notices` as none, so the key stays optional.
+    #[test]
+    fn a_task_with_no_notices_sends_no_notices_key() {
+        let task = PreviewTask {
+            task: "x".into(),
+            items: vec![],
+            error: None,
+            notices: vec![],
+        };
+        let json = serde_json::to_value(&task).unwrap();
+        assert!(json.get("notices").is_none(), "{json}");
+    }
 
     #[test]
     fn preview_groups_by_task_with_total_and_errors_leaving_out_ignored_items() {
@@ -645,6 +709,7 @@ mod tests {
                 ]),
                 ignored: [PathBuf::from("/w/c/node_modules")].into_iter().collect(),
                 holds_ignored: Default::default(),
+                notices: Vec::new(),
             },
             TaskScan {
                 task: "tool_caches",
@@ -656,12 +721,14 @@ mod tests {
                 }]),
                 ignored: Default::default(),
                 holds_ignored: Default::default(),
+                notices: Vec::new(),
             },
             TaskScan {
                 task: "git_worktrees",
                 result: Err("lsof broke".into()),
                 ignored: Default::default(),
                 holds_ignored: Default::default(),
+                notices: Vec::new(),
             },
         ];
         let view = preview_view(&volume(), SPACE, &scans, Utc::now());

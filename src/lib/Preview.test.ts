@@ -1238,4 +1238,49 @@ describe('Preview', () => {
       )
     })
   })
+
+  describe('notices', () => {
+    const STUCK = '/Users/a/w/shop/.claude/worktrees/stuck'
+
+    /** The usual scan, with a broken worktree on the worktrees task. */
+    function withNotice(): VolumePreview[] {
+      const found = volumes()
+      found[0].tasks[1].notices = [
+        { path: STUCK, size_text: '3 GB', message: 'broken git worktree: its repo is gone' },
+      ]
+      return found
+    }
+
+    it('shows nothing when no task has a notice', async () => {
+      backend()
+      await renderScanned()
+      expect(screen.queryByRole('region', { name: 'Needs you' })).toBeNull()
+    })
+
+    it('lists each notice with its path, size and message', async () => {
+      backend({ preview: () => withNotice() })
+      await renderScanned()
+      const region = screen.getByRole('region', { name: 'Needs you' })
+      expect(within(region).getByText(/stuck/)).toBeInTheDocument()
+      expect(within(region).getByText('3 GB')).toBeInTheDocument()
+      expect(within(region).getByText('broken git worktree: its repo is gone')).toBeInTheDocument()
+    })
+
+    it('shows a notice when the category holding it starts closed', async () => {
+      const found = withNotice()
+      found[0].tasks[1].items = []
+      backend({ preview: () => found })
+      await renderScanned()
+      expect(screen.getByRole('region', { name: 'Needs you' })).toBeInTheDocument()
+    })
+
+    it('offers no way to tick or clean a notice, and leaves it out of the total', async () => {
+      backend({ preview: () => withNotice() })
+      await renderScanned()
+      const region = screen.getByRole('region', { name: 'Needs you' })
+      expect(within(region).queryByRole('checkbox')).toBeNull()
+      expect(within(region).queryByRole('button')).toBeNull()
+      expect(screen.getByText(/^up to 3\.5 GB/)).toBeInTheDocument()
+    })
+  })
 })

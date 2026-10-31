@@ -58,10 +58,19 @@ export interface PreviewItem {
   holds_ignored: boolean
 }
 
+/** Something only a person can deal with. It is never removed or counted. */
+export interface PreviewNotice {
+  path: string
+  size_text: string
+  message: string
+}
+
 export interface PreviewTask {
   task: TaskType
   items: PreviewItem[]
   error: string | null
+  /** Left out when there are none. */
+  notices?: PreviewNotice[]
 }
 
 export interface VolumePreview {

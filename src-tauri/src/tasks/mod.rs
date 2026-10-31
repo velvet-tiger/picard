@@ -67,6 +67,15 @@ impl Candidate {
     }
 }
 
+/// Something a scan found that only a person can deal with. It is never a
+/// candidate, so nothing ever removes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub message: String,
+}
+
 /// Something a task removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Removed {
@@ -307,6 +316,10 @@ pub trait CleanupTask: Send + Sync {
     fn scan(&self, ctx: &Ctx) -> Result<Vec<Candidate>>;
     /// Removes the given candidates, re-checking each one first.
     fn run(&self, ctx: &Ctx, candidates: &[Candidate]) -> Report;
+    /// What a person should look at. Never changes anything.
+    fn notices(&self, _ctx: &Ctx) -> Vec<Notice> {
+        Vec::new()
+    }
 }
 
 /// Builds the enabled tasks in config order. Tools are found through `env`,
