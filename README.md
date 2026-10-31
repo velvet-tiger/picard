@@ -10,19 +10,20 @@ Picard only works inside the folders you list as **roots**, such as `~/working`.
 
 | Task | Removes | Only when |
 |---|---|---|
-| `git_worktrees` | Linked git worktrees | Clean, not locked, and not in use by any running process. Nothing is paused in them: no rebase, `git am`, merge, cherry-pick, revert, sequence of cherry-picks or reverts, bisect or notes merge. Done ones go after `min_idle_minutes`: another local branch holds their HEAD, or other local branches hold a cherry-picked copy of each commit that no other branch holds. The copies can be spread over several branches. Ones whose commits are only pushed, and done ones that made commits now on no branch, go after `stale_days`. |
+| `git_worktrees` | Linked git worktrees | Clean, not locked, and not in use by any running process. Nothing is paused in them: no rebase, `git am`, merge, cherry-pick, revert, sequence of cherry-picks or reverts, bisect or notes merge. Done ones go after `min_idle_minutes`: another local branch holds their HEAD, or other local branches hold a cherry-picked copy of each commit that no other branch holds. The copies can be spread over several branches. Ones whose commits are only pushed, done ones that made commits now on no branch, and partly deleted ones go after `stale_days`. |
 | `node_modules` | `node_modules` next to a `package.json` | The project has not changed for `stale_days`. |
 | `cargo_clean` | `target/` next to a `Cargo.toml` | The project has not changed for `stale_days`, or every project with `mode = "all"`. |
 | `python_venv` | `.venv` or `venv` holding a `pyvenv.cfg`, next to a `pyproject.toml`, `requirements.txt`, `setup.py`, `setup.cfg` or `Pipfile` | The project has not changed for `stale_days`. |
-| `build_output` | Folders named in `dirs` (`dist`, `build`, `.next`, `vendor` by default) | The project has not changed for `stale_days`, git ignores the folder, git tracks nothing inside it, and it holds no git repo of its own. |
+| `build_output` | Folders named in `dirs` (`dist`, `build`, `.next`, `vendor` by default) | The project has not changed for `stale_days`, git ignores the folder, git tracks nothing inside it, and it holds no git repo of its own apart from clean clones in a package folder. Outside any git repo, only `.next` with a `BUILD_ID` file and `vendor` with a `composer/installed.json` file qualify. |
 | `tool_caches` | Whatever each tool's own prune command removes | The tool is installed, switched on, and keeps its cache on the low drive. Off unless you add it. |
 | `command` | Whatever your script removes | It is enabled. |
 
 These rules always hold:
 
 - Nothing outside your roots is removed, and symlinks are never followed out of them. Tool caches are the exception: Picard never deletes them itself. It asks each tool to prune its own cache.
-- Git branches are never deleted. Worktrees are removed with `git worktree remove`. A worktree with checked-out submodules needs `--force`, so Picard first checks each submodule itself: it must be clean, and every commit in it must be on a remote branch.
-- A worktree with uncommitted or untracked changes is never removed. Neither is one that holds another git checkout, such as a Claude Code worktree in `.claude/worktrees/`.
+- Git branches are never deleted. Worktrees are removed with `git worktree remove`. A worktree with checked-out submodules needs `--force`, so Picard first checks each submodule itself: it must be clean, and every commit in it must be on a remote branch. A partly deleted worktree needs `--force` too, so Picard checks its status again right before removal.
+- A worktree with uncommitted or untracked changes is never removed. The exception is a partly deleted one, whose only change is deleted tracked files. A worktree that holds another git checkout, such as a Claude Code worktree in `.claude/worktrees/`, is never removed either. The exception is a clean clone in a package folder.
+- A broken worktree is never removed. Picard shows it under **Needs you** for you to deal with.
 - A worktree with a paused rebase, `git am`, merge, cherry-pick, revert, bisect or notes merge is never removed. Removing it would delete that operation's state.
 - A worktree's own refs, under `refs/worktree/` and `refs/bisect/`, are deleted with it. A worktree is never removed while one of them points at a commit that no other local branch holds, or at anything that is not a commit, such as a tag object.
 - A copied repo, made with `cp -R` or Finder's Duplicate, still lists the original repo's worktrees. Picard judges a worktree only through the repo it belongs to, and only by the HEAD it has now.
@@ -31,7 +32,7 @@ These rules always hold:
 - Every removal is logged to `history.jsonl`.
 - Only one cleanup runs at a time.
 
-A project "has not changed" when no file in it has a newer modification time. Build output does not count. Neither does agent config that tools such as Automatic rewrite on every sync: `.agents`, `.automatic`, `.automatic.json`, `.claude`, `.codex`, `.cursor`, `.gemini`, `.junie`, `.mcp.json`, `.opencode`, `.windsurf`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` and `opencode.json`. Edits you make to those by hand do not count either. Git checkouts inside them, such as `.claude/worktrees/*`, still count. Those are the defaults. Change the list in **Settings…** under "Changes that don't count as work", or set `activity_ignore` in the config. A list you set replaces the defaults, so it must name every default you want to keep. An empty list makes every change count. **Restore defaults** puts the default list back. When you save a list that holds exactly the defaults, Picard takes the key out of the config, with any comment above it, so later releases can update the defaults. This happens on any save from **Settings…**.
+A project "has not changed" when no file in it has a newer modification time. Build output does not count. Neither does agent config that tools such as Automatic rewrite on every sync, or the project files that JetBrains IDEs rewrite when you open a project: `.agents`, `.automatic`, `.automatic.json`, `.claude`, `.codex`, `.cursor`, `.gemini`, `.idea`, `.junie`, `.mcp.json`, `.opencode`, `.phpstorm.meta.php`, `.windsurf`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` and `opencode.json`. Edits you make to those by hand do not count either. Git checkouts inside them, such as `.claude/worktrees/*`, still count. Those are the defaults. Change the list in **Settings…** under "Changes that don't count as work", or set `activity_ignore` in the config. A list you set replaces the defaults, so it must name every default you want to keep. An empty list makes every change count. **Restore defaults** puts the default list back. When you save a list that holds exactly the defaults, Picard takes the key out of the config, with any comment above it, so later releases can update the defaults. This happens on any save from **Settings…**.
 
 A worktree is done when another local branch holds its HEAD. Any branch counts except the worktree's own, even one checked out in another worktree. Remote-tracking branches do not count. Neither does a symbolic ref under `refs/heads`, because it is only another name for some other ref. Picard needs no default branch. A repo that integrates into `develop`, `2.0-dev` or `trunk` works without any setting.
 
@@ -53,6 +54,31 @@ The **Clean…** list says why a worktree is done. When git recorded a merge, it
 A branch that holds the commits does not prove the work is finished. A branch stacked on top of the worktree's branch counts. So does a branch that merged it in only to sync. For example, if feature branch B merges in unfinished work from feature branch A, A's worktree is done. A worktree's own branch is kept, so no commit is lost. A detached worktree has no branch. Once it is removed, its own commits are unreachable, and the next `git gc` can delete them. Only the copies remain. Picard logs the HEAD of each detached worktree it removes, so `git fsck --lost-found` can find that commit until then. Ignored files in the worktree, such as a local `.env`, are lost. In **Ask** mode you can untick or **Ignore** it.
 
 One thing to know: removing a worktree also deletes files git ignores inside it, such as a local `.env`. Git's own `git worktree remove` behaves the same way. The same goes for `build_output`: it trusts your `.gitignore`. If you keep files you cannot rebuild in an ignored `build` folder, add that folder to `exclude`. Picard keeps a worktree that holds another checkout by finding its `.git`. A checkout made with `--separate-git-dir`, or one whose git folder lives elsewhere, has no `.git` inside the worktree, so exclude it yourself.
+
+### Partly deleted and broken worktrees
+
+`git worktree remove` can stop part way, for example if the Mac shuts down during a large delete. Picard gives this command up to 30 minutes, far longer than any other git command. A removal that still stops leaves one of two things.
+
+A **partly deleted** worktree is still registered, and git status lists deleted tracked files and nothing else. Picard treats it like any other worktree, with two differences. It always waits for `stale_days`, because you might be deleting those files on purpose. A deletion counts as a change here, so the wait starts again after each one. The **Clean…** list says "partly deleted". If anything else has changed in it, such as an edit or a new file, Picard keeps it. A worktree whose commits exist nowhere else is kept too.
+
+A **broken** worktree is a folder whose `.git` file names a worktree record that no longer exists. Git cannot run there, so nothing shows whether its files matter. Picard never removes one. `picard scan` and the **Clean…** window list it under **Needs you**, with its path and size. Check it for work, then delete it yourself. To stop Picard listing a folder, add it to `exclude`. This search runs only when `git_worktrees` is on, and it uses the same depth limit and skipped folders as the search for repos.
+
+### Clones in package folders
+
+Some package managers install real git clones, such as Composer with `--prefer-source` and Terraform modules. Those clones would otherwise keep a whole worktree or `vendor` folder for ever. Picard accepts a checkout inside a worktree or a build output folder only when all of these hold:
+
+- Its `.git` is a folder. A `.git` file means a linked worktree or a submodule.
+- It sits below a `vendor` folder, or below `.terraform/modules`. Anything in `.claude/worktrees` inside the worktree or project stays refused.
+- The repo around it ignores it.
+- Git run there really uses its own `.git` folder, and that folder has no `info/grafts`.
+- Its own repo config defines no filters, and it has no submodules.
+- `git status` is clean, and every commit, stash and reflog entry is on one of its remote branches.
+
+An error from git, or a folder Picard cannot read, keeps the worktree or folder. Picard runs the same check just before removal. Files that the clone's own `.gitignore` covers are not checked, so they are lost with it.
+
+### Build output outside a git repo
+
+Outside any git repo, nothing can vouch for a folder called `dist` or `build`, so Picard keeps it. Two names leave proof of what they are, written by the tool itself. `.next` qualifies with a regular `BUILD_ID` file, and `vendor` with a regular `composer/installed.json` file. The **Clean…** list says so, for example "Next.js build, not in a git repo". Staleness and the check for nested repos still apply. If git fails for any other reason, the folder is kept.
 
 ## Modes
 
@@ -176,7 +202,7 @@ enabled = false
 
 Every task also accepts `enabled = false`.
 
-`dirs` entries must be plain folder names. Picard refuses paths, `.git`, and names with glob characters such as `*`.
+`dirs` entries must be plain folder names. Picard refuses paths, `.git`, and names with glob characters such as `*`. A `dirs` list you set replaces the defaults, so a later release that adds a default name does not reach it. Add new names yourself. Other build folders work the same way. For example, add `target` for Maven projects.
 
 `appearance` sets the Picard window to light or dark. Left out, the window follows the macOS setting. Saving **System** in Settings takes the key out of the config. A change from Settings applies when you press **Save**. A change made by editing the file applies the next time the window opens.
 
@@ -232,7 +258,7 @@ The app binary also works as a command-line tool:
 /Applications/Picard.app/Contents/MacOS/picard run --yes
 ```
 
-`scan` lists what would be removed and changes nothing. `run --yes` cleans each drive that is below its target. Both accept `--config <path>`.
+`scan` lists what would be removed and changes nothing. It also prints a `needs you` line for each broken worktree, which is not counted in the total. `run --yes` cleans each drive that is below its target. Both accept `--config <path>`.
 
 ## Troubleshooting
 
@@ -244,11 +270,11 @@ chmod go-w ~/Library/Application\ Support/Picard ~/Library/Application\ Support/
 
 **No notifications appear.** Check System Settings, then Notifications, then Picard. In a development build (`make dev`), notifications come from "Terminal" instead, so allow them for Terminal.
 
-**A worktree is never offered.** Picard keeps worktrees that a running process is using, such as an open Claude Code session or terminal. It also keeps any with uncommitted changes, commits that no other branch or remote holds, unsafe submodules, or filters set in the repo's own git config.
+**A worktree is never offered.** Picard keeps worktrees that a running process is using, such as an open Claude Code session or terminal. It also keeps any with uncommitted changes, commits that no other branch or remote holds, unsafe submodules, or filters set in the repo's own git config. A checkout inside it counts as unsafe too, unless it is a clean clone in a package folder. If the worktree is listed under **Needs you**, see [Partly deleted and broken worktrees](#partly-deleted-and-broken-worktrees).
 
 **Roots in Documents, Desktop or Downloads.** macOS asks for permission before an app reads these folders. Allow it when asked, or give Picard Full Disk Access in System Settings, then Privacy & Security.
 
-**The log** is at `~/Library/Logs/com.velvettiger.picard/Picard.log`.
+**The log** is at `~/Library/Logs/com.velvettiger.picard/Picard.log`. It starts a new file at 5 MB and keeps the last three old ones.
 
 ## Building
 

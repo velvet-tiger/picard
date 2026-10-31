@@ -6,6 +6,24 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A broken worktree is a folder whose `.git` file names a worktree record that no longer exists. A failed removal leaves one. `picard scan` and the Clean window now list these under **Needs you**, with path and size. Picard never removes one, and they are not counted in any total. Submodules are not reported.
+- A partly deleted worktree is one whose status lists deleted tracked files and nothing else, as a `git worktree remove` that stopped part way leaves it. It is now removed with `--force`, but only after `stale_days`, never `min_idle_minutes`, and only if another branch or a remote holds its commits. Any other change in it keeps it. Its reason says "partly deleted". Deletions count as activity for this wait.
+- A clean clone in a package folder no longer keeps a worktree or a build output folder for ever. This covers a checkout below `vendor` or `.terraform/modules`, with a `.git` folder, that the repo around it ignores. It must have no repo filters, no submodules and no uncommitted changes, and every commit must be on one of its remote branches. Picard checks again just before removal. Any other checkout is still refused, and so is anything in `.claude/worktrees` inside the worktree or project.
+- Outside any git repo, `.next` with a `BUILD_ID` file and `vendor` with a `composer/installed.json` file are now cleaned from stale projects. Every other name stays kept there, including `dist` and `build`. A git failure does not count as "outside a repo".
+
+### Changed
+
+- `.idea` and `.phpstorm.meta.php` are now on the default list of changes that do not count as work. A custom `activity_ignore` list is not changed.
+- The log starts a new file at 5 MB and keeps three old ones. It used to start again at 40 kB, which lost the history a bug report needs. Each `build_output` scan logs one summary line, and the line for each folder moved to debug level.
+
+### Fixed
+
+- `git worktree remove` now has 30 minutes instead of 60 seconds. A large worktree could reach the old limit, and stopping it part way left the worktree half deleted.
+- `build_output` now judges each folder again just before removing it. It used to act on the scan's answer alone.
+- `build_output` used to skip a folder it could not read while looking for nested repos, so a repo inside it went unseen. It now keeps the output folder.
+
 ## [0.8.0] - 2026-10-25
 
 ### Added
