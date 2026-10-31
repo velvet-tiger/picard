@@ -22,7 +22,15 @@ mod windows;
 use std::sync::Arc;
 
 use tauri::Manager;
+use tauri_plugin_log::RotationStrategy;
 use tokio::sync::mpsc;
+
+/// The size at which the log starts a new file. The plugin's default of 40 kB
+/// is shorter than one busy day, so it lost the history a bug report needs.
+const LOG_FILE_BYTES: u128 = 5 * 1024 * 1024;
+
+/// Old log files kept, so the log folder cannot grow without limit.
+const LOG_FILES_KEPT: usize = 3;
 
 /// Starts Picard as a menu bar app: no Dock icon and no window, only the tray.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -31,6 +39,8 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
+                .max_file_size(LOG_FILE_BYTES)
+                .rotation_strategy(RotationStrategy::KeepSome(LOG_FILES_KEPT))
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())

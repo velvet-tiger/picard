@@ -94,7 +94,7 @@ impl CleanupTask for BuildOutput {
                 break;
             }
             if let Err(why) = check_target(&target, ctx) {
-                log::info!("build_output: skipping {}: {why}", target.display());
+                log::debug!("build_output: skipping {}: {why}", target.display());
                 continue;
             }
             // Staleness first: it is cheap, and it spares running git for
@@ -107,11 +107,14 @@ impl CleanupTask for BuildOutput {
                 continue;
             };
             if let Some(why) = self.keep_reason(&project, name) {
-                log::info!("build_output: keeping {}: {why}", target.display());
+                log::debug!("build_output: keeping {}: {why}", target.display());
                 continue;
             }
             found.push((target, format!("ignored by git, untouched for {idle} days")));
         }
+        // Per-folder reasons are at debug level. With many projects they
+        // would otherwise flood the log on every scan.
+        log::info!("build_output: {} candidate(s)", found.len());
         let paths: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
         let sizes = ctx.measure_all(&paths);
         Ok(found
@@ -208,6 +211,57 @@ mod tests {
         let dist = found.iter().find(|c| c.path.ends_with("dist")).unwrap();
         assert!(dist.bytes >= 20_000, "{}", dist.bytes);
         assert_eq!(dist.reason, "ignored by git, untouched for 60 days");
+    }
+
+    /// Records this thread's log lines, so tests running at the same time
+    /// cannot add to them. Only this module's test installs a logger.
+    struct ThreadLog;
+
+    thread_local! {
+        static LINES: std::cell::RefCell<Vec<(log::Level, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    impl log::Log for ThreadLog {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            LINES.with_borrow_mut(|l| l.push((record.level(), record.args().to_string())));
+        }
+        fn flush(&self) {}
+    }
+
+    /// The per-folder lines run for every project on every scan, so only one
+    /// summary line may reach the log at the info level.
+    #[test]
+    fn a_scan_logs_one_info_summary_and_keeps_folder_lines_at_debug() {
+        static LOGGER: ThreadLog = ThreadLog;
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&LOGGER).unwrap();
+            log::set_max_level(log::LevelFilter::Debug);
+        });
+        let fx = Fixture::new(&[]);
+        let dir = repo(&fx, "p");
+        std::fs::write(dir.join(".gitignore"), "!dist/\n").unwrap();
+        fx.file("p/dist/app.js", 1);
+        fx.age("p", 60);
+        LINES.with_borrow_mut(Vec::clear);
+        task().scan(&fx.ctx()).unwrap();
+        let lines = LINES.with_borrow(Clone::clone);
+        let at = |level| -> Vec<&str> {
+            lines
+                .iter()
+                .filter(|(l, _)| *l == level)
+                .map(|(_, m)| m.as_str())
+                .collect()
+        };
+        assert_eq!(at(log::Level::Info), vec!["build_output: 0 candidate(s)"]);
+        assert!(
+            at(log::Level::Debug).iter().any(|m| m.contains("keeping")),
+            "{lines:?}"
+        );
     }
 
     #[test]
