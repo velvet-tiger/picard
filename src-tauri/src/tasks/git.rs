@@ -198,6 +198,40 @@ impl GitCmd {
         stdout_of(out, dir, args)
     }
 
+    /// True if `dir` is in a git repo, false if git says plainly that it is
+    /// not. Any other failure is an error, so the caller can keep a folder it
+    /// cannot judge. Git prints a similar line for a broken `.git` file, so
+    /// only the wording for "searched every parent" counts, and a `.git` entry
+    /// in `dir` or any parent means something is there that git cannot read.
+    pub fn in_repo(&self, dir: &Path) -> Result<bool> {
+        let args = ["rev-parse", "--git-dir"];
+        let mut cmd = self.command(dir, &args);
+        // Git translates this message, and its wording is the answer here.
+        cmd.env("LC_ALL", "C");
+        let out = proc::run(cmd, self.limits.normal, GIT_OUTPUT_CAP)
+            .with_context(|| format!("running git rev-parse in {}", dir.display()))?;
+        if out.success() {
+            return Ok(true);
+        }
+        let searched = out.code == Some(128)
+            && out
+                .stderr
+                .contains("not a git repository (or any of the parent directories)");
+        let dot_git = dir
+            .ancestors()
+            .map(|a| a.join(".git"))
+            .find(|p| std::fs::symlink_metadata(p).is_ok());
+        if searched && dot_git.is_none() {
+            return Ok(false);
+        }
+        bail!(
+            "cannot tell whether {} is in a git repo: {}{}",
+            dir.display(),
+            shown_stderr(&out.stderr),
+            dot_git.map_or(String::new(), |p| format!(" ({} exists)", p.display()))
+        )
+    }
+
     /// Runs a git command whose exit status is the answer, like
     /// `merge-base --is-ancestor`: 0 is yes, 1 is no, anything else is an error.
     pub fn check(&self, dir: &Path, args: &[&str]) -> Result<bool> {
@@ -992,6 +1026,54 @@ mod tests {
         git.output(dir.path(), &["init", "-q"]).unwrap();
         let err = git.output(dir.path(), &args).unwrap_err().to_string();
         assert!(err.len() < 2_000, "{} chars: {err}", err.len());
+    }
+
+    #[test]
+    fn in_repo_tells_a_repo_from_no_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitCmd::default();
+        assert!(!git.in_repo(dir.path()).unwrap());
+        git.output(dir.path(), &["init", "-q"]).unwrap();
+        let inner = dir.path().join("a/b");
+        std::fs::create_dir_all(&inner).unwrap();
+        assert!(git.in_repo(&inner).unwrap());
+    }
+
+    /// Each of these is a folder Picard cannot judge, not one outside a repo.
+    #[test]
+    fn in_repo_treats_anything_unclear_as_an_error() {
+        let git = GitCmd::default();
+        let broken_file = tempfile::tempdir().unwrap();
+        std::fs::write(
+            broken_file.path().join(".git"),
+            "gitdir: /gone/.git/worktrees/x\n",
+        )
+        .unwrap();
+        assert!(git.in_repo(broken_file.path()).is_err());
+
+        // Git skips an invalid `.git` folder and reports no repo at all.
+        let broken_folder = tempfile::tempdir().unwrap();
+        std::fs::create_dir(broken_folder.path().join(".git")).unwrap();
+        let inner = broken_folder.path().join("a");
+        std::fs::create_dir(&inner).unwrap();
+        assert!(git.in_repo(&inner).is_err());
+
+        assert!(git.in_repo(Path::new("/no/such/folder")).is_err());
+    }
+
+    #[test]
+    fn in_repo_treats_another_git_failure_as_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-git");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho 'fatal: out of memory' >&2\nexit 128\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let git = GitCmd::new(path, std::env::var("PATH").unwrap());
+        assert!(git.in_repo(dir.path()).is_err());
     }
 
     #[test]

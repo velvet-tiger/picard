@@ -4,9 +4,16 @@
 //! Those names are not always build output. Some repos commit `dist`, Go
 //! projects often commit `vendor`, and `build` is sometimes source. So a
 //! folder is a candidate only when git vouches for it: git must ignore the
-//! folder and track nothing inside it. A folder outside any git repo is kept,
-//! because nothing can vouch for it. A folder that holds a git repo of its own
-//! is kept too, because that repo may hold work that exists nowhere else. The
+//! folder and track nothing inside it.
+//!
+//! Outside any git repo, only a file the tool itself writes can vouch for a
+//! folder. `.next` must hold `BUILD_ID`, and `vendor` must hold
+//! `composer/installed.json`. Every other name is kept there, including `dist`
+//! and `build`, because nothing shows what is in them. When git fails for any
+//! other reason, the folder is kept too.
+//!
+//! A folder that holds a git repo of its own is kept, in or out of a repo,
+//! because that repo may hold work that exists nowhere else. The
 //! exception is a clean clone that a package manager installed from source,
 //! such as Composer's `--prefer-source` installs, whose commits are all on its
 //! remote branches. `GitCmd::nested_checkout_problem` lists the conditions.
@@ -18,11 +25,59 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use super::git::GitCmd;
-use super::stale_dirs::{find_pairs, idle_days};
+use super::stale_dirs::{find_pairs, idle_days, is_file};
 use super::{Candidate, CleanupTask, Ctx, Estimate, Report, check_target, remove_dirs};
 
 /// How deep to search under each root for projects.
 const SEARCH_DEPTH: usize = 8;
+
+/// The folder names that can be vouched for outside a git repo: the name, the
+/// file inside it that only the tool writes, and what that file shows.
+const OUTSIDE_A_REPO: &[(&str, &[&str], &str)] = &[
+    (".next", &["BUILD_ID"], "Next.js build"),
+    (
+        "vendor",
+        &["composer", "installed.json"],
+        "Composer packages",
+    ),
+];
+
+/// What shows that a folder is regenerable build output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Voucher {
+    /// Git ignores it and tracks nothing in it.
+    Git,
+    /// It is outside any repo, and holds a file only this tool writes.
+    ToolFile(&'static str),
+}
+
+impl Voucher {
+    /// The candidate reason for a folder with this voucher.
+    fn reason(self, idle: u64) -> String {
+        match self {
+            Voucher::Git => format!("ignored by git, untouched for {idle} days"),
+            Voucher::ToolFile(what) => {
+                format!("{what}, not in a git repo, untouched for {idle} days")
+            }
+        }
+    }
+}
+
+/// True if the path `parts` below `dir` is a regular file reached through real
+/// folders. A symlink anywhere on the way could point at something else.
+fn holds_file(dir: &Path, parts: &[&str]) -> bool {
+    let Some((file, folders)) = parts.split_last() else {
+        return false;
+    };
+    let mut at = dir.to_path_buf();
+    for folder in folders {
+        at.push(folder);
+        if !std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_dir()) {
+            return false;
+        }
+    }
+    is_file(&at.join(file))
+}
 
 pub struct BuildOutput {
     git: GitCmd,
@@ -40,7 +95,24 @@ impl BuildOutput {
         }
     }
 
-    /// Why `project/name` must be kept, if anything. Only reads.
+    /// What vouches for `project/name`, or why it must be kept. Only reads.
+    fn judge(&self, project: &Path, name: &str) -> Result<Voucher, String> {
+        let voucher = match self.git.in_repo(project) {
+            Ok(true) => self.git_vouches(project, name)?,
+            Ok(false) => tool_file_vouches(project, name)?,
+            Err(e) => return Err(format!("{e:#}")),
+        };
+        match self
+            .git
+            .output_checkout_problem(project, &project.join(name))
+        {
+            Ok(None) => Ok(voucher),
+            Ok(Some((repo, why))) => Err(format!("holds a git repo at {}: {why}", repo.display())),
+            Err(e) => Err(format!("cannot check it for git repos: {e:#}")),
+        }
+    }
+
+    /// Checks that git ignores `project/name` and tracks nothing in it.
     ///
     /// `check-ignore` and `ls-files` read the index and ignore files. Neither
     /// runs filters or hooks, and `GitCmd` turns off fsmonitor.
@@ -50,45 +122,47 @@ impl BuildOutput {
     /// refuses names with those characters. As a second guard, `ls-files` gets
     /// `--literal-pathspecs`, and the `./` prefix stops a leading `:` acting as
     /// magic for `check-ignore`, which refuses that flag.
-    fn keep_reason(&self, project: &Path, name: &str) -> Option<String> {
+    fn git_vouches(&self, project: &Path, name: &str) -> Result<Voucher, String> {
         let path = format!("./{name}");
         match self
             .git
             .check(project, &["check-ignore", "-q", "--", &path])
         {
             Ok(true) => {}
-            Ok(false) => return Some("git does not ignore it".to_string()),
-            Err(e) => return Some(format!("cannot ask git about it: {e:#}")),
+            Ok(false) => return Err("git does not ignore it".to_string()),
+            Err(e) => return Err(format!("cannot ask git about it: {e:#}")),
         }
         match self.git.output(
             project,
             &["--literal-pathspecs", "ls-files", "-z", "--", name],
         ) {
-            Ok(tracked) if tracked.is_empty() => {}
-            Ok(_) => return Some("git tracks files inside it".to_string()),
-            Err(e) => return Some(format!("cannot list its tracked files: {e:#}")),
-        }
-        match self
-            .git
-            .output_checkout_problem(project, &project.join(name))
-        {
-            Ok(None) => None,
-            Ok(Some((repo, why))) => Some(format!("holds a git repo at {}: {why}", repo.display())),
-            Err(e) => Some(format!("cannot check it for git repos: {e:#}")),
+            Ok(tracked) if tracked.is_empty() => Ok(Voucher::Git),
+            Ok(_) => Err("git tracks files inside it".to_string()),
+            Err(e) => Err(format!("cannot list its tracked files: {e:#}")),
         }
     }
 
-    /// Why candidate `c` must be kept now, if anything. A clone in it can
-    /// have gained work since the scan.
-    fn keep_reason_now(&self, c: &Candidate) -> Option<String> {
+    /// Judges candidate `c` again. A clone in it can have gained work since
+    /// the scan.
+    fn judge_again(&self, c: &Candidate) -> Result<Voucher, String> {
         let (Some(project), Some(name)) = (c.path.parent(), c.path.file_name()) else {
-            return Some("has no parent folder".to_string());
+            return Err("has no parent folder".to_string());
         };
         let Some(name) = name.to_str() else {
-            return Some("has a name that is not UTF-8".to_string());
+            return Err("has a name that is not UTF-8".to_string());
         };
-        self.keep_reason(project, name)
+        self.judge(project, name)
     }
+}
+
+/// Checks that `project/name`, outside any git repo, holds the file that shows
+/// what it is.
+fn tool_file_vouches(project: &Path, name: &str) -> Result<Voucher, String> {
+    OUTSIDE_A_REPO
+        .iter()
+        .find(|(known, parts, _)| *known == name && holds_file(&project.join(name), parts))
+        .map(|(_, _, what)| Voucher::ToolFile(what))
+        .ok_or_else(|| "outside any git repo, and nothing shows it is build output".to_string())
 }
 
 impl CleanupTask for BuildOutput {
@@ -116,11 +190,10 @@ impl CleanupTask for BuildOutput {
             let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if let Some(why) = self.keep_reason(&project, name) {
-                log::debug!("build_output: keeping {}: {why}", target.display());
-                continue;
+            match self.judge(&project, name) {
+                Ok(voucher) => found.push((target, voucher.reason(idle))),
+                Err(why) => log::debug!("build_output: keeping {}: {why}", target.display()),
             }
-            found.push((target, format!("ignored by git, untouched for {idle} days")));
         }
         // Per-folder reasons are at debug level. With many projects they
         // would otherwise flood the log on every scan.
@@ -146,7 +219,7 @@ impl CleanupTask for BuildOutput {
                 report.halted = Some("the volume is no longer mounted".to_string());
                 break;
             }
-            if let Some(why) = self.keep_reason_now(c) {
+            if let Err(why) = self.judge_again(c) {
                 log::warn!("not removing {}: {why}", c.path.display());
                 report.failed.push((c.path.clone(), why));
                 continue;
@@ -553,6 +626,159 @@ mod tests {
         assert!(report.removed.is_empty(), "{report:?}");
         assert!(report.failed[0].1.contains("has uncommitted changes"));
         assert!(dir.join("vendor/acme/lib/notes.txt").exists());
+    }
+
+    /// Names the reason the fixture above stays kept, now that a clean clone
+    /// can pass: `git init` made no commit, so its file is untracked.
+    #[test]
+    fn a_folder_holding_a_git_repo_is_kept_because_its_files_are_uncommitted() {
+        let fx = Fixture::new(&[]);
+        let dir = repo(&fx, "p");
+        std::fs::write(dir.join(".gitignore"), "vendor/\n").unwrap();
+        fx.file("p/vendor/acme/lib/src/A.php", 1);
+        git(&dir.join("vendor/acme/lib"), &["init", "-q"]);
+        let why = task().judge(&dir, "vendor").unwrap_err();
+        assert!(why.ends_with("has uncommitted changes"), "{why}");
+    }
+
+    /// A project with a stale `.next` build, in no repo.
+    fn loose_next(fx: &Fixture) {
+        fx.file("loose/src/a.js", 1);
+        fx.file("loose/.next/BUILD_ID", 1);
+        fx.age("loose", 60);
+    }
+
+    fn loose_vendor(fx: &Fixture) {
+        fx.file("loose/composer.json", 1);
+        fx.file("loose/vendor/composer/installed.json", 1);
+        fx.age("loose", 60);
+    }
+
+    #[test]
+    fn a_next_build_outside_a_repo_is_accepted_and_says_why() {
+        let fx = Fixture::new(&[]);
+        loose_next(&fx);
+        let ctx = fx.ctx();
+        let t = task();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["loose/.next"]);
+        assert_eq!(
+            found[0].reason,
+            "Next.js build, not in a git repo, untouched for 60 days"
+        );
+        let report = t.run(&ctx, &found);
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(fx.root.join("loose/src/a.js").exists());
+    }
+
+    #[test]
+    fn composer_packages_outside_a_repo_are_accepted_and_say_why() {
+        let fx = Fixture::new(&[]);
+        loose_vendor(&fx);
+        let found = task().scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["loose/vendor"]);
+        assert_eq!(
+            found[0].reason,
+            "Composer packages, not in a git repo, untouched for 60 days"
+        );
+    }
+
+    #[test]
+    fn outside_a_repo_a_recent_project_is_kept() {
+        let fx = Fixture::new(&[]);
+        loose_next(&fx);
+        fx.file("loose/src/b.js", 1);
+        assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn outside_a_repo_a_folder_without_its_marker_is_kept() {
+        let fx = Fixture::new(&[]);
+        fx.file("a/.next/cache/x", 1);
+        fx.file("b/vendor/acme/lib.php", 1);
+        fx.file("c/vendor/installed.json", 1);
+        fx.age("a", 60);
+        fx.age("b", 60);
+        fx.age("c", 60);
+        assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_marker_only_counts_for_its_own_folder_name() {
+        let fx = Fixture::new(&[]);
+        fx.file("a/dist/BUILD_ID", 1);
+        fx.file("b/build/composer/installed.json", 1);
+        fx.file("c/.next/composer/installed.json", 1);
+        fx.file("d/vendor/BUILD_ID", 1);
+        for p in ["a", "b", "c", "d"] {
+            fx.age(p, 60);
+        }
+        assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_marker_must_be_a_regular_file_in_a_real_folder() {
+        let symlink = std::os::unix::fs::symlink::<PathBuf, PathBuf>;
+        let fx = Fixture::new(&[]);
+        fx.file("a/.next/BUILD_ID/inside", 1);
+        let elsewhere = fx.file("elsewhere/composer/installed.json", 1);
+        fx.file("b/.next/other", 1);
+        symlink(elsewhere.clone(), fx.root.join("b/.next/BUILD_ID")).unwrap();
+        fx.file("c/vendor/other", 1);
+        symlink(
+            elsewhere.parent().unwrap().to_path_buf(),
+            fx.root.join("c/vendor/composer"),
+        )
+        .unwrap();
+        for p in ["a", "b", "c", "elsewhere"] {
+            fx.age(p, 60);
+        }
+        assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn outside_a_repo_a_folder_holding_a_git_repo_is_kept() {
+        let fx = Fixture::new(&[]);
+        fx.file("loose/vendor/composer/installed.json", 1);
+        fx.file("loose/vendor/acme/lib/a.php", 1);
+        clone_like(&fx.root.join("loose/vendor/acme/lib"));
+        fx.age("loose", 60);
+        assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    /// A broken worktree is not "outside a repo". Git fails in it, and
+    /// nothing shows whether its files are safe to lose.
+    #[test]
+    fn a_git_failure_is_not_the_same_as_no_repo() {
+        let fx = Fixture::new(&[]);
+        fx.file("wt/.next/BUILD_ID", 1);
+        std::fs::write(fx.root.join("wt/.git"), "gitdir: /gone/.git/worktrees/x\n").unwrap();
+        fx.age("wt", 60);
+        assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_marker_does_not_override_git_inside_a_repo() {
+        let fx = Fixture::new(&[]);
+        let dir = repo(&fx, "p");
+        std::fs::write(dir.join(".gitignore"), "!.next/\n").unwrap();
+        fx.file("p/.next/BUILD_ID", 1);
+        fx.age("p", 60);
+        assert!(task().scan(&fx.ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_marker_that_goes_between_scan_and_removal_keeps_the_folder() {
+        let fx = Fixture::new(&[]);
+        loose_next(&fx);
+        let ctx = fx.ctx();
+        let t = task();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(found.len(), 1);
+        std::fs::remove_file(fx.root.join("loose/.next/BUILD_ID")).unwrap();
+        let report = t.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(fx.root.join("loose/.next").exists());
     }
 
     #[test]
