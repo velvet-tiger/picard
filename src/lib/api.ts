@@ -238,7 +238,7 @@ export function newTask(type: TaskType): Task {
         type,
         enabled: true,
         stale_days: 30,
-        dirs: ['dist', 'build', '.next', 'vendor', '.terraform', 'storybook-static'],
+        dirs: ['dist', 'build', '.next', 'vendor', '.terraform', 'storybook-static', 'target'],
       }
     case 'tool_caches':
       return { type, enabled: true, uv: true, homebrew: true, simulators: true, bun: true }

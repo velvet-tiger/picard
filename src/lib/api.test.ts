@@ -154,6 +154,7 @@ describe('newTask', () => {
       'vendor',
       '.terraform',
       'storybook-static',
+      'target',
     ])
   })
 })
