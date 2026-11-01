@@ -6,6 +6,8 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-01
+
 ### Added
 
 - A broken worktree is a folder whose `.git` file names a worktree record that no longer exists. A failed removal leaves one. `picard scan` and the Clean window now list these under **Needs you**, with path and size. Picard never removes one, and they are not counted in any total. Submodules are not reported, and neither is a record on a drive that is not mounted. `picard scan` escapes control characters in these paths.
@@ -207,6 +209,7 @@ and removes build output and finished work when a drive runs low.
 - Disk image volume test (a918137).
 - Vitest tests for `api.ts`, Preview and Settings (5eeb28a).
 
+[0.9.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.9.0
 [0.8.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.8.0
 [0.7.1]: https://github.com/velvet-tiger/picard/releases/tag/v0.7.1
 [0.7.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.7.0
