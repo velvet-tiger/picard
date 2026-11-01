@@ -11,6 +11,7 @@ mod command;
 mod git;
 mod git_worktrees;
 mod in_use;
+mod notice_actions;
 mod size;
 pub mod stale_dirs;
 mod tool_caches;
@@ -25,6 +26,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
+pub use notice_actions::{reveal_folder, trash_broken_worktree, volume_holding};
 pub use size::SizeCache;
 
 use crate::config::{CargoMode, TaskConfig, ToolOverrides};
@@ -68,12 +70,15 @@ impl Candidate {
 }
 
 /// Something a scan found that only a person can deal with. It is never a
-/// candidate, so nothing ever removes it.
+/// candidate, so no scan or clean ever removes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub path: PathBuf,
     pub bytes: u64,
     pub message: String,
+    /// A person may send it to the Trash from the Clean window. The folder is
+    /// judged again then. See `notice_actions`.
+    pub deletable: bool,
 }
 
 /// Something a task removed.

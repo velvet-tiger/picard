@@ -38,6 +38,7 @@ tauri-plugin-dialog = "2"
 # Linux AppImage tar.gz unpacking, and pulls in zip 4.x
 # (RUSTSEC-2026-0367/0368/0369). The macOS path keeps tar and flate2 regardless.
 tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
+trash = "5.2.9"
 
 [dev-dependencies]
 filetime = "0.2.29"

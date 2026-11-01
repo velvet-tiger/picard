@@ -8,6 +8,8 @@
     getTotals,
     getStatus,
     setIgnored,
+    revealNotice,
+    deleteNotice,
     getProtection,
     getScanState,
     cancelScan,
@@ -108,7 +110,8 @@
 
   const key = (mount: string, path: string) => `${mount}\u0000${path}`
 
-  // Paths whose Ignore or Unignore request is still in flight, keyed like `checked`.
+  // Paths with an Ignore, Unignore, Finder or Delete request still in flight,
+  // keyed like `checked`.
   let toggling = $state<Record<string, boolean>>({})
   // Cleaning or rescanning mid-toggle could act on, or show, the list as it was.
   const busyToggling = $derived(Object.values(toggling).some(Boolean))
@@ -565,6 +568,45 @@
     afterBusy()
   }
 
+  /** The notice whose Delete waits for a second click, keyed like `checked`. */
+  let confirmingDelete = $state<string | null>(null)
+
+  async function reveal(mount: string, path: string) {
+    const k = key(mount, path)
+    toggling[k] = true
+    error = null
+    try {
+      await revealNotice(path)
+    } catch (e) {
+      error = errorText(e)
+    } finally {
+      toggling[k] = false
+    }
+    afterBusy()
+  }
+
+  /**
+   * Moves a confirmed notice to the Trash and drops its row. The stored scan
+   * may still list it, but the backend refuses a row that went stale.
+   */
+  async function deleteConfirmed(mount: string, path: string) {
+    const k = key(mount, path)
+    confirmingDelete = null
+    toggling[k] = true
+    error = null
+    try {
+      await deleteNotice(path)
+      for (const v of volumes) {
+        for (const t of v.tasks) t.notices = t.notices?.filter((n) => n.path !== path)
+      }
+    } catch (e) {
+      error = errorText(e)
+    } finally {
+      toggling[k] = false
+    }
+    afterBusy()
+  }
+
   let refreshCalls = 0
 
   /**
@@ -795,12 +837,43 @@
             <h3>Needs you</h3>
             <ul>
               {#each notices as n}
+                {@const k = key(v.mount, n.path)}
                 <li class="notice">
                   <span class="text">
                     <span class="title" title={tildePath(n.path)}>{shortPath(n.path)}</span>
                     <span class="reason">{n.message}</span>
                   </span>
                   <span class="size">{n.size_text}</span>
+                  <button
+                    class="row-action"
+                    onclick={() => reveal(v.mount, n.path)}
+                    disabled={toggling[k] || cleaning}
+                    aria-label="Open {tildePath(n.path)} in Finder">Open in Finder</button
+                  >
+                  {#if n.deletable && confirmingDelete !== k}
+                    <button
+                      class="row-action"
+                      onclick={() => (confirmingDelete = k)}
+                      disabled={toggling[k] || cleaning}
+                      aria-label="Delete {tildePath(n.path)}">Delete</button
+                    >
+                  {/if}
+                  {#if n.deletable && confirmingDelete === k}
+                    <div class="confirm">
+                      <span>Move {tildePath(n.path)} ({n.size_text}) to the Trash?</span>
+                      <button
+                        class="row-action"
+                        onclick={() => deleteConfirmed(v.mount, n.path)}
+                        disabled={toggling[k] || cleaning}
+                        aria-label="Move {tildePath(n.path)} to the Trash">Move to Trash</button
+                      >
+                      <button
+                        class="row-action"
+                        onclick={() => (confirmingDelete = null)}
+                        aria-label="Cancel deleting {tildePath(n.path)}">Cancel</button
+                      >
+                    </div>
+                  {/if}
                 </li>
               {/each}
             </ul>
@@ -968,10 +1041,25 @@
   }
   .notice {
     display: flex;
-    gap: 8px;
+    flex-wrap: wrap;
+    align-items: start;
+    gap: 4px 8px;
   }
   .notice .text {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .notice .confirm {
+    display: flex;
+    flex: 1 0 100%;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+  .notice .confirm span {
     flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
   .notice .reason {
     margin-left: 0;

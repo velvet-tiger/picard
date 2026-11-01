@@ -58,11 +58,13 @@ export interface PreviewItem {
   holds_ignored: boolean
 }
 
-/** Something only a person can deal with. It is never removed or counted. */
+/** Something only a person can deal with. No clean removes it, and it is never counted. */
 export interface PreviewNotice {
   path: string
   size_text: string
   message: string
+  /** Offers Delete, which moves the folder to the Trash. */
+  deletable: boolean
 }
 
 export interface PreviewTask {
@@ -301,6 +303,10 @@ export const installUpdate = () => invoke<UpdateStatus>('install_update')
 /** Restarts Picard into the installed version. Rejects while a cleanup is running. */
 export const restartToUpdate = () => invoke<void>('restart_to_update')
 export const openLink = (link: Link) => invoke<void>('open_link', { link })
+/** Shows a notice's folder in Finder. */
+export const revealNotice = (path: string) => invoke<void>('reveal_notice', { path })
+/** Moves a broken worktree to the Trash. The backend judges it again and may refuse. */
+export const deleteNotice = (path: string) => invoke<void>('delete_notice', { path })
 
 /**
  * Makes the page light, dark, or follow macOS. app.css keys its palettes on

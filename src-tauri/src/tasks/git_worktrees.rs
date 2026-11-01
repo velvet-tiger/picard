@@ -94,7 +94,9 @@
 //! Picard also looks for broken worktrees: folders whose `.git` file names a
 //! worktree record that no longer exists. A failed removal leaves one. Git
 //! cannot run there and no longer lists it, so nothing shows whether work
-//! would be lost. They are reported as notices, and nothing ever removes them.
+//! would be lost. They are reported as notices, and Picard never removes one
+//! on its own. A person can check one and send it to the Trash from the Clean
+//! window. See `notice_actions`.
 //!
 //! Each candidate is judged again just before removal, with the repo's
 //! worktrees and branches read afresh. One found done must still be done.
@@ -1325,27 +1327,28 @@ impl CleanupTask for GitWorktrees {
     /// `ctx.search_roots`, which spans every volume. The scan already limited
     /// the second kind to this volume.
     fn notices(&self, ctx: &Ctx) -> Vec<Notice> {
-        let mut found: Vec<(PathBuf, &str)> = folders_under(ctx, &ctx.roots)
+        let mut found: Vec<(PathBuf, &str, bool)> = folders_under(ctx, &ctx.roots)
             .filter_map(|e| {
                 let message = broken_worktree(e.path())?;
-                Some((e.into_path(), message))
+                Some((e.into_path(), message, true))
             })
             .collect();
         let lost = self
             .gitignore_lost
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        found.extend(lost.iter().map(|p| (p.clone(), GITIGNORE_LOST)));
+        found.extend(lost.iter().map(|p| (p.clone(), GITIGNORE_LOST, false)));
         drop(lost);
-        let paths: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
+        let paths: Vec<PathBuf> = found.iter().map(|(p, _, _)| p.clone()).collect();
         let sizes = ctx.measure_all(&paths);
         found
             .into_iter()
             .zip(sizes)
-            .map(|((path, message), bytes)| Notice {
+            .map(|((path, message, deletable), bytes)| Notice {
                 path,
                 bytes,
                 message: message.to_string(),
+                deletable,
             })
             .collect()
     }
@@ -1395,7 +1398,7 @@ fn find_repos(ctx: &Ctx) -> Vec<PathBuf> {
 /// cannot be read is not reported. The file is only read, and the paths it
 /// names are only checked for existence, so a hostile one can do no harm. A
 /// record on a drive that is not mounted is only out of reach, not gone.
-fn broken_worktree(folder: &Path) -> Option<&'static str> {
+pub(super) fn broken_worktree(folder: &Path) -> Option<&'static str> {
     let contents = read_small_file(&folder.join(".git"), GIT_FILE_LIMIT).ok()??;
     let record = worktree_record(folder, &contents)?;
     if on_unmounted_volume(&record) {
@@ -1408,9 +1411,9 @@ fn broken_worktree(folder: &Path) -> Option<&'static str> {
     // `<git dir>/worktrees/<id>`, so two levels up is the repo's git dir.
     let git_dir = record.parent()?.parent()?;
     Some(if std::fs::symlink_metadata(git_dir).is_ok() {
-        "broken git worktree: its repo no longer lists it. Picard will not remove it. Check it for work, then delete it yourself"
+        "broken git worktree: its repo no longer lists it. Picard never removes it on its own. Check it for work, then delete it"
     } else {
-        "broken git worktree: its repo is gone. Picard will not remove it. Check it for work, then delete it yourself"
+        "broken git worktree: its repo is gone. Picard never removes it on its own. Check it for work, then delete it"
     })
 }
 
@@ -1717,6 +1720,7 @@ fn format_idle(idle: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::notice_actions::check_with_in_use;
     use super::super::test_support::{Fixture, git_with_hook};
     use super::*;
     use std::process::Command;
@@ -2072,6 +2076,9 @@ mod tests {
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert_eq!(notices[0].path, wt.canonicalize().unwrap());
         assert!(notices[0].message.contains(".gitignore is gone"));
+        assert!(!notices[0].deletable);
+        let refused = check_with_in_use(&wt, &ctx, vec![]).unwrap_err();
+        assert_eq!(refused, "is not a broken worktree");
         assert!(wt.exists());
     }
 
@@ -2206,6 +2213,11 @@ mod tests {
         assert_eq!(notices[0].path, wt.canonicalize().unwrap());
         assert!(notices[0].bytes >= 5_000, "{}", notices[0].bytes);
         assert!(notices[0].message.contains("no longer lists it"));
+        assert!(notices[0].deletable);
+        assert_eq!(
+            check_with_in_use(&wt, &ctx, vec![]).unwrap(),
+            wt.canonicalize().unwrap()
+        );
     }
 
     #[test]

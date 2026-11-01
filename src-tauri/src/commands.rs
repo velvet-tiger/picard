@@ -5,8 +5,9 @@
 //! Errors go back to the window as text, because that is what it shows.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,10 +21,10 @@ use crate::disk::{self, DiskSpace};
 use crate::history::{self, Entry, Totals};
 use crate::poll;
 use crate::preview_scans::{self, Request, ScanPhase, Scope};
-use crate::runner::{self, CleanRequest, TaskScan, VolumeRun};
+use crate::runner::{self, CleanRequest, RunLock, TaskScan, VolumeRun};
 use crate::settings::{self, Settings};
 use crate::state::Shared;
-use crate::tasks::{IgnoreList, Protected};
+use crate::tasks::{self, Ctx, IgnoreList, Protected};
 use crate::updater::{self, UpdateStatus, Updates};
 use crate::volume::Volume;
 use crate::windows;
@@ -71,6 +72,8 @@ pub struct PreviewNotice {
     pub path: String,
     pub size_text: String,
     pub message: String,
+    /// Offers Delete, which moves the folder to the Trash.
+    pub deletable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -440,6 +443,41 @@ pub async fn open_link(link: Link) -> Result<(), String> {
     blocking(move || about::open(link)).await
 }
 
+/// Shows a notice's folder in Finder.
+#[tauri::command]
+pub async fn reveal_notice(state: SharedState<'_>, path: String) -> Result<(), String> {
+    let shared = Arc::clone(&state);
+    blocking(move || {
+        let config = load_config(&shared)?;
+        tasks::reveal_folder(Path::new(&path), &config.roots)
+    })
+    .await
+}
+
+/// Moves a broken worktree to the Trash, after judging it again. It stays out
+/// of the history and totals, because the space returns only when the Trash
+/// is emptied. The run lock keeps any clean, including the CLI's, from
+/// starting meanwhile. The config is read after taking it, so the ignore list
+/// is the current one.
+#[tauri::command]
+pub async fn delete_notice(state: SharedState<'_>, path: String) -> Result<(), String> {
+    let shared = Arc::clone(&state);
+    blocking(move || {
+        let refused = |why: String| format!("did not delete {path}: {why}");
+        let _run = RunLock::acquire(&shared.paths.lock).map_err(|e| refused(format!("{e:#}")))?;
+        let target = Path::new(&path);
+        let config = load_config(&shared)?;
+        let found = poll::scan(&config.roots, &shared.uuids);
+        let volumes = found.readings.iter().map(|(v, _)| v);
+        let volume = tasks::volume_holding(target, volumes).map_err(refused)?;
+        let exclude = tasks::build_exclude(&config.exclude).map_err(|e| format!("{e:#}"))?;
+        let ctx = Ctx::for_volume(volume, &exclude, SystemTime::now(), &shared.sizes);
+        ctx.set_keep(IgnoreList::new(&config.ignore));
+        tasks::trash_broken_worktree(target, &ctx, shared.is_cleaning())
+    })
+    .await
+}
+
 /// Shows the macOS folder picker as a sheet on the calling window. Returns the
 /// chosen folder as it should appear in `roots` (`~/…` inside the home
 /// folder), or `None` if the user cancelled.
@@ -526,6 +564,7 @@ pub(crate) fn preview_view(
                     path: n.path.display().to_string(),
                     size_text: disk::format_bytes(n.bytes),
                     message: n.message.clone(),
+                    deletable: n.deletable,
                 })
                 .collect();
             match &s.result {
@@ -647,6 +686,7 @@ mod tests {
             path: PathBuf::from("/w/stuck"),
             bytes: 3_000_000_000,
             message: "broken".into(),
+            deletable: true,
         };
         let scan = |result| TaskScan {
             task: "git_worktrees",
@@ -664,6 +704,7 @@ mod tests {
                     path: "/w/stuck".into(),
                     size_text: "3.0 GB".into(),
                     message: "broken".into(),
+                    deletable: true,
                 }]
             );
         }

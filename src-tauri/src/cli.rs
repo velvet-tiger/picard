@@ -282,6 +282,7 @@ mod tests {
                 path: PathBuf::from("/w/stuck"),
                 bytes: 3_000_000_000,
                 message: "broken git worktree".into(),
+                deletable: true,
             }],
         }];
         let space = DiskSpace {
@@ -365,6 +366,7 @@ mod tests {
                 path: PathBuf::from("/w/a\u{1b}[2J\nb é"),
                 bytes: 0,
                 message: "broken".into(),
+                deletable: false,
             }],
         }];
         let space = DiskSpace {

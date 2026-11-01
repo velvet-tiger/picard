@@ -24,6 +24,8 @@ const COMMANDS: &[&str] = &[
     "install_update",
     "restart_to_update",
     "open_link",
+    "reveal_notice",
+    "delete_notice",
 ];
 
 fn main() {

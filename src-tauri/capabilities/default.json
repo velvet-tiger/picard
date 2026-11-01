@@ -27,6 +27,8 @@
     "allow-check-for-update",
     "allow-install-update",
     "allow-restart-to-update",
-    "allow-open-link"
+    "allow-open-link",
+    "allow-reveal-notice",
+    "allow-delete-notice"
   ]
 }

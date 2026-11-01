@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reveal-notice"
+description = "Enables the reveal_notice command without any pre-configured scope."
+commands.allow = ["reveal_notice"]
+
+[[permission]]
+identifier = "deny-reveal-notice"
+description = "Denies the reveal_notice command without any pre-configured scope."
+commands.deny = ["reveal_notice"]

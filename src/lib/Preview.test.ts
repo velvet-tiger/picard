@@ -91,6 +91,8 @@ function backend(handlers: Record<string, Handler> = {}) {
     run_selected: () => [],
     get_scan_state: () => ({ state: 'idle' }) satisfies ScanPhase,
     cancel_scan: () => null,
+    reveal_notice: () => null,
+    delete_notice: () => null,
     ...handlers,
   })
 }
@@ -1246,10 +1248,26 @@ describe('Preview', () => {
     function withNotice(): VolumePreview[] {
       const found = volumes()
       found[0].tasks[1].notices = [
-        { path: STUCK, size_text: '3 GB', message: 'broken git worktree: its repo is gone' },
+        {
+          path: STUCK,
+          size_text: '3 GB',
+          message: 'broken git worktree: its repo is gone',
+          deletable: true,
+        },
       ]
       return found
     }
+
+    /** The usual scan, with a worktree only a person may delete by hand. */
+    function withUndeletableNotice(): VolumePreview[] {
+      const found = withNotice()
+      found[0].tasks[1].notices![0].deletable = false
+      return found
+    }
+
+    const notices = () => within(screen.getByRole('region', { name: 'Needs you' }))
+    const button = (name: string) => notices().getByRole('button', { name })
+    const STUCK_SHOWN = '~/w/shop/.claude/worktrees/stuck'
 
     it('shows nothing when no task has a notice', async () => {
       backend()
@@ -1274,13 +1292,96 @@ describe('Preview', () => {
       expect(screen.getByRole('region', { name: 'Needs you' })).toBeInTheDocument()
     })
 
-    it('offers no way to tick or clean a notice, and leaves it out of the total', async () => {
+    it('gives a notice no checkbox, and leaves it out of the total', async () => {
       backend({ preview: () => withNotice() })
       await renderScanned()
       const region = screen.getByRole('region', { name: 'Needs you' })
       expect(within(region).queryByRole('checkbox')).toBeNull()
-      expect(within(region).queryByRole('button')).toBeNull()
       expect(screen.getByText(/^up to 3\.5 GB/)).toBeInTheDocument()
+    })
+
+    it('opens any notice in Finder', async () => {
+      const api = backend({ preview: () => withUndeletableNotice() })
+      await renderScanned()
+      await fireEvent.click(button(`Open ${STUCK_SHOWN} in Finder`))
+      await waitFor(() => expect(api.sent('reveal_notice')).toEqual([{ path: STUCK }]))
+    })
+
+    it('shows a failure to open Finder', async () => {
+      backend({
+        preview: () => withNotice(),
+        reveal_notice: () => {
+          throw 'could not show it'
+        },
+      })
+      await renderScanned()
+      await fireEvent.click(button(`Open ${STUCK_SHOWN} in Finder`))
+      expect(await screen.findByText('could not show it')).toBeInTheDocument()
+    })
+
+    it('offers Delete only on a deletable notice', async () => {
+      backend({ preview: () => withUndeletableNotice() })
+      await renderScanned()
+      expect(notices().queryByRole('button', { name: `Delete ${STUCK_SHOWN}` })).toBeNull()
+    })
+
+    it('asks first, naming the folder, its size and the Trash', async () => {
+      const api = backend({ preview: () => withNotice() })
+      await renderScanned()
+      await fireEvent.click(button(`Delete ${STUCK_SHOWN}`))
+      expect(
+        notices().getByText(`Move ${STUCK_SHOWN} (3 GB) to the Trash?`),
+      ).toBeInTheDocument()
+      expect(api.sent('delete_notice')).toEqual([])
+    })
+
+    it('makes no call when the confirmation is cancelled', async () => {
+      const api = backend({ preview: () => withNotice() })
+      await renderScanned()
+      await fireEvent.click(button(`Delete ${STUCK_SHOWN}`))
+      await fireEvent.click(button(`Cancel deleting ${STUCK_SHOWN}`))
+      await settle()
+      expect(api.sent('delete_notice')).toEqual([])
+      expect(button(`Delete ${STUCK_SHOWN}`)).toBeInTheDocument()
+      expect(notices().queryByText(/to the Trash\?/)).toBeNull()
+    })
+
+    it('removes the row after a confirmed delete, without a new scan', async () => {
+      const api = backend({ preview: () => withNotice() })
+      await renderScanned()
+      await fireEvent.click(button(`Delete ${STUCK_SHOWN}`))
+      await fireEvent.click(button(`Move ${STUCK_SHOWN} to the Trash`))
+      await waitFor(() => expect(screen.queryByRole('region', { name: 'Needs you' })).toBeNull())
+      expect(api.sent('delete_notice')).toEqual([{ path: STUCK }])
+      expect(api.sent('preview')).toHaveLength(1)
+    })
+
+    it('disables the row while a delete is in flight', async () => {
+      const reply = deferred<null>()
+      backend({ preview: () => withNotice(), delete_notice: () => reply.promise })
+      await renderScanned()
+      await fireEvent.click(button(`Delete ${STUCK_SHOWN}`))
+      await fireEvent.click(button(`Move ${STUCK_SHOWN} to the Trash`))
+      await waitFor(() => expect(button(`Delete ${STUCK_SHOWN}`)).toBeDisabled())
+      expect(button(`Open ${STUCK_SHOWN} in Finder`)).toBeDisabled()
+      reply.resolve(null)
+      await waitFor(() => expect(screen.queryByRole('region', { name: 'Needs you' })).toBeNull())
+    })
+
+    it('keeps the row and shows why when a delete fails', async () => {
+      backend({
+        preview: () => withNotice(),
+        delete_notice: () => {
+          throw 'did not delete it: a running process is using it'
+        },
+      })
+      await renderScanned()
+      await fireEvent.click(button(`Delete ${STUCK_SHOWN}`))
+      await fireEvent.click(button(`Move ${STUCK_SHOWN} to the Trash`))
+      expect(
+        await screen.findByText('did not delete it: a running process is using it'),
+      ).toBeInTheDocument()
+      expect(button(`Delete ${STUCK_SHOWN}`)).toBeInTheDocument()
     })
   })
 })
