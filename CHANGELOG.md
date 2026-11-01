@@ -22,6 +22,7 @@ All notable changes to Picard are recorded here. The format follows
 
 ### Fixed
 
+- The folder names field in Settings can be edited again. It used to delete each comma as you typed it, so you could not add a name.
 - `git worktree remove` now has 30 minutes instead of 60 seconds. A large worktree could reach the old limit, and stopping it part way left the worktree half deleted.
 - `build_output` now judges each folder again just before removing it. It used to act on the scan's answer alone.
 - `build_output` used to skip a folder it could not read while looking for nested repos, so a repo inside it went unseen. It now keeps the output folder.

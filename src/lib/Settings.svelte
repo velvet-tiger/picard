@@ -17,6 +17,7 @@
     withEveryBuiltIn,
     TASK_LABELS,
     type Settings,
+    type Task,
   } from './api'
 
   let settings = $state<Settings | null>(null)
@@ -36,6 +37,10 @@
   // changes this list too, and Save must not write back an older copy.
   let ignoredFolders = $state<string[]>([])
   let ignoreError = $state<string | null>(null)
+  // The text of the folder names field while it has focus. Joining the parsed
+  // list back into the field on each keystroke would delete a comma as soon as
+  // it was typed, so no second name could be started.
+  let dirsDraft = $state.raw<{ task: Task; text: string } | null>(null)
   let removingIgnored = $state<string | null>(null)
 
   async function loadIgnored() {
@@ -464,13 +469,16 @@
                 <input
                   class="wide path"
                   bind:value={
-                    () => task.dirs.join(', '),
-                    (v: string) =>
-                      (task.dirs = v
+                    () => (dirsDraft?.task === task ? dirsDraft.text : task.dirs.join(', ')),
+                    (v: string) => {
+                      dirsDraft = { task, text: v }
+                      task.dirs = v
                         .split(',')
                         .map((d) => d.trim())
-                        .filter(Boolean))
+                        .filter(Boolean)
+                    }
                   }
+                  onblur={() => (dirsDraft = null)}
                   placeholder="dist, build, .next, vendor, .terraform, storybook-static, target"
                 />
               </div>

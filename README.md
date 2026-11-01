@@ -214,7 +214,7 @@ enabled = false
 
 Every task also accepts `enabled = false`.
 
-`dirs` entries must be plain folder names. Picard refuses paths, `.git`, and names with glob characters such as `*`. A `dirs` list you set replaces the defaults, so a later release that adds a default name does not reach it. Add new names yourself. Other build folders work the same way. For example, add `target` for Maven projects.
+`dirs` entries must be plain folder names. Picard refuses paths, `.git`, and names with glob characters such as `*`. A `dirs` list you set replaces the defaults, so a later release that adds a default name does not reach it. Add new names yourself. Other build folders work the same way. For example, add `Pods` for CocoaPods projects.
 
 `appearance` sets the Picard window to light or dark. Left out, the window follows the macOS setting. Saving **System** in Settings takes the key out of the config. A change from Settings applies when you press **Save**. A change made by editing the file applies the next time the window opens.
 

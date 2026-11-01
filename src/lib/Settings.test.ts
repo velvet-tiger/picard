@@ -65,6 +65,33 @@ describe('Settings', () => {
     expect(screen.getByPlaceholderText(task.dirs.join(', '))).toBeInTheDocument()
   })
 
+  it('lets you type a new build folder name', async () => {
+    const task = newTask('build_output')
+    if (task.type !== 'build_output') throw new Error('wrong task type')
+    task.dirs = ['dist']
+    const { sent } = backend({ get_settings: () => ({ ...config(), tasks: [task] }) })
+    await renderLoaded()
+    const input = screen.getByDisplayValue('dist') as HTMLInputElement
+
+    await fireEvent.input(input, { target: { value: 'dist,' } })
+    expect(input.value).toBe('dist,')
+    await fireEvent.input(input, { target: { value: 'dist, ou' } })
+    expect(input.value).toBe('dist, ou')
+    await fireEvent.input(input, { target: { value: 'dist, out,' } })
+    await fireEvent.blur(input)
+    expect(input.value).toBe('dist, out')
+
+    await fireEvent.click(saveButton())
+    await screen.findByText('Saved. Picard has reloaded the settings.')
+    expect(sent('save_settings')).toEqual([
+      {
+        settings: expect.objectContaining({
+          tasks: expect.arrayContaining([expect.objectContaining({ dirs: ['dist', 'out'] })]),
+        }),
+      },
+    ])
+  })
+
   it('shows the load error', async () => {
     backend({
       get_settings: () => {
