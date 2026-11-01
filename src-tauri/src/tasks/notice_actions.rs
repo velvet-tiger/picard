@@ -96,18 +96,32 @@ pub fn volume_holding<'v>(
         .ok_or_else(|| "is outside the configured roots".to_string())
 }
 
-/// Refuses a folder that sits inside a folder Picard would never search, or
-/// inside any `.git`. The scan cannot have found one there, so the row is stale
-/// or forged.
+/// Refuses a folder that sits inside a folder Picard would never search,
+/// inside any `.git`, or deeper than the search goes. The scan cannot have
+/// found one there, so the row is stale or forged. Roots can nest, so the
+/// nearest root counts. Also refuses a folder inside an ignored folder. A
+/// clean would remove that one, because protection never reaches down, but
+/// Delete has no scan's judgement behind it, so it is stricter on purpose.
 fn check_placement(canon: &Path, ctx: &Ctx) -> Result<(), String> {
     if canon.components().any(|c| c.as_os_str() == ".git") {
         return Err("sits inside a .git folder".to_string());
     }
-    let root = ctx.roots.iter().find(|r| canon.starts_with(r));
-    for folder in canon
-        .ancestors()
-        .take_while(|a| Some(*a) != root.map(PathBuf::as_path))
-    {
+    if canon.ancestors().skip(1).any(|a| ctx.is_ignored(a)) {
+        return Err("sits inside an ignored folder".to_string());
+    }
+    let Some(root) = ctx
+        .roots
+        .iter()
+        .filter(|r| canon.starts_with(r))
+        .max_by_key(|r| r.components().count())
+    else {
+        return Err("is outside the configured roots".to_string());
+    };
+    let depth = canon.components().count() - root.components().count();
+    if depth > SEARCH_DEPTH {
+        return Err("sits deeper than Picard searches".to_string());
+    }
+    for folder in canon.ancestors().take_while(|a| a != root) {
         if ctx.exclude.is_match(folder) {
             return Err("sits inside an excluded folder".to_string());
         }
@@ -138,8 +152,9 @@ fn check_folder(path: &Path, ctx: &Ctx) -> Result<PathBuf, String> {
 }
 
 /// Refuses a folder that holds a root, the home folder or another checkout.
-/// Depth and `CONTENTS_NOT_SEARCHED` limit only the search for checkouts. A
-/// root or the home folder is found from its path, wherever it sits.
+/// `CONTENTS_NOT_SEARCHED` limits only the search for checkouts, and
+/// `entry_cap` bounds it. A root or the home folder is found from its path,
+/// wherever it sits.
 fn check_contents(canon: &Path, kept: &KeptFolders, entry_cap: usize) -> Result<(), String> {
     let holds =
         |p: &Path| p.starts_with(canon) || p.canonicalize().is_ok_and(|c| c.starts_with(canon));
@@ -154,7 +169,6 @@ fn check_contents(canon: &Path, kept: &KeptFolders, entry_cap: usize) -> Result<
     }
     let walk = WalkDir::new(canon)
         .follow_links(false)
-        .max_depth(SEARCH_DEPTH)
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_str();
@@ -175,8 +189,21 @@ fn check_contents(canon: &Path, kept: &KeptFolders, entry_cap: usize) -> Result<
                 entry.path().display()
             ));
         }
+        if entry.file_type().is_dir() && is_bare_repo(entry.path()) {
+            return Err(format!(
+                "it holds a bare git repo at {}. Check it, then delete it yourself",
+                entry.path().display()
+            ));
+        }
     }
     Ok(())
+}
+
+/// True if `dir` has both `HEAD` and `objects`, as a git repo does. Neither is
+/// followed if it is a symlink.
+fn is_bare_repo(dir: &Path) -> bool {
+    let has = |name| std::fs::symlink_metadata(dir.join(name)).is_ok();
+    has("HEAD") && has("objects")
 }
 
 /// Returns the canonical path of `path` if it may go to the Trash now.
@@ -453,6 +480,61 @@ mod tests {
             let err = refusal(&wt, &fx.ctx());
             assert!(err.contains(why), "{err}");
         }
+    }
+
+    #[test]
+    fn the_nearest_of_two_nested_roots_decides() {
+        let fx = Fixture::new(&[]);
+        let wt = broken(&fx, "target/sub/wt");
+        let mut ctx = fx.ctx();
+        assert!(refusal(&wt, &ctx).contains("sits inside"));
+        let nested = fx.root.canonicalize().unwrap().join("target/sub");
+        ctx.roots.push(nested);
+        assert!(check_with_in_use(&wt, &ctx, vec![]).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_folder_inside_an_ignored_folder_but_not_beside_one() {
+        let fx = Fixture::new(&[]);
+        let wt = broken(&fx, "a/stuck");
+        fx.file("a/other/x.txt", 1);
+        let ctx = fx.ctx();
+        ctx.set_keep(IgnoreList::new(&[fx.root.join("a/other")]));
+        assert!(check_with_in_use(&wt, &ctx, vec![]).is_ok());
+        ctx.set_keep(IgnoreList::new(&[fx.root.join("a")]));
+        let err = refusal(&wt, &ctx);
+        assert!(err.contains("sits inside an ignored folder"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_folder_deeper_than_the_search_goes() {
+        let fx = Fixture::new(&[]);
+        let deepest = broken(&fx, "1/2/3/4/5/6/7/8");
+        assert!(check_with_in_use(&deepest, &fx.ctx(), vec![]).is_ok());
+        let too_deep = broken(&fx, "a/2/3/4/5/6/7/8/9");
+        let err = refusal(&too_deep, &fx.ctx());
+        assert!(err.contains("deeper than Picard searches"), "{err}");
+    }
+
+    #[test]
+    fn finds_a_nested_checkout_at_any_depth() {
+        let fx = Fixture::new(&[]);
+        let wt = broken(&fx, "stuck");
+        fx.file("stuck/1/2/3/4/5/6/7/8/9/10/11/.git/HEAD", 1);
+        let err = refusal(&wt, &fx.ctx());
+        assert!(err.contains("another git checkout"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_folder_holding_a_bare_repo() {
+        let fx = Fixture::new(&[]);
+        let wt = broken(&fx, "stuck");
+        fx.file("stuck/a/repo.git/HEAD", 1);
+        assert!(check_with_in_use(&wt, &fx.ctx(), vec![]).is_ok());
+        fx.file("stuck/a/repo.git/objects/info", 1);
+        let err = refusal(&wt, &fx.ctx());
+        assert!(err.contains("a bare git repo"), "{err}");
+        assert!(err.contains("delete it yourself"), "{err}");
     }
 
     #[test]

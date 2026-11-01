@@ -302,6 +302,13 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// True if `path` is itself in the ignore list. Holding an ignored folder
+    /// does not count.
+    pub fn is_ignored(&self, path: &Path) -> bool {
+        let keep = self.keep.read().unwrap_or_else(PoisonError::into_inner);
+        keep.protects(path) == Some(Protected::Ignored)
+    }
+
     /// Searches all of `roots` (every configured root, on any volume) for owners
     /// of removable folders, while removal stays limited to this volume's roots.
     pub fn with_search_roots(mut self, roots: &[PathBuf]) -> Self {
