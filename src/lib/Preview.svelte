@@ -190,6 +190,7 @@
   function show(found: VolumePreview[]) {
     stale = null
     volumes = found
+    confirmingDelete = null
     // A skip lasts for one list; a fresh scan offers every row again.
     skipped = {}
     // Everything not ignored starts ticked; one click on "Clean selected" removes it all.
@@ -570,11 +571,14 @@
 
   /** The notice whose Delete waits for a second click, keyed like `checked`. */
   let confirmingDelete = $state<string | null>(null)
+  // The run lock lets one delete through at a time, so a second would only fail.
+  let deletesInFlight = $state(0)
+  const deleteBlocked = (k: string) =>
+    deletesInFlight > 0 || toggling[k] || cleaning || cleaningAnywhere
 
   async function reveal(mount: string, path: string) {
     const k = key(mount, path)
     toggling[k] = true
-    error = null
     try {
       await revealNotice(path)
     } catch (e) {
@@ -586,25 +590,40 @@
   }
 
   /**
-   * Moves a confirmed notice to the Trash and drops its row. The stored scan
-   * may still list it, but the backend refuses a row that went stale.
+   * Moves a confirmed notice to the Trash, then drops it and every row under
+   * it. A row that went stale fails safely, because the backend judges it again.
    */
   async function deleteConfirmed(mount: string, path: string) {
     const k = key(mount, path)
     confirmingDelete = null
     toggling[k] = true
+    deletesInFlight++
     error = null
     try {
       await deleteNotice(path)
-      for (const v of volumes) {
-        for (const t of v.tasks) t.notices = t.notices?.filter((n) => n.path !== path)
-      }
+      dropRows(path)
     } catch (e) {
       error = errorText(e)
     } finally {
+      deletesInFlight--
       toggling[k] = false
     }
     afterBusy()
+  }
+
+  /** Takes `path` and everything under it off the page, with its ticks and skips. */
+  function dropRows(path: string) {
+    const gone = (p: string) => p === path || p.startsWith(`${path}/`)
+    for (const v of volumes) {
+      for (const t of v.tasks) {
+        t.notices = t.notices?.filter((n) => !gone(n.path))
+        for (const i of t.items.filter((i) => gone(i.path))) {
+          delete checked[key(v.mount, i.path)]
+          delete skipped[key(v.mount, i.path)]
+        }
+        t.items = t.items.filter((i) => !gone(i.path))
+      }
+    }
   }
 
   let refreshCalls = 0
@@ -854,7 +873,7 @@
                     <button
                       class="row-action"
                       onclick={() => (confirmingDelete = k)}
-                      disabled={toggling[k] || cleaning}
+                      disabled={deleteBlocked(k)}
                       aria-label="Delete {tildePath(n.path)}">Delete</button
                     >
                   {/if}
@@ -864,7 +883,7 @@
                       <button
                         class="row-action"
                         onclick={() => deleteConfirmed(v.mount, n.path)}
-                        disabled={toggling[k] || cleaning}
+                        disabled={deleteBlocked(k)}
                         aria-label="Move {tildePath(n.path)} to the Trash">Move to Trash</button
                       >
                       <button

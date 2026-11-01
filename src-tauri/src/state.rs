@@ -1,7 +1,7 @@
 //! State shared by the poll loop and the window commands.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use tauri::{AppHandle, Runtime};
 
 use crate::commands::VolumePreview;
+use crate::disk::format_bytes;
 use crate::preview_scans::PreviewScans;
 use crate::tasks::Stop;
 use crate::tray::{self, TrayState};
@@ -168,6 +169,12 @@ impl Shared {
         self.lock_previews().mark_cleaned(mount, Utc::now());
     }
 
+    /// Drops `path`, and everything under it, from the stored scans. The rest
+    /// of each scan stays, so unlike `mark_cleaned` no banner follows.
+    pub fn forget_preview_path(&self, path: &Path) {
+        self.lock_previews().forget_path(path);
+    }
+
     /// A panic while holding the lock cannot leave the store half-written:
     /// each write is one `retain`, `insert` or swap of a finished list, so a
     /// poisoned lock is still usable.
@@ -237,6 +244,29 @@ impl PreviewStore {
         self.list = kept;
     }
 
+    /// See `Shared::forget_preview_path`. Totals lose only what they counted,
+    /// and protected items were never counted.
+    fn forget_path(&mut self, gone: &Path) {
+        let is_gone = |p: &str| Path::new(p).starts_with(gone);
+        for volume in &mut self.list {
+            let mut uncounted = 0;
+            for task in &mut volume.tasks {
+                task.notices.retain(|n| !is_gone(&n.path));
+                task.items.retain(|i| {
+                    let keep = !is_gone(&i.path);
+                    if !keep && !i.ignored && !i.holds_ignored {
+                        uncounted += i.bytes;
+                    }
+                    keep
+                });
+            }
+            if uncounted > 0 {
+                volume.total_bytes = volume.total_bytes.saturating_sub(uncounted);
+                volume.total_text = format_bytes(volume.total_bytes);
+            }
+        }
+    }
+
     /// Drops the entry for `mount` and refuses its scans that started before `at`.
     fn mark_cleaned(&mut self, mount: &str, at: DateTime<Utc>) {
         self.list.retain(|v| v.mount != mount);
@@ -270,6 +300,7 @@ fn tell_window_cleaning<R: Runtime>(app: &AppHandle<R>, cleaning: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::{PreviewItem, PreviewNotice, PreviewTask};
     use chrono::TimeZone;
 
     fn at(minute: u32) -> DateTime<Utc> {
@@ -301,6 +332,45 @@ mod tests {
             .iter()
             .map(|v| (v.mount.as_str(), v.scanned_at))
             .collect()
+    }
+
+    #[test]
+    fn forgetting_a_path_drops_it_and_what_is_under_it_and_nothing_else() {
+        let item = |path: &str, bytes, ignored| PreviewItem {
+            path: path.into(),
+            bytes,
+            size_text: String::new(),
+            reason: String::new(),
+            ignored,
+            holds_ignored: false,
+        };
+        let notice = |path: &str| PreviewNotice {
+            path: path.into(),
+            size_text: String::new(),
+            message: String::new(),
+            deletable: true,
+        };
+        let mut volume = preview("/", 1);
+        volume.total_bytes = 300;
+        volume.tasks.push(PreviewTask {
+            task: "git_worktrees".into(),
+            items: vec![
+                item("/w/stuck/node_modules", 100, false),
+                item("/w/stuck/dist", 900, true),
+                item("/w/stuck-two/node_modules", 200, false),
+            ],
+            error: None,
+            notices: vec![notice("/w/stuck"), notice("/w/stuck-two")],
+        });
+        let mut s = store(vec![volume]);
+        s.forget_path(Path::new("/w/stuck"));
+        let kept = &s.list[0];
+        let task = &kept.tasks[0];
+        assert_eq!(task.items.len(), 1);
+        assert_eq!(task.items[0].path, "/w/stuck-two/node_modules");
+        assert_eq!(task.notices, vec![notice("/w/stuck-two")]);
+        assert_eq!(kept.total_bytes, 200);
+        assert!(s.cleaned.is_empty(), "this is not a clean");
     }
 
     #[test]

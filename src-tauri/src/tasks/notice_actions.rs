@@ -17,8 +17,9 @@ use std::time::Duration;
 use anyhow::Result;
 use trash::TrashContext;
 use trash::macos::{DeleteMethod, TrashContextExtMacos};
+use walkdir::WalkDir;
 
-use super::git_worktrees::broken_worktree;
+use super::git_worktrees::{SEARCH_DEPTH, SKIP_DIRS, broken_worktree, surely_broken};
 use super::in_use::InUse;
 use super::{Ctx, check_target};
 use crate::volume::Volume;
@@ -26,6 +27,19 @@ use crate::volume::Volume;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// `open` prints nothing on success and a line or two on failure.
 const OPEN_OUTPUT_CAP: usize = 4 * 1024;
+
+/// Regenerable folders the search for nested checkouts does not enter, so a
+/// broken worktree with installed dependencies can still be deleted.
+const CONTENTS_NOT_SEARCHED: &[&str] = &["node_modules", "target"];
+/// The most entries the search reads. More than this is refused, not skipped.
+const SEARCH_ENTRY_CAP: usize = 200_000;
+
+/// Folders that a trashed folder must not hold.
+pub struct KeptFolders<'a> {
+    /// Every configured root, on any volume.
+    pub roots: &'a [PathBuf],
+    pub home: &'a Path,
+}
 
 /// Returns the canonical path of `path` if it is a real folder at or inside
 /// one of `roots`. A root can hold a notice, so unlike `check_target` this
@@ -82,62 +96,155 @@ pub fn volume_holding<'v>(
         .ok_or_else(|| "is outside the configured roots".to_string())
 }
 
+/// Refuses a folder that sits inside a folder Picard would never search, or
+/// inside any `.git`. The scan cannot have found one there, so the row is stale
+/// or forged.
+fn check_placement(canon: &Path, ctx: &Ctx) -> Result<(), String> {
+    if canon.components().any(|c| c.as_os_str() == ".git") {
+        return Err("sits inside a .git folder".to_string());
+    }
+    let root = ctx.roots.iter().find(|r| canon.starts_with(r));
+    for folder in canon
+        .ancestors()
+        .take_while(|a| Some(*a) != root.map(PathBuf::as_path))
+    {
+        if ctx.exclude.is_match(folder) {
+            return Err("sits inside an excluded folder".to_string());
+        }
+        if folder
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| SKIP_DIRS.contains(&n))
+        {
+            return Err(format!("sits inside {}", folder.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Everything about the folder itself that must hold. Returns its canonical
+/// path. The caller must have refreshed the ignore list on `ctx`.
+fn check_folder(path: &Path, ctx: &Ctx) -> Result<PathBuf, String> {
+    let canon = check_target(path, ctx)?;
+    ctx.refuse_kept(&canon)?;
+    check_placement(&canon, ctx)?;
+    if broken_worktree(&canon).is_none() {
+        return Err("is not a broken worktree".to_string());
+    }
+    if !surely_broken(&canon) {
+        return Err("its repo may be on a drive that is not mounted".to_string());
+    }
+    Ok(canon)
+}
+
+/// Refuses a folder that holds a root, the home folder or another checkout.
+/// Depth and `CONTENTS_NOT_SEARCHED` limit only the search for checkouts. A
+/// root or the home folder is found from its path, wherever it sits.
+fn check_contents(canon: &Path, kept: &KeptFolders, entry_cap: usize) -> Result<(), String> {
+    let holds =
+        |p: &Path| p.starts_with(canon) || p.canonicalize().is_ok_and(|c| c.starts_with(canon));
+    if let Some(root) = kept.roots.iter().find(|r| holds(r)) {
+        return Err(format!(
+            "it holds {}, a configured root. Check it, then delete it yourself",
+            root.display()
+        ));
+    }
+    if holds(kept.home) {
+        return Err("it holds your home folder. Check it, then delete it yourself".to_string());
+    }
+    let walk = WalkDir::new(canon)
+        .follow_links(false)
+        .max_depth(SEARCH_DEPTH)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_str();
+            !e.file_type().is_dir() || !name.is_some_and(|n| CONTENTS_NOT_SEARCHED.contains(&n))
+        });
+    for (seen, entry) in walk.enumerate() {
+        if seen >= entry_cap {
+            return Err(
+                "it holds too many files to check. Check it, then delete it yourself".to_string(),
+            );
+        }
+        let entry = entry.map_err(|e| {
+            format!("Picard could not read all of it ({e}). Check it, then delete it yourself")
+        })?;
+        if entry.file_name() == ".git" && entry.depth() > 1 {
+            return Err(format!(
+                "it holds another git checkout at {}. Check it, then delete it yourself",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Returns the canonical path of `path` if it may go to the Trash now.
 ///
 /// Refuses while a clean runs, and fails closed if `load_in_use` fails. The
-/// slow process listing comes last, so a bad path costs nothing. The caller
+/// slow process listing waits until the cheap checks pass. The folder is then
+/// judged once more, so its path and state are what was checked. The caller
 /// must have refreshed the ignore list on `ctx` with `Ctx::set_keep`.
 fn check_broken_worktree(
     path: &Path,
     ctx: &Ctx,
     cleaning: bool,
+    kept: &KeptFolders,
     load_in_use: impl FnOnce() -> Result<InUse>,
 ) -> Result<PathBuf, String> {
     if cleaning {
         return Err("a cleanup is running".to_string());
     }
-    let canon = check_target(path, ctx)?;
-    ctx.refuse_kept(&canon)?;
-    if broken_worktree(&canon).is_none() {
-        return Err("is not a broken worktree".to_string());
-    }
+    let canon = check_folder(path, ctx)?;
+    check_contents(&canon, kept, SEARCH_ENTRY_CAP)?;
     let in_use = load_in_use()
         .map_err(|e| format!("could not check whether a process is using it: {e:#}"))?;
     if in_use.contains(&canon) {
         return Err("a running process is using it".to_string());
     }
+    if check_folder(path, ctx)? != canon {
+        return Err("it moved while Picard was checking it".to_string());
+    }
     Ok(canon)
 }
 
-/// Checks `path`, then hands the canonical path to `trash`.
+/// Checks `path`, then hands the canonical path to `trash`. Returns that path.
 fn trash_checked(
     path: &Path,
     ctx: &Ctx,
     cleaning: bool,
+    kept: &KeptFolders,
     load_in_use: impl FnOnce() -> Result<InUse>,
     trash: impl FnOnce(&Path) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     let refused = |why| format!("did not delete {}: {why}", path.display());
-    let canon = check_broken_worktree(path, ctx, cleaning, load_in_use).map_err(refused)?;
+    let canon = check_broken_worktree(path, ctx, cleaning, kept, load_in_use).map_err(refused)?;
     trash(&canon).map_err(|e| format!("could not delete {}: {e}", canon.display()))?;
     log::info!("moved broken worktree {} to the Trash", canon.display());
-    Ok(())
+    Ok(canon)
 }
 
 /// Moves `path` to the Trash. The crate's default asks Finder through
 /// osascript, which needs an Automation permission, so this picks
 /// NSFileManager. The price is that "Put Back" may not be offered.
-fn move_to_trash(path: &Path) -> Result<(), String> {
+pub fn move_to_trash(path: &Path) -> Result<(), String> {
     let mut trash = TrashContext::new();
     trash.set_delete_method(DeleteMethod::NsFileManager);
     trash.delete(path).map_err(|e| e.to_string())
 }
 
-/// Moves a broken worktree to the Trash, if it still passes every check.
-/// `cleaning` says whether a clean is marked as running. The caller holds the
-/// run lock, so no clean can start until this returns.
-pub fn trash_broken_worktree(path: &Path, ctx: &Ctx, cleaning: bool) -> Result<(), String> {
-    trash_checked(path, ctx, cleaning, InUse::load, move_to_trash)
+/// Hands a broken worktree to `trash`, if it still passes every check, and
+/// returns its canonical path. `cleaning` says whether a clean is marked as
+/// running. The caller holds the run lock, so no clean can start until this
+/// returns.
+pub fn trash_broken_worktree(
+    path: &Path,
+    ctx: &Ctx,
+    cleaning: bool,
+    kept: &KeptFolders,
+    trash: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<PathBuf, String> {
+    trash_checked(path, ctx, cleaning, kept, InUse::load, trash)
 }
 
 #[cfg(test)]
@@ -146,7 +253,11 @@ pub(super) fn check_with_in_use(
     ctx: &Ctx,
     in_use: Vec<PathBuf>,
 ) -> Result<PathBuf, String> {
-    check_broken_worktree(path, ctx, false, || Ok(InUse::from_cwds(in_use)))
+    let kept = KeptFolders {
+        roots: &[],
+        home: Path::new("/nonexistent-home"),
+    };
+    check_broken_worktree(path, ctx, false, &kept, || Ok(InUse::from_cwds(in_use)))
 }
 
 #[cfg(test)]
@@ -162,14 +273,22 @@ mod tests {
     fn broken(fx: &Fixture, name: &str) -> PathBuf {
         let folder = fx.file(&format!("{name}/work.txt"), 10);
         let folder = folder.parent().unwrap().to_path_buf();
+        let id = folder.file_name().unwrap();
         fs::create_dir_all(fx.root.join("repo/.git/worktrees")).unwrap();
-        let record = fx.root.join("repo/.git/worktrees").join(name);
+        let record = fx.root.join("repo/.git/worktrees").join(id);
         fs::write(
             folder.join(".git"),
             format!("gitdir: {}\n", record.display()),
         )
         .unwrap();
         folder
+    }
+
+    fn nothing_kept() -> KeptFolders<'static> {
+        KeptFolders {
+            roots: &[],
+            home: Path::new("/nonexistent-home"),
+        }
     }
 
     fn nothing_in_use() -> Result<InUse> {
@@ -179,7 +298,7 @@ mod tests {
     /// Tries to trash `path` and returns the error, proving nothing was trashed.
     fn refusal(path: &Path, ctx: &Ctx) -> String {
         let trashed = RefCell::new(Vec::new());
-        let result = trash_checked(path, ctx, false, nothing_in_use, |p| {
+        let result = trash_checked(path, ctx, false, &nothing_kept(), nothing_in_use, |p| {
             trashed.borrow_mut().push(p.to_path_buf());
             Ok(())
         });
@@ -192,10 +311,17 @@ mod tests {
         let fx = Fixture::new(&[]);
         let wt = broken(&fx, "stuck");
         let trashed = RefCell::new(Vec::new());
-        trash_checked(&wt, &fx.ctx(), false, nothing_in_use, |p| {
-            trashed.borrow_mut().push(p.to_path_buf());
-            Ok(())
-        })
+        trash_checked(
+            &wt,
+            &fx.ctx(),
+            false,
+            &nothing_kept(),
+            nothing_in_use,
+            |p| {
+                trashed.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(*trashed.borrow(), vec![wt.canonicalize().unwrap()]);
     }
@@ -204,9 +330,14 @@ mod tests {
     fn a_failed_trash_comes_back_with_the_path() {
         let fx = Fixture::new(&[]);
         let wt = broken(&fx, "stuck");
-        let err = trash_checked(&wt, &fx.ctx(), false, nothing_in_use, |_| {
-            Err("the Trash is full".to_string())
-        })
+        let err = trash_checked(
+            &wt,
+            &fx.ctx(),
+            false,
+            &nothing_kept(),
+            nothing_in_use,
+            |_| Err("the Trash is full".to_string()),
+        )
         .unwrap_err();
         assert!(err.contains("stuck"), "{err}");
         assert!(err.contains("the Trash is full"), "{err}");
@@ -293,8 +424,10 @@ mod tests {
     fn refuses_when_the_process_list_cannot_be_read() {
         let fx = Fixture::new(&[]);
         let wt = broken(&fx, "stuck");
-        let err = check_broken_worktree(&wt, &fx.ctx(), false, || anyhow::bail!("lsof broke"))
-            .unwrap_err();
+        let err = check_broken_worktree(&wt, &fx.ctx(), false, &nothing_kept(), || {
+            anyhow::bail!("lsof broke")
+        })
+        .unwrap_err();
         assert!(err.contains("lsof broke"), "{err}");
     }
 
@@ -302,8 +435,132 @@ mod tests {
     fn refuses_while_a_clean_is_running() {
         let fx = Fixture::new(&[]);
         let wt = broken(&fx, "stuck");
-        let err = check_broken_worktree(&wt, &fx.ctx(), true, nothing_in_use).unwrap_err();
+        let err = check_broken_worktree(&wt, &fx.ctx(), true, &nothing_kept(), nothing_in_use)
+            .unwrap_err();
         assert!(err.contains("a cleanup is running"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_folder_inside_a_folder_the_search_skips() {
+        let fx = Fixture::new(&["**/private"]);
+        for (parent, why) in [
+            ("a/node_modules", "sits inside"),
+            ("a/target", "sits inside"),
+            ("a/private", "sits inside an excluded folder"),
+            ("a/.git", "sits inside a .git folder"),
+        ] {
+            let wt = broken(&fx, &format!("{parent}/stuck"));
+            let err = refusal(&wt, &fx.ctx());
+            assert!(err.contains(why), "{err}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_folder_holding_a_nested_checkout() {
+        for nested in [".git/HEAD", "b/.git"] {
+            let fx = Fixture::new(&[]);
+            let wt = broken(&fx, "stuck");
+            fx.file(&format!("stuck/a/{nested}"), 1);
+            let err = refusal(&wt, &fx.ctx());
+            assert!(err.contains("another git checkout"), "{err}");
+            assert!(err.contains("delete it yourself"), "{err}");
+        }
+    }
+
+    #[test]
+    fn dependencies_and_build_output_do_not_stop_a_delete() {
+        let fx = Fixture::new(&[]);
+        let wt = broken(&fx, "stuck");
+        fx.file("stuck/node_modules/dep/.git/HEAD", 1);
+        fx.file("stuck/target/dep/.git/HEAD", 1);
+        assert!(check_with_in_use(&wt, &fx.ctx(), vec![]).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_folder_holding_a_root_or_the_home_folder_at_any_depth() {
+        let fx = Fixture::new(&[]);
+        let wt = broken(&fx, "stuck").canonicalize().unwrap();
+        fx.file("stuck/node_modules/deep/a.txt", 1);
+        let inner = wt.join("node_modules/deep");
+        let roots = [inner.clone()];
+        let as_root = KeptFolders {
+            roots: &roots,
+            home: Path::new("/nonexistent-home"),
+        };
+        let err = check_contents(&wt, &as_root, SEARCH_ENTRY_CAP).unwrap_err();
+        assert!(err.contains("a configured root"), "{err}");
+        let as_home = KeptFolders {
+            roots: &[],
+            home: &inner,
+        };
+        let err = check_contents(&wt, &as_home, SEARCH_ENTRY_CAP).unwrap_err();
+        assert!(err.contains("your home folder"), "{err}");
+    }
+
+    #[test]
+    fn refuses_when_the_entry_cap_is_hit() {
+        let fx = Fixture::new(&[]);
+        let wt = broken(&fx, "stuck");
+        let err = check_contents(&wt, &nothing_kept(), 1).unwrap_err();
+        assert!(err.contains("too many files"), "{err}");
+        assert!(check_contents(&wt, &nothing_kept(), 100).is_ok());
+    }
+
+    #[test]
+    fn refuses_when_an_entry_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = Fixture::new(&[]);
+        let wt = broken(&fx, "stuck");
+        let locked = wt.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = check_contents(&wt, &nothing_kept(), SEARCH_ENTRY_CAP);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.unwrap_err().contains("could not read"));
+    }
+
+    /// `change` runs while the process list loads, the last slow step.
+    fn check_after(path: &Path, ctx: &Ctx, change: impl FnOnce()) -> Result<PathBuf, String> {
+        check_broken_worktree(path, ctx, false, &nothing_kept(), || {
+            change();
+            nothing_in_use()
+        })
+    }
+
+    #[test]
+    fn refuses_a_folder_repaired_during_the_process_listing() {
+        let fx = Fixture::new(&[]);
+        let wt = broken(&fx, "stuck");
+        let err = check_after(&wt, &fx.ctx(), || {
+            fs::create_dir_all(fx.root.join("repo/.git/worktrees/stuck")).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(err, "is not a broken worktree");
+    }
+
+    #[test]
+    fn refuses_a_folder_swapped_for_a_symlink_during_the_process_listing() {
+        let fx = Fixture::new(&[]);
+        let wt = broken(&fx, "stuck");
+        let err = check_after(&wt, &fx.ctx(), || {
+            fs::rename(&wt, fx.root.join("moved")).unwrap();
+            symlink(fx.root.join("moved"), &wt).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(err, "is a symlink");
+    }
+
+    #[test]
+    fn refuses_a_path_that_resolves_elsewhere_after_the_process_listing() {
+        let fx = Fixture::new(&[]);
+        let wt = broken(&fx, "a/stuck");
+        let other = broken(&fx, "b/stuck");
+        let err = check_after(&wt, &fx.ctx(), || {
+            fs::rename(fx.root.join("a"), fx.root.join("old")).unwrap();
+            symlink(other.parent().unwrap(), fx.root.join("a")).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(err, "it moved while Picard was checking it");
     }
 
     #[test]

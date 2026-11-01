@@ -9,7 +9,7 @@ All notable changes to Picard are recorded here. The format follows
 ### Added
 
 - Every row under **Needs you** in the Clean window has an **Open in Finder** button.
-- A broken worktree row has a **Delete** button. After you confirm, Picard moves the folder to the Trash. Picard still never removes one on its own. Just before acting it refuses if the folder is no longer a broken worktree, is ignored or excluded, is in use by a running process, or if a clean is running. A worktree that lost its `.gitignore` cannot be deleted this way. The space returns when the Trash is emptied, so a deleted folder is not added to the history or to "Freed by Picard".
+- A broken worktree row has a **Delete** button. After you confirm, Picard moves the folder to the Trash. Picard still never removes one on its own. Just before acting it refuses if the folder is no longer a broken worktree, is ignored or excluded, is in use by a running process, or if a clean is running. It also refuses a folder that sits inside `node_modules`, `target` or `.git`, or that holds another git checkout, a configured root or the home folder. Delete is not offered if the repo may be on a drive that is not mounted. A worktree that lost its `.gitignore` cannot be deleted this way. Finder's Put Back may not be offered, but the folder can be dragged out of the Trash. The space returns when the Trash is emptied, so a deleted folder is not added to the history or to "Freed by Picard".
 
 ### Changed
 

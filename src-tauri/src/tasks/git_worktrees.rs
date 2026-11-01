@@ -111,7 +111,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -124,8 +125,8 @@ use super::stale_dirs::{FINDER_METADATA, is_file, is_skipped, newest_mtime};
 use super::{Candidate, CleanupTask, Ctx, Estimate, Notice, Removed, Report, check_target};
 
 /// Folders never descended into while looking for repos.
-const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git"];
-const SEARCH_DEPTH: usize = 8;
+pub(super) const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git"];
+pub(super) const SEARCH_DEPTH: usize = 8;
 const SECS_PER_DAY: u64 = 86_400;
 
 /// The largest `.git` file Picard reads. Git writes one line holding a path,
@@ -1330,7 +1331,8 @@ impl CleanupTask for GitWorktrees {
         let mut found: Vec<(PathBuf, &str, bool)> = folders_under(ctx, &ctx.roots)
             .filter_map(|e| {
                 let message = broken_worktree(e.path())?;
-                Some((e.into_path(), message, true))
+                let deletable = surely_broken(e.path());
+                Some((e.into_path(), message, deletable))
             })
             .collect();
         let lost = self
@@ -1399,15 +1401,7 @@ fn find_repos(ctx: &Ctx) -> Vec<PathBuf> {
 /// names are only checked for existence, so a hostile one can do no harm. A
 /// record on a drive that is not mounted is only out of reach, not gone.
 pub(super) fn broken_worktree(folder: &Path) -> Option<&'static str> {
-    let contents = read_small_file(&folder.join(".git"), GIT_FILE_LIMIT).ok()??;
-    let record = worktree_record(folder, &contents)?;
-    if on_unmounted_volume(&record) {
-        return None;
-    }
-    match std::fs::symlink_metadata(&record) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        _ => return None,
-    }
+    let record = missing_record(folder)?;
     // `<git dir>/worktrees/<id>`, so two levels up is the repo's git dir.
     let git_dir = record.parent()?.parent()?;
     Some(if std::fs::symlink_metadata(git_dir).is_ok() {
@@ -1417,13 +1411,93 @@ pub(super) fn broken_worktree(folder: &Path) -> Option<&'static str> {
     })
 }
 
+/// The worktree record `folder`'s `.git` file names, if it does not exist.
+fn missing_record(folder: &Path) -> Option<PathBuf> {
+    let contents = read_small_file(&folder.join(".git"), GIT_FILE_LIMIT).ok()??;
+    let record = worktree_record(folder, &contents)?;
+    if on_unmounted_volume(&record) {
+        return None;
+    }
+    match std::fs::symlink_metadata(&record) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(record),
+        _ => None,
+    }
+}
+
+/// The stricter test behind Delete. `broken_worktree` only decides what to
+/// list, and a healthy worktree whose repo is on an unplugged drive can pass
+/// it. This also needs proof that the record is gone, not out of reach.
+pub(super) fn surely_broken(folder: &Path) -> bool {
+    missing_record(folder).is_some_and(|r| record_surely_gone(&r, Path::new("/Volumes")))
+}
+
+/// True unless `record` may only be out of reach: through a dangling symlink,
+/// or on a drive under `volumes` that is not mounted. Both the path as written
+/// and the place it really reaches are tested. A failed read counts against it.
+fn record_surely_gone(record: &Path, volumes: &Path) -> bool {
+    let record = lexically_normal(record);
+    let Some(reaches) = deepest_existing(&record).and_then(|p| p.canonicalize().ok()) else {
+        return false;
+    };
+    !on_unmounted_drive(&record, volumes) && !on_unmounted_drive(&reaches, volumes)
+}
+
+/// `path` with `.` and `..` worked out from the text alone.
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The deepest ancestor of `path` that exists, which may be a dangling
+/// symlink. `None` if a read fails for any reason but "not found".
+fn deepest_existing(path: &Path) -> Option<&Path> {
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => return Some(ancestor),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// True if `path` sits in `<volumes>/<name>` and that folder is missing, or is
+/// only a leftover folder. A mounted drive has its own device.
+fn on_unmounted_drive(path: &Path, volumes: &Path) -> bool {
+    let Some(name) = path
+        .strip_prefix(volumes)
+        .ok()
+        .and_then(|rest| rest.components().next())
+    else {
+        return false;
+    };
+    match (
+        std::fs::metadata(volumes),
+        std::fs::metadata(volumes.join(name)),
+    ) {
+        (Ok(parent), Ok(drive)) => drive.dev() == parent.dev(),
+        _ => true,
+    }
+}
+
 /// The path a `.git` file names, if the file has the form a linked worktree's
 /// does: `gitdir: <git dir>/worktrees/<id>`, with one id. A relative path
-/// starts at `folder`. The contents are untrusted, so anything else gives None.
+/// starts at `folder`. The contents are untrusted, so anything else gives
+/// None. That includes a `\r`: Git writes none, and with CRLF the path would
+/// end in `\r`, so the record of a healthy worktree would look missing.
 fn worktree_record(folder: &Path, contents: &[u8]) -> Option<PathBuf> {
     let line = std::str::from_utf8(contents).ok()?.strip_suffix('\n')?;
     let target = Path::new(line.strip_prefix("gitdir: ")?);
-    if line.contains('\n') || target.file_name().is_none() {
+    if line.contains(['\n', '\r']) || target.file_name().is_none() {
         return None;
     }
     let record = folder.join(target);
@@ -2218,6 +2292,84 @@ mod tests {
             check_with_in_use(&wt, &ctx, vec![]).unwrap(),
             wt.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn a_git_file_with_crlf_is_never_reported_broken() {
+        let fx = Fixture::new(&[]);
+        let r = repo(&fx);
+        let healthy = worktree(&r, "healthy");
+        let gone = broken(&fx, &r, "gone");
+        for wt in [&healthy, &gone] {
+            let line = std::fs::read_to_string(wt.join(".git")).unwrap();
+            let crlf = line.replace('\n', "\r\n");
+            std::fs::write(wt.join(".git"), crlf).unwrap();
+            assert_eq!(broken_worktree(wt), None, "{}", wt.display());
+            assert!(!surely_broken(wt), "{}", wt.display());
+        }
+    }
+
+    #[test]
+    fn a_record_behind_a_dangling_symlink_is_listed_but_not_deletable() {
+        let fx = Fixture::new(&[]);
+        let wt = fx
+            .file("stuck/work.txt", 10)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let link = fx.root.join("link");
+        std::os::unix::fs::symlink(fx.root.join("unplugged"), &link).unwrap();
+        let line = format!("gitdir: {}/.git/worktrees/stuck\n", link.display());
+        std::fs::write(wt.join(".git"), line).unwrap();
+        let notices = task(1, vec![]).notices(&fx.ctx());
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(!notices[0].deletable);
+        let refused = check_with_in_use(&wt, &fx.ctx(), vec![]).unwrap_err();
+        assert!(refused.contains("not mounted"), "{refused}");
+    }
+
+    #[test]
+    fn a_relative_record_is_judged_where_it_really_points() {
+        let fx = Fixture::new(&[]);
+        let volumes = fx.dir.path().canonicalize().unwrap().join("Volumes");
+        std::fs::create_dir_all(volumes.join("Ext")).unwrap();
+        let record = volumes.join("Other/../Ext/repo/.git/worktrees/x");
+        assert!(!record_surely_gone(&record, &volumes));
+    }
+
+    #[test]
+    fn a_leftover_folder_in_volumes_is_not_a_mounted_drive() {
+        let fx = Fixture::new(&[]);
+        let volumes = fx.dir.path().canonicalize().unwrap().join("Volumes");
+        std::fs::create_dir_all(volumes.join("Ext")).unwrap();
+        let record = |name: &str| volumes.join(name).join("repo/.git/worktrees/x");
+        assert!(!record_surely_gone(&record("Ext"), &volumes));
+        assert!(!record_surely_gone(&record("Missing"), &volumes));
+    }
+
+    #[test]
+    fn a_link_into_a_leftover_folder_is_not_a_mounted_drive() {
+        let fx = Fixture::new(&[]);
+        let base = fx.dir.path().canonicalize().unwrap();
+        let volumes = base.join("Volumes");
+        std::fs::create_dir_all(volumes.join("Ext")).unwrap();
+        std::os::unix::fs::symlink(volumes.join("Ext"), base.join("link")).unwrap();
+        let record = base.join("link/repo/.git/worktrees/x");
+        assert!(!record_surely_gone(&record, &volumes));
+    }
+
+    /// `/dev` has its own device, as a mounted drive does.
+    #[test]
+    fn a_record_on_a_mounted_drive_or_the_startup_disk_is_surely_gone() {
+        let fx = Fixture::new(&[]);
+        let base = fx.dir.path().canonicalize().unwrap();
+        let volumes = base.join("Volumes");
+        std::fs::create_dir_all(&volumes).unwrap();
+        std::os::unix::fs::symlink("/dev", volumes.join("Ext")).unwrap();
+        let on_drive = volumes.join("Ext/no-such-repo/.git/worktrees/x");
+        assert!(record_surely_gone(&on_drive, &volumes));
+        let on_disk = base.join("repo/.git/worktrees/x");
+        assert!(record_surely_gone(&on_disk, &volumes));
     }
 
     #[test]

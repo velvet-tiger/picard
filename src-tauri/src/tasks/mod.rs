@@ -26,7 +26,9 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
-pub use notice_actions::{reveal_folder, trash_broken_worktree, volume_holding};
+pub use notice_actions::{
+    KeptFolders, move_to_trash, reveal_folder, trash_broken_worktree, volume_holding,
+};
 pub use size::SizeCache;
 
 use crate::config::{CargoMode, TaskConfig, ToolOverrides};

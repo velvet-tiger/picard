@@ -21,10 +21,10 @@ use crate::disk::{self, DiskSpace};
 use crate::history::{self, Entry, Totals};
 use crate::poll;
 use crate::preview_scans::{self, Request, ScanPhase, Scope};
-use crate::runner::{self, CleanRequest, RunLock, TaskScan, VolumeRun};
+use crate::runner::{self, CleanRequest, LockBusy, RunLock, TaskScan, VolumeRun};
 use crate::settings::{self, Settings};
 use crate::state::Shared;
-use crate::tasks::{self, Ctx, IgnoreList, Protected};
+use crate::tasks::{self, Ctx, IgnoreList, KeptFolders, Protected};
 use crate::updater::{self, UpdateStatus, Updates};
 use crate::volume::Volume;
 use crate::windows;
@@ -454,28 +454,46 @@ pub async fn reveal_notice(state: SharedState<'_>, path: String) -> Result<(), S
     .await
 }
 
-/// Moves a broken worktree to the Trash, after judging it again. It stays out
-/// of the history and totals, because the space returns only when the Trash
-/// is emptied. The run lock keeps any clean, including the CLI's, from
-/// starting meanwhile. The config is read after taking it, so the ignore list
-/// is the current one.
+/// Moves a broken worktree to the Trash, after judging it again.
 #[tauri::command]
 pub async fn delete_notice(state: SharedState<'_>, path: String) -> Result<(), String> {
     let shared = Arc::clone(&state);
-    blocking(move || {
-        let refused = |why: String| format!("did not delete {path}: {why}");
-        let _run = RunLock::acquire(&shared.paths.lock).map_err(|e| refused(format!("{e:#}")))?;
-        let target = Path::new(&path);
-        let config = load_config(&shared)?;
-        let found = poll::scan(&config.roots, &shared.uuids);
-        let volumes = found.readings.iter().map(|(v, _)| v);
-        let volume = tasks::volume_holding(target, volumes).map_err(refused)?;
-        let exclude = tasks::build_exclude(&config.exclude).map_err(|e| format!("{e:#}"))?;
-        let ctx = Ctx::for_volume(volume, &exclude, SystemTime::now(), &shared.sizes);
-        ctx.set_keep(IgnoreList::new(&config.ignore));
-        tasks::trash_broken_worktree(target, &ctx, shared.is_cleaning())
-    })
-    .await
+    blocking(move || trash_notice(&shared, &path, tasks::move_to_trash)).await
+}
+
+/// Hands the folder at `path` to `trash` if it may go. It stays out of the
+/// history and totals, because the space returns only when the Trash is
+/// emptied, but the stored scan forgets it. The run lock keeps any clean,
+/// including the CLI's, from starting meanwhile. The config is read after
+/// taking it, so the ignore list is the current one.
+fn trash_notice(
+    shared: &Shared,
+    path: &str,
+    trash: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let refused = |why: String| format!("did not delete {path}: {why}");
+    // A clean that lands in this window reports the lock as busy and tries later.
+    let _run = RunLock::acquire(&shared.paths.lock).map_err(|e| {
+        refused(match e.downcast_ref::<LockBusy>() {
+            Some(_) => "Picard is busy, try again".to_string(),
+            None => format!("{e:#}"),
+        })
+    })?;
+    let target = Path::new(path);
+    let config = load_config(shared).map_err(refused)?;
+    let found = poll::scan(&config.roots, &shared.uuids);
+    let volumes = found.readings.iter().map(|(v, _)| v);
+    let volume = tasks::volume_holding(target, volumes).map_err(refused)?;
+    let exclude = tasks::build_exclude(&config.exclude).map_err(|e| refused(format!("{e:#}")))?;
+    let ctx = Ctx::for_volume(volume, &exclude, SystemTime::now(), &shared.sizes);
+    ctx.set_keep(IgnoreList::new(&config.ignore));
+    let kept = KeptFolders {
+        roots: &config.roots,
+        home: &shared.home,
+    };
+    let canon = tasks::trash_broken_worktree(target, &ctx, shared.is_cleaning(), &kept, trash)?;
+    shared.forget_preview_path(&canon);
+    Ok(())
 }
 
 /// Shows the macOS folder picker as a sheet on the calling window. Returns the
@@ -656,6 +674,130 @@ fn run_view(name: &str, result: Result<VolumeRun, String>) -> RunResult {
 mod tests {
     use super::*;
     use crate::tasks::{Candidate, Estimate, Notice, Removed};
+    use std::cell::Cell;
+    use std::fs;
+
+    /// A `Shared` with a good config, and a broken worktree in its root.
+    struct DeleteFixture {
+        _dir: tempfile::TempDir,
+        shared: Shared,
+        worktree: PathBuf,
+    }
+
+    impl DeleteFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().canonicalize().unwrap();
+            let root = base.join("root");
+            let worktree = root.join("stuck");
+            fs::create_dir_all(&worktree).unwrap();
+            let git = format!("gitdir: {}/repo/.git/worktrees/stuck\n", root.display());
+            fs::write(worktree.join(".git"), git).unwrap();
+            let config_path = base.join("config.toml");
+            let config = format!("min_free_gb = 10\nroots = [\"{}\"]\n", root.display());
+            fs::write(&config_path, config).unwrap();
+            let shared = Shared::new(base.join("home"), config_path);
+            Self {
+                _dir: dir,
+                shared,
+                worktree,
+            }
+        }
+
+        /// Runs `trash_notice` with a fake trash. Returns its result and
+        /// whether the fake ran.
+        fn delete(&self) -> (Result<(), String>, bool) {
+            let called = Cell::new(false);
+            let result = trash_notice(&self.shared, self.path(), |_| {
+                called.set(true);
+                Ok(())
+            });
+            (result, called.get())
+        }
+
+        fn path(&self) -> &str {
+            self.worktree.to_str().unwrap()
+        }
+    }
+
+    #[test]
+    fn a_delete_passes_every_check_and_reaches_the_trash() {
+        let fx = DeleteFixture::new();
+        let (result, called) = fx.delete();
+        assert_eq!(result, Ok(()));
+        assert!(called);
+    }
+
+    #[test]
+    fn a_delete_takes_the_lock_before_it_reads_the_config() {
+        let fx = DeleteFixture::new();
+        fs::write(&fx.shared.config_path, "not toml [").unwrap();
+        let held = RunLock::acquire(&fx.shared.paths.lock).unwrap();
+        let (result, called) = fx.delete();
+        assert!(result.unwrap_err().contains("Picard is busy, try again"));
+        assert!(!called);
+        drop(held);
+        let (result, called) = fx.delete();
+        let err = result.unwrap_err();
+        assert!(
+            err.starts_with(&format!("did not delete {}", fx.path())),
+            "{err}"
+        );
+        assert!(!called);
+    }
+
+    #[test]
+    fn a_delete_is_refused_while_a_clean_is_marked_as_running() {
+        let fx = DeleteFixture::new();
+        fx.shared.enter_cleaning();
+        let (result, called) = fx.delete();
+        assert!(result.unwrap_err().contains("a cleanup is running"));
+        assert!(!called);
+    }
+
+    #[test]
+    fn a_failed_trash_leaves_the_stored_scan_alone() {
+        let fx = DeleteFixture::new();
+        fx.shared.record_preview(stored_notice(fx.path()));
+        let result = trash_notice(&fx.shared, fx.path(), |_| Err("no".to_string()));
+        assert!(result.is_err());
+        assert_eq!(stored_notice_count(&fx.shared), 1);
+    }
+
+    #[test]
+    fn a_delete_drops_the_row_from_the_stored_scan() {
+        let fx = DeleteFixture::new();
+        fx.shared.record_preview(stored_notice(fx.path()));
+        fx.delete().0.unwrap();
+        assert_eq!(stored_notice_count(&fx.shared), 0);
+        assert_eq!(fx.shared.previews().len(), 1, "the volume stays listed");
+    }
+
+    fn stored_notice(path: &str) -> VolumePreview {
+        VolumePreview {
+            name: "test".into(),
+            mount: "/".into(),
+            free_text: String::new(),
+            tasks: vec![PreviewTask {
+                task: "git_worktrees".into(),
+                items: Vec::new(),
+                error: None,
+                notices: vec![PreviewNotice {
+                    path: path.into(),
+                    size_text: "1 B".into(),
+                    message: "broken".into(),
+                    deletable: true,
+                }],
+            }],
+            total_bytes: 0,
+            total_text: String::new(),
+            scanned_at: Utc::now(),
+        }
+    }
+
+    fn stored_notice_count(shared: &Shared) -> usize {
+        shared.previews()[0].tasks[0].notices.len()
+    }
 
     #[test]
     fn not_activity_lists_the_default_names() {

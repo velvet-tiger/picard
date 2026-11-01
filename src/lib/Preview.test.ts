@@ -1368,6 +1368,97 @@ describe('Preview', () => {
       await waitFor(() => expect(screen.queryByRole('region', { name: 'Needs you' })).toBeNull())
     })
 
+    it('drops the deleted folder and only what is under it, with the selected total', async () => {
+      const found = withNotice()
+      const twin = `${STUCK}-two`
+      found[0].tasks[1].notices!.push({ ...found[0].tasks[1].notices![0], path: twin })
+      found[0].tasks[1].items.push(item(`${STUCK}/node_modules`, 1e9), item(`${twin}/dist`, 2e9))
+      backend({ preview: () => found })
+      await renderScanned()
+      expect(screen.getByText('5 selected, 6.5 GB')).toBeInTheDocument()
+      await fireEvent.click(button(`Delete ${STUCK_SHOWN}`))
+      await fireEvent.click(button(`Move ${STUCK_SHOWN} to the Trash`))
+      await waitFor(() => expect(screen.getByText('4 selected, 5.5 GB')).toBeInTheDocument())
+      expect(button(`Delete ${STUCK_SHOWN}-two`)).toBeInTheDocument()
+      expect(notices().queryByRole('button', { name: `Delete ${STUCK_SHOWN}` })).toBeNull()
+    })
+
+    it('forgets a skip on a row the delete took away', async () => {
+      const found = withNotice()
+      found[0].tasks[1].items.push(item(`${STUCK}/node_modules`, 1e9))
+      backend({ preview: () => found })
+      await renderScanned()
+      await fireEvent.click(
+        screen.getByRole('button', { name: `Skip ${STUCK_SHOWN}/node_modules` }),
+      )
+      await waitFor(() => expect(screen.getByText('3 selected, 3.5 GB')).toBeInTheDocument())
+      await fireEvent.click(button(`Delete ${STUCK_SHOWN}`))
+      await fireEvent.click(button(`Move ${STUCK_SHOWN} to the Trash`))
+      await waitFor(() => expect(screen.queryByRole('region', { name: 'Needs you' })).toBeNull())
+      expect(screen.getByText('3 selected, 3.5 GB')).toBeInTheDocument()
+    })
+
+    it('blocks Delete and Move to Trash on every row during a delete', async () => {
+      const found = withNotice()
+      const twin = `${STUCK}-two`
+      const third = `${STUCK}-three`
+      const row = found[0].tasks[1].notices![0]
+      found[0].tasks[1].notices!.push({ ...row, path: twin }, { ...row, path: third })
+      const reply = deferred<null>()
+      backend({ preview: () => found, delete_notice: () => reply.promise })
+      await renderScanned()
+      await fireEvent.click(button(`Delete ${STUCK_SHOWN}`))
+      await fireEvent.click(button(`Move ${STUCK_SHOWN} to the Trash`))
+      await waitFor(() => expect(button(`Delete ${STUCK_SHOWN}-two`)).toBeDisabled())
+      expect(button(`Delete ${STUCK_SHOWN}-three`)).toBeDisabled()
+      expect(button(`Open ${STUCK_SHOWN}-two in Finder`)).toBeEnabled()
+      reply.resolve(null)
+      await waitFor(() => expect(button(`Delete ${STUCK_SHOWN}-two`)).toBeEnabled())
+    })
+
+    it('blocks a pending Move to Trash when a background clean starts', async () => {
+      backend({ preview: () => withNotice() })
+      await renderScanned()
+      await fireEvent.click(button(`Delete ${STUCK_SHOWN}`))
+      expect(button(`Move ${STUCK_SHOWN} to the Trash`)).toBeEnabled()
+      await emit('cleaning-changed', true)
+      await waitFor(() => expect(button(`Move ${STUCK_SHOWN} to the Trash`)).toBeDisabled())
+    })
+
+    it('blocks Delete while a clean runs in the background', async () => {
+      backend({
+        preview: () => withNotice(),
+        get_status: () => ({ ...status(), cleaning: true }),
+      })
+      await renderScanned()
+      await waitFor(() => expect(button(`Delete ${STUCK_SHOWN}`)).toBeDisabled())
+    })
+
+    it('forgets a pending confirmation when a new list arrives', async () => {
+      backend({ preview: () => withNotice() })
+      await renderScanned()
+      await fireEvent.click(button(`Delete ${STUCK_SHOWN}`))
+      await fireEvent.click(screen.getByRole('button', { name: /^Scan/ }))
+      await waitFor(() => expect(button(`Delete ${STUCK_SHOWN}`)).toBeInTheDocument())
+      expect(notices().queryByText(/to the Trash\?/)).toBeNull()
+    })
+
+    it('leaves an earlier error up after a reveal that works', async () => {
+      backend({
+        preview: () => withNotice(),
+        delete_notice: () => {
+          throw 'did not delete it'
+        },
+      })
+      await renderScanned()
+      await fireEvent.click(button(`Delete ${STUCK_SHOWN}`))
+      await fireEvent.click(button(`Move ${STUCK_SHOWN} to the Trash`))
+      await screen.findByText('did not delete it')
+      await fireEvent.click(button(`Open ${STUCK_SHOWN} in Finder`))
+      await settle()
+      expect(screen.getByText('did not delete it')).toBeInTheDocument()
+    })
+
     it('keeps the row and shows why when a delete fails', async () => {
       backend({
         preview: () => withNotice(),
