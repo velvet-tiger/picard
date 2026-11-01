@@ -6,6 +6,10 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `storybook-static` is no longer on the default `dirs` list of `build_output`. A `dirs` list in your config keeps it until you remove it.
+
 ## [0.9.0] - 2026-11-01
 
 ### Added
