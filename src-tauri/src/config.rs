@@ -54,7 +54,7 @@ stale_days = 30
 [[task]]
 type = "build_output"     # folders git ignores, or proven Next.js and Composer output
 stale_days = 30
-dirs = ["dist", "build", ".next", "vendor", ".terraform", "storybook-static", "target"]
+dirs = ["dist", "build", ".next", "vendor", ".terraform", "target"]
 "#;
 
 const BYTES_PER_GB: f64 = 1_000_000_000.0;
@@ -377,17 +377,9 @@ fn default_cargo_mode() -> CargoMode {
     CargoMode::Stale
 }
 fn default_build_output_dirs() -> Vec<String> {
-    [
-        "dist",
-        "build",
-        ".next",
-        "vendor",
-        ".terraform",
-        "storybook-static",
-        "target",
-    ]
-    .map(String::from)
-    .to_vec()
+    ["dist", "build", ".next", "vendor", ".terraform", "target"]
+        .map(String::from)
+        .to_vec()
 }
 fn default_command_timeout_secs() -> u64 {
     600
@@ -778,7 +770,6 @@ mod tests {
                     ".next".into(),
                     "vendor".into(),
                     ".terraform".into(),
-                    "storybook-static".into(),
                     "target".into()
                 ]
             }
@@ -1202,7 +1193,7 @@ mod tests {
         let base = "min_free_gb = 1\nroots = [\"/a\"]\n[[task]]\ntype = \"build_output\"\n";
         assert!(matches!(
             &parse_ok(base).tasks[0],
-            TaskConfig::BuildOutput { dirs, .. } if dirs.len() == 7
+            TaskConfig::BuildOutput { dirs, .. } if dirs.len() == 6
         ));
         for bad in [
             "[]",

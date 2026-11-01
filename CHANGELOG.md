@@ -14,6 +14,7 @@ All notable changes to Picard are recorded here. The format follows
 ### Changed
 
 - The message on a broken worktree now says Picard never removes it on its own. This also changes the `picard scan` output.
+- `storybook-static` is no longer on the default `dirs` list of `build_output`. A `dirs` list in your config keeps it until you remove it.
 
 ## [0.9.0] - 2026-11-01
 
