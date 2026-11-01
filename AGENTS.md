@@ -1,4 +1,12 @@
+## Working Protocols
 
+- **Operating mode:** Plan and Review
+- **Branches:** feature branches
+- **Worktrees:** yes
+- **Pull requests:** no
+- **Merge target:** main
+- **Human review:** not required before merge
+- **Handoff:** after verification, with the report
 
 <!-- automatic:rules:start -->
 # Working with the Automatic MCP Service
@@ -337,7 +345,13 @@ USE OF THIS FRAMEWORK IS NON-NEGOTIABLE. Acknowledge that you have read this fil
 
 ## Phase 4: Communicate
 
-- Tell the user what you found, what needs to be done, and how you are going to fix it.
+- Present the plan under these headings, in this order:
+  1. **Problem.** Restate the problem in your own words. Say what is wrong or missing and why it matters.
+  2. **What I found.** The facts from Phase 2: the relevant code, its current behaviour, and the cause.
+  3. **Solution.** A short, high-level explanation of the fix. Say what will change and why this approach was chosen. No file-level detail.
+  4. **Plan.** The concrete steps: files, functions, tests.
+  5. **Other information.** Decisions you need from the user, assumptions, risks, and out-of-scope items.
+- Leave a heading out only when it has nothing to say. Say so in one line rather than removing it silently.
 - Communicate in plain, clear language. Do not use jargon, idioms, turns-of-phrase or colloquialisms.
 - Communicate in full sentances, do not omit words or drop articles.
 - Assume the user does not understand the full context you have and spell out any assumptions, issues, or knowledge gaps
@@ -390,6 +404,7 @@ before any plan has been stated, or after the plan changed without saying so.
 ## Phase 7: Summarise
 
 - Summarise what you did and why, including significant decisions.
+- Always state the git state as its own line. Say "Committed" with the short hash and branch, or "Not committed" with the reason. Examples of a reason: the user's approval is needed, tests fail, or the repository's rules forbid it. Never leave the reader to infer it.
 - Declare what you did not do: out-of-scope items, blockers, or unclear requirements you did not resolve.
 - Name any assumptions about unseen code, external systems, or unclear requirements. Do not present uncertain work as definitive.
 - Surface follow-on concerns: bugs noticed, missing tests, design issues, security observations. Do not discard observations silently.
@@ -584,6 +599,57 @@ as security surface.
   recommendation, or the ticket for an unrelated item.
 - Anything verified by inspection only.
 
+# Working Protocols
+
+## Before your first change in a repository, find the Working Protocols block.
+
+Look for a `## Working Protocols` section in the instruction file you read
+(AGENTS.md, CLAUDE.md, or similar). If it exists, follow it. It takes
+precedence over general defaults on operating mode, branching, and review.
+
+If it does not exist, ask the user each question below, then write the block.
+Do not guess answers from the repository. If nobody can answer, use Plan and
+Review, make no commits, and report that the block is missing.
+
+## Writing the block
+
+Write it outside any `automatic:rules` markers. Write identical text to every
+instruction file in the project. Do not write it in a read-only project.
+Change it only when the user asks.
+
+## Questions
+
+1. Operating mode
+   - Plan and Review: present a plan, wait for approval, work until done.
+   - Unsupervised: formulate a plan, work until done without waiting.
+   - Something else the user describes.
+2. Branch and commit strategy
+   - Use branches? Which model (for example gitflow)?
+   - Use worktrees?
+   - Create PRs?
+   - Always merge back to a given branch (for example main or dev)?
+3. Verification and review
+   - Do diffs or PRs need a human review or merge?
+   - At what point does the agent hand off to a human?
+
+## Block format
+
+## Working Protocols
+
+- **Operating mode:** Plan and Review
+- **Branches:** feature branches, gitflow naming
+- **Worktrees:** yes
+- **Pull requests:** yes
+- **Merge target:** main
+- **Human review:** required before merge
+- **Handoff:** after verification, with the PR link
+
+## Stops that apply in every mode
+
+No mode removes a stop for destructive actions, secrets, a user's explicit
+gate, or a failed check. Unsupervised removes the wait for plan approval.
+It does not remove verification, reviews, or reporting.
+
 # Worktrees and testing
 
 ## Before you ask the user to test, run, or check anything, stop.
@@ -609,6 +675,81 @@ Do not ask the user to test until one of these is done or chosen.
 The first message of the task names the worktree path and branch. Mention it again in every summary that asks the user to act.
 
 **Red flag:** you are about to write "please test", "try it now", "can you confirm", or "run the export again", and the words "worktree" and "main checkout" do not appear in the first line.
+
+# After completing a section of work
+
+Keeping a running list of issues at the end of every section so the user can keep track of what happened and whats remaining.
+State your current branch and worktree and commit status.
+
+# Reporting
+
+## Before you end a task or stage, write the report in this order.
+
+**State:** one of Not started, Plan, In progress, Blocked, Complete, Failed,
+or Abandoned. Use Blocked when the work cannot continue without the user, and
+say what you need. For Failed or Abandoned, give the reason.
+
+**Problem:** restate the problem and its cause in one or two sentences.
+Example: "The sync dropped remote servers because the proxy stub overwrote
+the registry entry."
+
+**Solution:** state what you implemented. If you found more than one issue,
+use a table with one row per issue. Say so plainly if an issue is not resolved.
+
+| Issue | Resolution | Status |
+|---|---|---|
+| Proxy stub overwrote the registry entry | Filter stubs during discovery | Fixed |
+| Sync could downgrade a remote server | Add a downgrade guard | Fixed |
+| No test for the stub round-trip | Needs an owner decision | Open |
+
+**Git state:** use this table every time, so the fields stay in the same order.
+Write "None" or "No" rather than leaving a row out. If the work is not
+committed, say why in the Commit row.
+
+| Field | Value |
+|---|---|
+| Commit | `fbdafcd` |
+| Branch | `claude/example` |
+| Worktree | `.claude/worktrees/example` |
+| PR | None |
+| Merged to | No |
+
+Other rules may require more in the report, such as assumptions or review
+findings. Put that after these four items.
+
+During work, a progress update needs only the State line and what is
+happening now.
+
+**Red flag:** you are about to end a turn on finished work, and the reader
+cannot find the state or the git position without reading the whole message.
+
+# Long-running work
+
+The user cannot see what an agent or background job is doing. Silence looks the same as a hang. Keep the user informed, and keep work in proportion to the task.
+
+## Before you start anything likely to take more than 10 minutes, stop and tell the user.
+
+This covers a brute-force test matrix, a mutation sweep, a large review, another fix round, a long build, and any subagent you expect to run that long. Say what it is, why it is worth the time, and roughly how long it will take. Then wait for an answer. Approval of a plan does not cover a slow method the plan did not mention.
+
+**Red flag:** you are about to start or brief a job, and the user has not heard its cost.
+
+## Before you brief a subagent, set its limits.
+
+Every brief states a time limit and a size limit. The default is 10 minutes. A reviewer reads the diff and writes a few targeted tests. It does not write throwaway brute-force matrices, and it does not run tests in the background and wait on them. If a job is slow or stuck, the subagent stops and reports what it has. A broad test that is worth having belongs in the repository, where it runs once and keeps paying off.
+
+**Red flag:** your brief says "try to break it" or "across every combination" and names no limit.
+
+## When work passes its estimate, tell the user.
+
+Say what it is doing now, how long it has run, and offer to stop it. "Still running" is not a status. If you do not know what a job is doing, check before you reply, and say so if you cannot find out.
+
+**Red flag:** you have written "still running" or "waiting on" twice for the same job.
+
+## When work grows past the ticket, stop and say so.
+
+Compare what you are about to do with what the user asked for. If the next step is a new design, a new subsystem, or a third round of the same work, stop. State what is done, what is left, and what it will cost. Offer to merge what is finished first and move the rest to its own ticket. The rule to fix defects found by review does not override this. It decides what is in scope, not how long the user waits without hearing from you.
+
+**Red flag:** the diff is many times larger than the ticket suggested, and the original fix is still unmerged.
 
 # Automatic-managed .gitignore
 
