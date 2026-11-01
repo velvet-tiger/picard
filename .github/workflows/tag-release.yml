@@ -1,0 +1,65 @@
+# Tags a release from main and starts release.yml for it.
+#
+# Pushes of a version tag from the weekly release routine are blocked by its
+# git gateway, so the tag is made here instead. The routine only pushes the
+# "chore(release)" commit to main. A tag made with GITHUB_TOKEN does not start
+# other workflows, so this one starts release.yml itself.
+#
+# It acts only when package.json holds a version that has no tag yet, and only
+# when that version is the same in Cargo.toml and tauri.conf.json. release.yml
+# repeats those checks and builds nothing otherwise. You can also run it by
+# hand from the Actions tab to tag the version now on main.
+
+name: Tag release
+
+on:
+  push:
+    branches: [main]
+    paths: [package.json]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Tag the version on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(node -p 'require("./package.json").version')
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -1)
+          tauri_version=$(node -p 'require("./src-tauri/tauri.conf.json").version')
+          echo "package.json=$version Cargo.toml=$cargo_version tauri.conf.json=$tauri_version"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::\"$version\" is not a plain version such as 1.2.3."
+            exit 1
+          fi
+          if [[ "$cargo_version" != "$version" || "$tauri_version" != "$version" ]]; then
+            echo "::error::The version is not the same in package.json, Cargo.toml and tauri.conf.json."
+            exit 1
+          fi
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists. Nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "$tag" HEAD
+          git push origin "refs/tags/$tag"
+          gh workflow run release.yml --ref main -f tag="$tag"
