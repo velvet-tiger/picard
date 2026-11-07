@@ -14,7 +14,7 @@ All notable changes to Picard are recorded here. The format follows
 
 ### Fixed
 
-- `node_modules`, `cargo_clean` and `python_venv` now check again that a project is still idle just before they remove its folder. Before, a project edited after the scan could lose its folder while a clean worked through the list. A folder kept this way is listed as not removed, with the reason "the project changed since the scan". `cargo_clean` with `mode = "all"` is unchanged.
+- `node_modules`, `cargo_clean` and `python_venv` now check again that a project is still idle just before they remove its folder. Before, a project edited after the scan could lose its folder while a clean worked through the list. A folder kept this way is listed as not removed, with the reason "the project changed since the scan", or "the project could not be read again" if it was moved or cannot be read. `cargo_clean` with `mode = "all"` is unchanged.
 
 ## [0.10.0] - 2026-11-01
 

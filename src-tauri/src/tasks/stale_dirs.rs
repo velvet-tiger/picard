@@ -57,15 +57,19 @@ impl StaleDirs {
     /// The scan's verdict can be minutes old by the time a folder is reached:
     /// sizes are measured and earlier folders deleted in between, and a wait
     /// can be as short as a few minutes. So the project's idle time is read
-    /// again. A file written after `ctx.now` makes `idle_for` return `None`,
-    /// which keeps the folder too. `mode = "all"` has no age to check.
+    /// again. A file written after `ctx.now` keeps the folder too. A project
+    /// that can no longer be read, for example because it was moved, keeps
+    /// it with its own reason. `mode = "all"` has no age to check.
     fn no_longer_idle(&self, c: &Candidate, ctx: &Ctx) -> Option<String> {
         let age = self.stale_after?;
         let Some(project) = c.path.parent() else {
             return Some("it has no parent folder to judge".to_string());
         };
-        match idle_for(project, ctx, self.dir_names) {
-            Some(idle) if idle >= age.duration() => None,
+        let Some(newest) = newest_mtime_skipping(project, self.dir_names, &ctx.not_activity) else {
+            return Some("the project could not be read again".to_string());
+        };
+        match ctx.now.duration_since(newest) {
+            Ok(idle) if idle >= age.duration() => None,
             _ => Some("the project changed since the scan".to_string()),
         }
     }
@@ -169,6 +173,12 @@ impl CleanupTask for StaleDirs {
     fn run(&self, ctx: &Ctx, candidates: &[Candidate]) -> Report {
         let mut report = Report::default();
         for c in candidates {
+            // Before the idle check: an unmounted project reads as unreadable,
+            // and that must halt the run, not list every folder as kept.
+            if !ctx.volume_present() {
+                report.halted = Some("the volume is no longer mounted".to_string());
+                break;
+            }
             if let Some(why) = self.no_longer_idle(c, ctx) {
                 log::warn!("{}: not removing {}: {why}", self.id, c.path.display());
                 report.failed.push((c.path.clone(), why));
@@ -816,6 +826,42 @@ mod tests {
         assert!(report.failed[0].0.ends_with("resumed/target"));
         assert!(!fx.root.join("idle/target").exists());
         assert!(fx.root.join("resumed/target").exists());
+    }
+
+    #[test]
+    fn run_halts_when_the_volume_is_gone() {
+        let fx = Fixture::new(&[]);
+        cargo_project(&fx, "a", 20);
+        cargo_project(&fx, "b", 20);
+        let mut ctx = fx.ctx();
+        let task = cargo_clean(Some(Age::days(14)), None);
+        let found = task.scan(&ctx).unwrap();
+        assert_eq!(found.len(), 2);
+        ctx.dev = ctx.dev.wrapping_add(1);
+        let report = task.run(&ctx, &found);
+        assert_eq!(
+            report.halted.as_deref(),
+            Some("the volume is no longer mounted")
+        );
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert!(fx.root.join("a/target").exists());
+    }
+
+    #[test]
+    fn run_keeps_a_project_that_can_no_longer_be_read() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 10, 40);
+        let ctx = fx.ctx();
+        let task = node_modules(Age::days(30));
+        let found = task.scan(&ctx).unwrap();
+        // Only node_modules is left, and it is skipped, so nothing is read.
+        for f in ["p/package.json", "p/src/index.js"] {
+            std::fs::remove_file(fx.root.join(f)).unwrap();
+        }
+        let report = task.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(report.failed[0].1, "the project could not be read again");
+        assert!(fx.root.join("p/node_modules").exists());
     }
 
     /// `mode = "all"` has no age, so activity never keeps a folder.
