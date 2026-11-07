@@ -837,6 +837,13 @@ mod tests {
         let task = cargo_clean(Some(Age::days(14)), None);
         let found = task.scan(&ctx).unwrap();
         assert_eq!(found.len(), 2);
+        // A gone volume leaves nothing to read. Without the volume check
+        // first, each folder would be listed as kept instead of halting.
+        for p in ["a", "b"] {
+            for f in ["Cargo.toml", "src/main.rs"] {
+                std::fs::remove_file(fx.root.join(p).join(f)).unwrap();
+            }
+        }
         ctx.dev = ctx.dev.wrapping_add(1);
         let report = task.run(&ctx, &found);
         assert_eq!(
