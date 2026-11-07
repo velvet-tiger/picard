@@ -27,7 +27,7 @@ These rules always hold:
 - A worktree with a paused rebase, `git am`, merge, cherry-pick, revert, bisect or notes merge is never removed. Removing it would delete that operation's state.
 - A worktree's own refs, under `refs/worktree/` and `refs/bisect/`, are deleted with it. A worktree is never removed while one of them points at a commit that no other local branch holds, or at anything that is not a commit, such as a tag object.
 - A copied repo, made with `cp -R` or Finder's Duplicate, still lists the original repo's worktrees. Picard judges a worktree only through the repo it belongs to, and only by the HEAD it has now.
-- Every item is checked again just before it is removed. A worktree is judged again from scratch, with its repo's branches read afresh. Its HEAD is read once more right before removal, and a HEAD that moved keeps it.
+- Every item is checked again just before it is removed. A worktree is judged again from scratch, with its repo's branches read afresh. Its HEAD is read once more right before removal, and a HEAD that moved keeps it. For `node_modules`, `cargo_clean` and `python_venv`, the project's idle time is read again, and a project that changed since the scan keeps its folder. `cargo_clean` with `mode = "all"` has no idle time, so it skips this check.
 - A folder you ignore is never removed, in any mode. Neither is a folder that holds one, such as a worktree with an ignored `node_modules` inside it.
 - Every removal is logged to `history.jsonl`.
 - Only one cleanup runs at a time.

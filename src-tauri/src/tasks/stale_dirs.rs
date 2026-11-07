@@ -51,6 +51,24 @@ impl StaleDirs {
         self.cache_prune = Some(prune);
         self
     }
+
+    /// Why candidate `c` must now be kept, or `None` if it may still go.
+    ///
+    /// The scan's verdict can be minutes old by the time a folder is reached:
+    /// sizes are measured and earlier folders deleted in between, and a wait
+    /// can be as short as a few minutes. So the project's idle time is read
+    /// again. A file written after `ctx.now` makes `idle_for` return `None`,
+    /// which keeps the folder too. `mode = "all"` has no age to check.
+    fn no_longer_idle(&self, c: &Candidate, ctx: &Ctx) -> Option<String> {
+        let age = self.stale_after?;
+        let Some(project) = c.path.parent() else {
+            return Some("it has no parent folder to judge".to_string());
+        };
+        match idle_for(project, ctx, self.dir_names) {
+            Some(idle) if idle >= age.duration() => None,
+            _ => Some("the project changed since the scan".to_string()),
+        }
+    }
 }
 
 /// Stale `node_modules` next to a `package.json`.
@@ -149,7 +167,22 @@ impl CleanupTask for StaleDirs {
     }
 
     fn run(&self, ctx: &Ctx, candidates: &[Candidate]) -> Report {
-        let mut report = remove_dirs(ctx, candidates);
+        let mut report = Report::default();
+        for c in candidates {
+            if let Some(why) = self.no_longer_idle(c, ctx) {
+                log::warn!("{}: not removing {}: {why}", self.id, c.path.display());
+                report.failed.push((c.path.clone(), why));
+                continue;
+            }
+            // One at a time, so each folder is removed right after its check.
+            let done = remove_dirs(ctx, std::slice::from_ref(c));
+            report.removed.extend(done.removed);
+            report.failed.extend(done.failed);
+            report.halted = done.halted;
+            if report.halted.is_some() {
+                break;
+            }
+        }
         if let Some(prune) = &self.cache_prune
             && report.halted.is_none()
         {
@@ -727,5 +760,76 @@ mod tests {
         assert!(!fx.root.join("old/node_modules").exists());
         assert!(fx.root.join("old/package.json").exists());
         assert!(fx.root.join("old/src/index.js").exists());
+    }
+
+    /// An edit between scan and run, older than the run's `ctx.now`.
+    #[test]
+    fn run_keeps_a_project_edited_since_the_scan() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 10, 0);
+        fx.age_by("p", Duration::from_secs(3 * 3_600));
+        let ctx = fx.ctx();
+        let task = node_modules(Age::hours(1));
+        let found = task.scan(&ctx).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
+        fx.file("p/src/edit.js", 1);
+        fx.age_by("p/src/edit.js", Duration::from_secs(10 * 60));
+        let report = task.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].1, "the project changed since the scan");
+        assert!(fx.root.join("p/node_modules/dep/index.js").exists());
+    }
+
+    /// An edit with an mtime later than `ctx.now` also keeps the folder.
+    #[test]
+    fn run_keeps_a_project_written_after_the_run_started() {
+        let fx = Fixture::new(&[]);
+        python_project(&fx, "p", ".venv", 40);
+        let ctx = fx.ctx();
+        let task = python_venv(Age::days(30));
+        let found = task.scan(&ctx).unwrap();
+        assert_eq!(found.len(), 1);
+        std::thread::sleep(Duration::from_millis(20));
+        fx.file("p/app/edit.py", 1);
+        let report = task.run(&ctx, &found);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(report.failed[0].1, "the project changed since the scan");
+        assert!(fx.root.join("p/.venv/pyvenv.cfg").exists());
+    }
+
+    #[test]
+    fn run_removes_idle_projects_beside_a_resumed_one() {
+        let fx = Fixture::new(&[]);
+        cargo_project(&fx, "idle", 20);
+        cargo_project(&fx, "resumed", 20);
+        let ctx = fx.ctx();
+        let task = cargo_clean(Some(Age::days(14)), None);
+        let found = task.scan(&ctx).unwrap();
+        assert_eq!(found.len(), 2);
+        fx.file("resumed/src/lib.rs", 1);
+        fx.age_by("resumed/src/lib.rs", Duration::from_secs(60));
+        let report = task.run(&ctx, &found);
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(report.removed[0].path.ends_with("idle/target"));
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].0.ends_with("resumed/target"));
+        assert!(!fx.root.join("idle/target").exists());
+        assert!(fx.root.join("resumed/target").exists());
+    }
+
+    /// `mode = "all"` has no age, so activity never keeps a folder.
+    #[test]
+    fn cargo_all_mode_run_ignores_activity() {
+        let fx = Fixture::new(&[]);
+        cargo_project(&fx, "busy", 0);
+        let ctx = fx.ctx();
+        let task = cargo_clean(None, None);
+        let found = task.scan(&ctx).unwrap();
+        fx.file("busy/src/edit.rs", 1);
+        let report = task.run(&ctx, &found);
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(report.failed.is_empty());
+        assert!(!fx.root.join("busy/target").exists());
     }
 }

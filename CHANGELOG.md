@@ -12,6 +12,10 @@ All notable changes to Picard are recorded here. The format follows
 - Settings warns when an idle time is under an hour, or under 5 minutes for merged worktrees. Short waits can catch a project that is still in use, because most tasks judge idleness by file changes alone.
 - Reasons in the Clean list and `picard scan` give the idle time in the unit you chose, such as "untouched for 5 hours". Worktree reasons say "waits for stale_after" instead of "waits for stale_days".
 
+### Fixed
+
+- `node_modules`, `cargo_clean` and `python_venv` now check again that a project is still idle just before they remove its folder. Before, a project edited after the scan could lose its folder while a clean worked through the list. A folder kept this way is listed as not removed, with the reason "the project changed since the scan". `cargo_clean` with `mode = "all"` is unchanged.
+
 ## [0.10.0] - 2026-11-01
 
 ### Added
