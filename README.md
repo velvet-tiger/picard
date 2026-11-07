@@ -10,11 +10,11 @@ Picard only works inside the folders you list as **roots**, such as `~/working`.
 
 | Task | Removes | Only when |
 |---|---|---|
-| `git_worktrees` | Linked git worktrees | Clean, not locked, and not in use by any running process. Nothing is paused in them: no rebase, `git am`, merge, cherry-pick, revert, sequence of cherry-picks or reverts, bisect or notes merge. Done ones go after `min_idle_minutes`: another local branch holds their HEAD, or other local branches hold a cherry-picked copy of each commit that no other branch holds. The copies can be spread over several branches. Ones whose commits are only pushed, done ones that made commits now on no branch, and partly deleted ones go after `stale_days`. |
-| `node_modules` | `node_modules` next to a `package.json` | The project has not changed for `stale_days`. |
-| `cargo_clean` | `target/` next to a `Cargo.toml` | The project has not changed for `stale_days`, or every project with `mode = "all"`. |
-| `python_venv` | `.venv` or `venv` holding a `pyvenv.cfg`, next to a `pyproject.toml`, `requirements.txt`, `setup.py`, `setup.cfg` or `Pipfile` | The project has not changed for `stale_days`. |
-| `build_output` | Folders named in `dirs` (`dist`, `build`, `.next`, `vendor`, `.terraform`, `target` by default) | The project has not changed for `stale_days`, git ignores the folder, git tracks nothing inside it, and it holds no git repo of its own apart from clean clones in a package folder. Outside any git repo, only `.next` with a `BUILD_ID` file and `vendor` with a `composer/installed.json` file qualify. |
+| `git_worktrees` | Linked git worktrees | Clean, not locked, and not in use by any running process. Nothing is paused in them: no rebase, `git am`, merge, cherry-pick, revert, sequence of cherry-picks or reverts, bisect or notes merge. Done ones go after `min_idle`: another local branch holds their HEAD, or other local branches hold a cherry-picked copy of each commit that no other branch holds. The copies can be spread over several branches. Ones whose commits are only pushed, done ones that made commits now on no branch, and partly deleted ones go after `stale_after`. |
+| `node_modules` | `node_modules` next to a `package.json` | The project has not changed for `stale_after`. |
+| `cargo_clean` | `target/` next to a `Cargo.toml` | The project has not changed for `stale_after`, or every project with `mode = "all"`. |
+| `python_venv` | `.venv` or `venv` holding a `pyvenv.cfg`, next to a `pyproject.toml`, `requirements.txt`, `setup.py`, `setup.cfg` or `Pipfile` | The project has not changed for `stale_after`. |
+| `build_output` | Folders named in `dirs` (`dist`, `build`, `.next`, `vendor`, `.terraform`, `target` by default) | The project has not changed for `stale_after`, git ignores the folder, git tracks nothing inside it, and it holds no git repo of its own apart from clean clones in a package folder. Outside any git repo, only `.next` with a `BUILD_ID` file and `vendor` with a `composer/installed.json` file qualify. |
 | `tool_caches` | Whatever each tool's own prune command removes | The tool is installed, switched on, and keeps its cache on the low drive. Off unless you add it. |
 | `command` | Whatever your script removes | It is enabled. |
 
@@ -45,11 +45,11 @@ A worktree is also done when other local branches hold a cherry-picked copy of e
 - One copy matches every commit that makes the same change, such as a change made, reverted and made again. Two such commits fail this check.
 - A copy still counts after its branch reverts it. A commit that reapplies a reverted change also counts as a copy of the original.
 
-A failed check only means the worktree is not done this way. A worktree whose branch is pushed still goes after `stale_days`. The same holds when git cannot run the check, for example in a partial clone that lacks some files' contents.
+A failed check only means the worktree is not done this way. A worktree whose branch is pushed still goes after `stale_after`. The same holds when git cannot run the check, for example in a partial clone that lacks some files' contents.
 
-A worktree can make a commit and then check out another one. That commit is then on no branch. Only the worktree's HEAD reflog reaches it, and removing the worktree deletes that reflog. So Picard reads the HEAD reflog of each done worktree. A commit made in the worktree that no other local branch holds, and that has no copy on one, makes the worktree wait for `stale_days`. The **Clean…** list then says "has commits on no branch". Commits the worktree only checked out or reset to do not count, because they existed already. That includes a commit made outside the reflog, for example with `git commit-tree`, and then reached with `checkout` or `reset`. A draft with a copy on a branch does not count either, such as a commit from before a plain rebase, or the first version of a commit whose message was amended. A squash or fixup rebase is different. It folds several commits into one, so the originals have no copy, and the worktree waits for `stale_days`. A reflog message Picard does not recognise counts as a commit made here, so it can only make a worktree wait. So does an empty message, except on the entry that created the worktree, which `git worktree add` writes with an old value of all zeros. Picard reads that old value from the reflog file itself, so a later empty message still counts after the creation entry expires. If git cannot look for copies, or the search would be too large, the worktree waits too. Without a reflog, for example with `core.logAllRefUpdates` off, there is nothing to read, and such commits are lost on removal.
+A worktree can make a commit and then check out another one. That commit is then on no branch. Only the worktree's HEAD reflog reaches it, and removing the worktree deletes that reflog. So Picard reads the HEAD reflog of each done worktree. A commit made in the worktree that no other local branch holds, and that has no copy on one, makes the worktree wait for `stale_after`. The **Clean…** list then says "has commits on no branch". Commits the worktree only checked out or reset to do not count, because they existed already. That includes a commit made outside the reflog, for example with `git commit-tree`, and then reached with `checkout` or `reset`. A draft with a copy on a branch does not count either, such as a commit from before a plain rebase, or the first version of a commit whose message was amended. A squash or fixup rebase is different. It folds several commits into one, so the originals have no copy, and the worktree waits for `stale_after`. A reflog message Picard does not recognise counts as a commit made here, so it can only make a worktree wait. So does an empty message, except on the entry that created the worktree, which `git worktree add` writes with an old value of all zeros. Picard reads that old value from the reflog file itself, so a later empty message still counts after the creation entry expires. If git cannot look for copies, or the search would be too large, the worktree waits too. Without a reflog, for example with `core.logAllRefUpdates` off, there is nothing to read, and such commits are lost on removal.
 
-The **Clean…** list says why a worktree is done. When git recorded a merge, it names it, for example "merged into 2.0-dev by 374877e". Otherwise it names the branch, as in "on main", or says "cherry-picked to another branch". A worktree whose commits are only pushed waits for `stale_days`. Any other worktree is kept. A squash merge of several commits is not a copy of any of them, so that worktree waits for `stale_days` if it was pushed, and is kept if not.
+The **Clean…** list says why a worktree is done. When git recorded a merge, it names it, for example "merged into 2.0-dev by 374877e". Otherwise it names the branch, as in "on main", or says "cherry-picked to another branch". A worktree whose commits are only pushed waits for `stale_after`. Any other worktree is kept. A squash merge of several commits is not a copy of any of them, so that worktree waits for `stale_after` if it was pushed, and is kept if not.
 
 A branch that holds the commits does not prove the work is finished. A branch stacked on top of the worktree's branch counts. So does a branch that merged it in only to sync. For example, if feature branch B merges in unfinished work from feature branch A, A's worktree is done. A worktree's own branch is kept, so no commit is lost. A detached worktree has no branch. Once it is removed, its own commits are unreachable, and the next `git gc` can delete them. Only the copies remain. Picard logs the HEAD of each detached worktree it removes, so `git fsck --lost-found` can find that commit until then. Ignored files in the worktree, such as a local `.env`, are lost. In **Ask** mode you can untick or **Ignore** it.
 
@@ -59,7 +59,7 @@ One thing to know: removing a worktree also deletes files git ignores inside it,
 
 `git worktree remove` can stop part way, for example if the Mac shuts down during a large delete. Picard gives this command up to 30 minutes, far longer than any other git command. A removal that still stops leaves one of two things.
 
-A **partly deleted** worktree is still registered, and git status lists deleted tracked files and nothing else. Picard treats it like any other worktree, with two differences. It always waits for `stale_days`, because you might be deleting those files on purpose. A deletion counts as a change here, so the wait starts again after each one. The **Clean…** list says "partly deleted". If anything else has changed in it, such as an edit or a new file, Picard keeps it. A worktree whose commits exist nowhere else is kept too.
+A **partly deleted** worktree is still registered, and git status lists deleted tracked files and nothing else. Picard treats it like any other worktree, with two differences. It always waits for `stale_after`, because you might be deleting those files on purpose. A deletion counts as a change here, so the wait starts again after each one. The **Clean…** list says "partly deleted". If anything else has changed in it, such as an edit or a new file, Picard keeps it. A worktree whose commits exist nowhere else is kept too.
 
 If the root `.gitignore` is one of the deleted files, ignored folders show as untracked. Picard cannot tell those from new work, so it lists the worktree under **Needs you** and never removes it. **Open in Finder** shows it, and only you can delete it.
 
@@ -175,26 +175,26 @@ ignore = ["~/working/site/node_modules"] # folders listed but never cleaned; set
 
 [[task]]                  # tasks run in this order
 type = "git_worktrees"
-stale_days = 14
-min_idle_minutes = 30
+stale_after = "14d"       # an age: minutes ("30m"), hours ("6h") or days ("14d")
+min_idle = "30m"
 
 [[task]]
 type = "node_modules"
-stale_days = 30
+stale_after = "30d"
 prune_package_caches = false   # also prune the npm and pnpm caches on the low drive
 
 [[task]]
 type = "cargo_clean"
 mode = "stale"            # or "all"
-stale_days = 14
+stale_after = "14d"
 
 [[task]]
 type = "python_venv"
-stale_days = 30
+stale_after = "30d"
 
 [[task]]
 type = "build_output"      # folders git ignores, or proven Next.js and Composer output
-stale_days = 30
+stale_after = "30d"
 dirs = ["dist", "build", ".next", "vendor", ".terraform", "target"]
 
 [[task]]
@@ -213,6 +213,8 @@ enabled = false
 ```
 
 Every task also accepts `enabled = false`.
+
+`stale_after` and `min_idle` take an age: a whole number followed by `m` for minutes, `h` for hours or `d` for days. Settings shows a unit menu for each one. Older configs that use `stale_days` (a number of days) or `min_idle_minutes` (a number of minutes) still work. Saving from Settings rewrites them in the new form.
 
 `dirs` entries must be plain folder names. Picard refuses paths, `.git`, and names with glob characters such as `*`. A `dirs` list you set replaces the defaults, so a later release that adds a default name does not reach it. Add new names yourself. Other build folders work the same way. For example, add `Pods` for CocoaPods projects.
 

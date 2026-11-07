@@ -7,13 +7,14 @@
 //! deleted outright. Moving them to the Trash would free nothing.
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use walkdir::WalkDir;
 
 use super::cache_prune::CachePrune;
 use super::{Candidate, CleanupTask, Ctx, Estimate, Report, check_target, remove_dirs};
+use crate::config::Age;
 
 /// Folders never descended into while searching for projects or reading mtimes.
 /// They are build output or too large to walk usefully. `.next` is Next.js
@@ -28,8 +29,6 @@ const DEFAULT_SEARCH_DEPTH: usize = 8;
 /// How deep to look inside a project for its newest file.
 const MTIME_DEPTH: usize = 6;
 
-const SECS_PER_DAY: u64 = 86_400;
-
 /// Written by Finder when a folder is opened. Not a sign of work.
 pub(super) const FINDER_METADATA: &str = ".DS_Store";
 
@@ -41,7 +40,7 @@ pub struct StaleDirs {
     /// A file the folder itself must hold, proving it is what its name says.
     inner_marker: Option<&'static str>,
     /// `None` means every match is a candidate (cargo_clean `mode = "all"`).
-    stale_days: Option<u32>,
+    stale_after: Option<Age>,
     search_depth: usize,
     /// Runs after the folders are removed (node_modules only).
     cache_prune: Option<CachePrune>,
@@ -55,26 +54,26 @@ impl StaleDirs {
 }
 
 /// Stale `node_modules` next to a `package.json`.
-pub fn node_modules(stale_days: u32) -> StaleDirs {
+pub fn node_modules(stale_after: Age) -> StaleDirs {
     StaleDirs {
         id: "node_modules",
         markers: &["package.json"],
         dir_names: &["node_modules"],
         inner_marker: None,
-        stale_days: Some(stale_days),
+        stale_after: Some(stale_after),
         search_depth: DEFAULT_SEARCH_DEPTH,
         cache_prune: None,
     }
 }
 
-/// Cargo `target/` next to a `Cargo.toml`. `stale_days = None` cleans them all.
-pub fn cargo_clean(stale_days: Option<u32>, depth: Option<u32>) -> StaleDirs {
+/// Cargo `target/` next to a `Cargo.toml`. `stale_after = None` cleans them all.
+pub fn cargo_clean(stale_after: Option<Age>, depth: Option<u32>) -> StaleDirs {
     StaleDirs {
         id: "cargo_clean",
         markers: &["Cargo.toml"],
         dir_names: &["target"],
         inner_marker: None,
-        stale_days,
+        stale_after,
         search_depth: depth.map_or(DEFAULT_SEARCH_DEPTH, |d| d as usize),
         cache_prune: None,
     }
@@ -85,7 +84,7 @@ pub fn cargo_clean(stale_days: Option<u32>, depth: Option<u32>) -> StaleDirs {
 /// The folder must hold `pyvenv.cfg`, which `python -m venv`, virtualenv, uv
 /// and Poetry all write, so a source folder that happens to be called `venv`
 /// is never a candidate.
-pub fn python_venv(stale_days: u32) -> StaleDirs {
+pub fn python_venv(stale_after: Age) -> StaleDirs {
     StaleDirs {
         id: "python_venv",
         markers: &[
@@ -97,7 +96,7 @@ pub fn python_venv(stale_days: u32) -> StaleDirs {
         ],
         dir_names: &[".venv", "venv"],
         inner_marker: Some("pyvenv.cfg"),
-        stale_days: Some(stale_days),
+        stale_after: Some(stale_after),
         search_depth: DEFAULT_SEARCH_DEPTH,
         cache_prune: None,
     }
@@ -124,10 +123,12 @@ impl CleanupTask for StaleDirs {
                 log::debug!("{}: skipping {}: no {inner}", self.id, target.display());
                 continue;
             }
-            let reason = match self.stale_days {
+            let reason = match self.stale_after {
                 None => "cleans all (mode = \"all\")".to_string(),
-                Some(days) => match idle_days(&project, ctx, self.dir_names) {
-                    Some(idle) if idle >= u64::from(days) => format!("untouched for {idle} days"),
+                Some(age) => match idle_for(&project, ctx, self.dir_names) {
+                    Some(idle) if idle >= age.duration() => {
+                        format!("untouched for {}", Age::describe(idle, age.unit))
+                    }
                     _ => continue,
                 },
             };
@@ -225,15 +226,14 @@ fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
-/// Whole days since anything in the project last changed, ignoring build
+/// How long since anything in the project last changed, ignoring build
 /// output, `.git`, `ctx.not_activity` and the folders named in `also_skip`
 /// (the task's own targets, so rebuilding them is not activity). `None` if
 /// nothing could be read or the newest mtime is in the future (a clock or
 /// exFAT oddity), which counts as "not stale".
-pub(super) fn idle_days(project: &Path, ctx: &Ctx, also_skip: &[&str]) -> Option<u64> {
+pub(super) fn idle_for(project: &Path, ctx: &Ctx, also_skip: &[&str]) -> Option<Duration> {
     let newest = newest_mtime_skipping(project, also_skip, &ctx.not_activity)?;
-    let idle = ctx.now.duration_since(newest).ok()?;
-    Some(idle.as_secs() / SECS_PER_DAY)
+    ctx.now.duration_since(newest).ok()
 }
 
 /// Newest mtime of any file in the project, ignoring build output, `.git` and
@@ -381,10 +381,28 @@ mod tests {
         let fx = Fixture::new(&[]);
         node_project(&fx, "old", 50_000, 40);
         node_project(&fx, "fresh", 50_000, 2);
-        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        let found = node_modules(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["old/node_modules"]);
         assert!(found[0].bytes >= 50_000, "{}", found[0].bytes);
         assert_eq!(found[0].reason, "untouched for 40 days");
+    }
+
+    #[test]
+    fn waits_shorter_than_a_day_use_their_own_unit() {
+        let fx = Fixture::new(&[]);
+        node_project(&fx, "p", 10, 0);
+        fx.age_by("p", Duration::from_secs(5 * 3_600 + 60));
+        let found = node_modules(Age::hours(3)).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
+        assert_eq!(found[0].reason, "untouched for 5 hours");
+        assert!(
+            node_modules(Age::hours(6))
+                .scan(&fx.ctx())
+                .unwrap()
+                .is_empty()
+        );
+        let found = node_modules(Age::minutes(90)).scan(&fx.ctx()).unwrap();
+        assert_eq!(found[0].reason, "untouched for 301 minutes");
     }
 
     #[test]
@@ -392,7 +410,12 @@ mod tests {
         let fx = Fixture::new(&[]);
         node_project(&fx, "p", 10, 90);
         fx.file("p/src/new.js", 1);
-        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(
+            node_modules(Age::days(30))
+                .scan(&fx.ctx())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -402,7 +425,7 @@ mod tests {
         // Touching a file deep inside node_modules leaves the project idle.
         fx.file("p/node_modules/dep/extra.js", 1);
         fx.age("p/node_modules/dep", 0);
-        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        let found = node_modules(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
     }
 
@@ -414,7 +437,7 @@ mod tests {
         // the mtime of each folder they land in.
         fx.file("p/.DS_Store", 1);
         fx.file("p/src/.DS_Store", 1);
-        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        let found = node_modules(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
         assert_eq!(found[0].reason, "untouched for 40 days");
     }
@@ -426,7 +449,7 @@ mod tests {
         node_project(&fx, "p", 100, 60);
         fx.file("p/.idea/workspace.xml", 1);
         fx.file("p/.phpstorm.meta.php", 1);
-        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        let found = node_modules(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
     }
 
@@ -440,12 +463,17 @@ mod tests {
         fx.file("p/.automatic/project.json", 1);
         fx.file("p/.claude/rules/general.md", 1);
         fx.file("p/packages/web/CLAUDE.md", 1);
-        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        let found = node_modules(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
         assert_eq!(found[0].reason, "untouched for 40 days");
         // A real edit still counts.
         fx.file("p/src/edit.js", 1);
-        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(
+            node_modules(Age::days(30))
+                .scan(&fx.ctx())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -455,11 +483,16 @@ mod tests {
         fx.file("p/.claude/worktrees/w/.git", 1);
         fx.file("p/.claude/worktrees/w/src/x.js", 1);
         fx.age("p/.claude/worktrees/w", 40);
-        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        let found = node_modules(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
         // An edit in the nested worktree is work on the project.
         fx.file("p/.claude/worktrees/w/src/edit.js", 1);
-        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(
+            node_modules(Age::days(30))
+                .scan(&fx.ctx())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -467,13 +500,18 @@ mod tests {
         let fx = Fixture::new(&[]);
         node_project(&fx, "p", 10, 40);
         fx.file("p/.vscode/settings.json", 1);
-        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(
+            node_modules(Age::days(30))
+                .scan(&fx.ctx())
+                .unwrap()
+                .is_empty()
+        );
         let ctx = fx.ctx().with_activity_ignore(&[".vscode".to_string()]);
-        let found = node_modules(30).scan(&ctx).unwrap();
+        let found = node_modules(Age::days(30)).scan(&ctx).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
         // AGENTS.md is a default, but not in this list, so it counts again.
         fx.file("p/AGENTS.md", 1);
-        assert!(node_modules(30).scan(&ctx).unwrap().is_empty());
+        assert!(node_modules(Age::days(30)).scan(&ctx).unwrap().is_empty());
     }
 
     #[test]
@@ -484,10 +522,10 @@ mod tests {
         let parse = |text: &str| crate::config::parse(text, &fx.root).unwrap();
         let defaults = parse("min_free_gb = 1\nroots = [\"/a\"]");
         let ctx = fx.ctx().with_activity_ignore(&defaults.activity_ignore);
-        assert_eq!(node_modules(30).scan(&ctx).unwrap().len(), 1);
+        assert_eq!(node_modules(Age::days(30)).scan(&ctx).unwrap().len(), 1);
         let empty = parse("min_free_gb = 1\nroots = [\"/a\"]\nactivity_ignore = []");
         let ctx = fx.ctx().with_activity_ignore(&empty.activity_ignore);
-        assert!(node_modules(30).scan(&ctx).unwrap().is_empty());
+        assert!(node_modules(Age::days(30)).scan(&ctx).unwrap().is_empty());
     }
 
     #[test]
@@ -497,7 +535,7 @@ mod tests {
         fx.file("p/node_modules/dep/package.json", 1);
         fx.file("p/node_modules/dep/node_modules/x/i.js", 1);
         fx.age("p", 90);
-        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        let found = node_modules(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/node_modules"]);
     }
 
@@ -507,7 +545,7 @@ mod tests {
         node_project(&fx, "mono", 10, 60);
         node_project(&fx, "mono/packages/a", 10, 60);
         fx.age("mono", 60);
-        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        let found = node_modules(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(
             names(&found, &fx.root),
             vec!["mono/node_modules", "mono/packages/a/node_modules"]
@@ -521,7 +559,12 @@ mod tests {
         fx.file("p/package.json", 1);
         symlink(fx.root.join("shared"), fx.root.join("p/node_modules")).unwrap();
         fx.age("p", 90);
-        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(
+            node_modules(Age::days(30))
+                .scan(&fx.ctx())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -529,7 +572,7 @@ mod tests {
         let fx = Fixture::new(&["**/keep-*/**", "**/keep-*"]);
         node_project(&fx, "keep-me", 10, 90);
         node_project(&fx, "other", 10, 90);
-        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        let found = node_modules(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["other/node_modules"]);
     }
 
@@ -542,7 +585,7 @@ mod tests {
         fx.age("site", 60);
         // A fresh build inside .next does not make the site look active.
         fx.file("site/.next/server/page.js", 1);
-        let found = node_modules(30).scan(&fx.ctx()).unwrap();
+        let found = node_modules(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["site/node_modules"]);
     }
 
@@ -551,7 +594,12 @@ mod tests {
         let fx = Fixture::new(&[]);
         fx.file("loose/node_modules/x.js", 1);
         fx.age("loose", 90);
-        assert!(node_modules(30).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(
+            node_modules(Age::days(30))
+                .scan(&fx.ctx())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn cargo_project(fx: &Fixture, rel: &str, age_days: u64) {
@@ -566,7 +614,9 @@ mod tests {
         let fx = Fixture::new(&[]);
         cargo_project(&fx, "old", 20);
         cargo_project(&fx, "today", 0);
-        let found = cargo_clean(Some(14), None).scan(&fx.ctx()).unwrap();
+        let found = cargo_clean(Some(Age::days(14)), None)
+            .scan(&fx.ctx())
+            .unwrap();
         assert_eq!(names(&found, &fx.root), vec!["old/target"]);
     }
 
@@ -587,7 +637,7 @@ mod tests {
         fx.age("ws", 30);
         fx.file("ws/crates/a/src/lib.rs", 1);
         assert!(
-            cargo_clean(Some(14), None)
+            cargo_clean(Some(Age::days(14)), None)
                 .scan(&fx.ctx())
                 .unwrap()
                 .is_empty()
@@ -622,7 +672,7 @@ mod tests {
         python_project(&fx, "old", ".venv", 40);
         python_project(&fx, "older", "venv", 90);
         python_project(&fx, "fresh", ".venv", 2);
-        let found = python_venv(30).scan(&fx.ctx()).unwrap();
+        let found = python_venv(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["old/.venv", "older/venv"]);
         assert!(found.iter().all(|c| c.bytes >= 30_000));
     }
@@ -636,7 +686,7 @@ mod tests {
         fx.file("pipenv/.venv/pyvenv.cfg", 1);
         fx.file("none/.venv/pyvenv.cfg", 1);
         fx.age("", 90);
-        let found = python_venv(30).scan(&fx.ctx()).unwrap();
+        let found = python_venv(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["pipenv/.venv", "reqs/.venv"]);
     }
 
@@ -647,7 +697,12 @@ mod tests {
         // Source code that happens to live in a folder called venv.
         fx.file("p/venv/notes.py", 1);
         fx.age("p", 90);
-        assert!(python_venv(30).scan(&fx.ctx()).unwrap().is_empty());
+        assert!(
+            python_venv(Age::days(30))
+                .scan(&fx.ctx())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -655,7 +710,7 @@ mod tests {
         let fx = Fixture::new(&[]);
         python_project(&fx, "p", ".venv", 60);
         fx.file("p/.venv/lib/new_dep.py", 1);
-        let found = python_venv(30).scan(&fx.ctx()).unwrap();
+        let found = python_venv(Age::days(30)).scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/.venv"]);
         assert_eq!(found[0].reason, "untouched for 60 days");
     }
@@ -665,7 +720,7 @@ mod tests {
         let fx = Fixture::new(&[]);
         node_project(&fx, "old", 10, 40);
         let ctx = fx.ctx();
-        let task = node_modules(30);
+        let task = node_modules(Age::days(30));
         let found = task.scan(&ctx).unwrap();
         let report = task.run(&ctx, &found);
         assert_eq!(report.removed.len(), 1);

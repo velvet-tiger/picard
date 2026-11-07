@@ -19,7 +19,7 @@ function config(): Settings {
     exclude: [],
     // The backend fills in the defaults when the file has no list.
     activity_ignore: ['.claude', 'AGENTS.md'],
-    tasks: [{ type: 'node_modules', enabled: true, stale_days: 30, prune_package_caches: false }],
+    tasks: [{ type: 'node_modules', enabled: true, stale_after: '30d', prune_package_caches: false }],
   }
 }
 
@@ -347,18 +347,21 @@ describe('Settings', () => {
     const { sent } = backend({
       get_settings: () => ({
         ...config(),
-        tasks: [{ type: 'cargo_clean', enabled: true, mode: 'stale', stale_days: 5 }],
+        tasks: [{ type: 'cargo_clean', enabled: true, mode: 'stale', stale_after: '5d' }],
       }),
     })
     await renderLoaded()
     const box = screen.getByRole('checkbox', { name: 'Only projects untouched for' })
-    const days = screen.getByRole('spinbutton', { name: 'Days untouched' })
+    const days = screen.getByRole('spinbutton', { name: 'Cargo target folders idle time' })
+    const unit = screen.getByRole('combobox', { name: 'Cargo target folders idle time unit' })
     expect(box).toBeChecked()
     expect(days).toBeEnabled()
+    expect(unit).toBeEnabled()
 
     await fireEvent.click(box)
 
     expect(days).toBeDisabled()
+    expect(unit).toBeDisabled()
     expect(
       screen.getByText('Cleans every project, including ones you are working on.'),
     ).toBeInTheDocument()
@@ -368,12 +371,51 @@ describe('Settings', () => {
         {
           settings: expect.objectContaining({
             tasks: expect.arrayContaining([
-              expect.objectContaining({ type: 'cargo_clean', mode: 'all', stale_days: 5 }),
+              expect.objectContaining({ type: 'cargo_clean', mode: 'all', stale_after: '5d' }),
             ]),
           }),
         },
       ]),
     )
+  })
+
+  it('saves an idle time in the unit picked for it', async () => {
+    const { sent } = backend()
+    await renderLoaded()
+    const value = screen.getByRole('spinbutton', { name: 'node_modules idle time' })
+    const unit = screen.getByRole('combobox', { name: 'node_modules idle time unit' })
+    expect(value).toHaveValue(30)
+    expect(unit).toHaveValue('d')
+
+    await fireEvent.change(unit, { target: { value: 'h' } })
+    await fireEvent.input(value, { target: { value: '6' } })
+    await fireEvent.click(saveButton())
+
+    await waitFor(() =>
+      expect(sent('save_settings')).toEqual([
+        {
+          settings: expect.objectContaining({
+            tasks: expect.arrayContaining([
+              expect.objectContaining({ type: 'node_modules', stale_after: '6h' }),
+            ]),
+          }),
+        },
+      ]),
+    )
+  })
+
+  it('shows both worktree waits with their own units', async () => {
+    backend({
+      get_settings: () => ({
+        ...config(),
+        tasks: [{ type: 'git_worktrees', enabled: true, stale_after: '12h', min_idle: '30m' }],
+      }),
+    })
+    await renderLoaded()
+    expect(screen.getByRole('spinbutton', { name: 'Merged worktree idle time' })).toHaveValue(30)
+    expect(screen.getByRole('combobox', { name: 'Merged worktree idle time unit' })).toHaveValue('m')
+    expect(screen.getByRole('spinbutton', { name: 'Other worktree idle time' })).toHaveValue(12)
+    expect(screen.getByRole('combobox', { name: 'Other worktree idle time unit' })).toHaveValue('h')
   })
 
   it('saves the chosen appearance and applies it only once saved', async () => {

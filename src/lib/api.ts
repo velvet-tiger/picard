@@ -11,12 +11,49 @@ export type Appearance = 'system' | 'light' | 'dark'
 
 export type Threshold = { unit: 'gb'; value: number } | { unit: 'pct'; value: number }
 
+/** The unit letter of an age: minutes, hours or days. */
+export type AgeUnit = 'm' | 'h' | 'd'
+
+export const AGE_UNITS: readonly AgeUnit[] = ['m', 'h', 'd']
+
+export function isAgeUnit(text: string): text is AgeUnit {
+  return (AGE_UNITS as readonly string[]).includes(text)
+}
+
+/**
+ * An age as the config writes it: a whole number and a unit letter, such as
+ * `"30m"`, `"6h"` or `"14d"`. The backend checks it when settings are saved.
+ */
+export type AgeText = string
+
+/**
+ * Splits an age into the number as typed and its unit. A half-typed age, such
+ * as `"d"` after the number was cleared, gives empty digits, so the field shows
+ * what the user left in it. An unknown unit reads as days, the old default.
+ */
+export function splitAge(text: AgeText): { digits: string; unit: AgeUnit } {
+  const last = text.slice(-1)
+  return isAgeUnit(last)
+    ? { digits: text.slice(0, -1), unit: last }
+    : { digits: text, unit: 'd' }
+}
+
+/** Joins a number, as typed, and a unit into an age. */
+export function joinAge(digits: string, unit: AgeUnit): AgeText {
+  return `${digits.trim()}${unit}`
+}
+
 export type Task =
-  | { type: 'git_worktrees'; enabled: boolean; stale_days: number; min_idle_minutes: number }
-  | { type: 'node_modules'; enabled: boolean; stale_days: number; prune_package_caches: boolean }
-  | { type: 'cargo_clean'; enabled: boolean; mode: CargoMode; stale_days: number; depth?: number }
-  | { type: 'python_venv'; enabled: boolean; stale_days: number }
-  | { type: 'build_output'; enabled: boolean; stale_days: number; dirs: string[] }
+  | { type: 'git_worktrees'; enabled: boolean; stale_after: AgeText; min_idle: AgeText }
+  | {
+      type: 'node_modules'
+      enabled: boolean
+      stale_after: AgeText
+      prune_package_caches: boolean
+    }
+  | { type: 'cargo_clean'; enabled: boolean; mode: CargoMode; stale_after: AgeText; depth?: number }
+  | { type: 'python_venv'; enabled: boolean; stale_after: AgeText }
+  | { type: 'build_output'; enabled: boolean; stale_after: AgeText; dirs: string[] }
   | {
       type: 'tool_caches'
       enabled: boolean
@@ -228,18 +265,18 @@ export const TASK_LABELS: Record<TaskType, string> = {
 export function newTask(type: TaskType): Task {
   switch (type) {
     case 'git_worktrees':
-      return { type, enabled: true, stale_days: 14, min_idle_minutes: 30 }
+      return { type, enabled: true, stale_after: '14d', min_idle: '30m' }
     case 'node_modules':
-      return { type, enabled: true, stale_days: 30, prune_package_caches: false }
+      return { type, enabled: true, stale_after: '30d', prune_package_caches: false }
     case 'cargo_clean':
-      return { type, enabled: true, mode: 'stale', stale_days: 14 }
+      return { type, enabled: true, mode: 'stale', stale_after: '14d' }
     case 'python_venv':
-      return { type, enabled: true, stale_days: 30 }
+      return { type, enabled: true, stale_after: '30d' }
     case 'build_output':
       return {
         type,
         enabled: true,
-        stale_days: 30,
+        stale_after: '30d',
         dirs: ['dist', 'build', '.next', 'vendor', '.terraform', 'target'],
       }
     case 'tool_caches':

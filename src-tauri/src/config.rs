@@ -35,25 +35,25 @@ exclude = []
 
 [[task]]
 type = "git_worktrees"
-stale_days = 14
-min_idle_minutes = 30
+stale_after = "14d"       # idle ages: minutes ("30m"), hours ("6h") or days ("14d")
+min_idle = "30m"
 
 [[task]]
 type = "node_modules"
-stale_days = 30
+stale_after = "30d"
 
 [[task]]
 type = "cargo_clean"
 mode = "stale"
-stale_days = 14
+stale_after = "14d"
 
 [[task]]
 type = "python_venv"
-stale_days = 30
+stale_after = "30d"
 
 [[task]]
 type = "build_output"     # folders git ignores, or proven Next.js and Composer output
-stale_days = 30
+stale_after = "30d"
 dirs = ["dist", "build", ".next", "vendor", ".terraform", "target"]
 "#;
 
@@ -281,10 +281,165 @@ impl VolumeOverride {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CargoMode {
-    /// Only projects whose sources have not changed in `stale_days`.
+    /// Only projects whose sources have not changed for `stale_after`.
     Stale,
     /// Everything under the roots, through `cargo clean-recursive`.
     All,
+}
+
+/// The unit an `Age` is counted in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgeUnit {
+    Minutes,
+    Hours,
+    Days,
+}
+
+impl AgeUnit {
+    fn secs(self) -> u64 {
+        match self {
+            AgeUnit::Minutes => 60,
+            AgeUnit::Hours => 3_600,
+            AgeUnit::Days => 86_400,
+        }
+    }
+
+    fn suffix(self) -> char {
+        match self {
+            AgeUnit::Minutes => 'm',
+            AgeUnit::Hours => 'h',
+            AgeUnit::Days => 'd',
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            AgeUnit::Minutes => "minute",
+            AgeUnit::Hours => "hour",
+            AgeUnit::Days => "day",
+        }
+    }
+}
+
+/// How long something must sit idle, such as a project before its
+/// `node_modules` go. Written as a number and a unit letter: `"30m"`, `"6h"`
+/// or `"14d"`. The unit is kept, not just the length, so the Settings window
+/// shows `24` hours as `24` hours rather than `1` day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Age {
+    pub value: u64,
+    pub unit: AgeUnit,
+}
+
+impl Age {
+    pub const fn minutes(value: u64) -> Self {
+        Age {
+            value,
+            unit: AgeUnit::Minutes,
+        }
+    }
+
+    #[cfg(test)]
+    pub const fn hours(value: u64) -> Self {
+        Age {
+            value,
+            unit: AgeUnit::Hours,
+        }
+    }
+
+    pub const fn days(value: u64) -> Self {
+        Age {
+            value,
+            unit: AgeUnit::Days,
+        }
+    }
+
+    /// The length of time. A value too large to count saturates, which only
+    /// means the wait never ends.
+    pub fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.value.saturating_mul(self.unit.secs()))
+    }
+
+    /// Reads `"<number><m|h|d>"`, such as `"30m"`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let bad = || format!("{text:?} is not an age like \"30m\", \"6h\" or \"14d\"");
+        let unit = match text.chars().last() {
+            Some('m') => AgeUnit::Minutes,
+            Some('h') => AgeUnit::Hours,
+            Some('d') => AgeUnit::Days,
+            _ => return Err(bad()),
+        };
+        let digits = &text[..text.len() - 1];
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        let value = digits.parse::<u64>().map_err(|_| bad())?;
+        Ok(Age { value, unit })
+    }
+
+    /// Reads an existing length of time as a whole number of `unit`s, for
+    /// reason text such as "untouched for 3 hours".
+    pub fn describe(idle: std::time::Duration, unit: AgeUnit) -> String {
+        let n = idle.as_secs() / unit.secs();
+        let plural = if n == 1 { "" } else { "s" };
+        format!("{n} {}{plural}", unit.name())
+    }
+}
+
+impl std::fmt::Display for Age {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.value, self.unit.suffix())
+    }
+}
+
+impl Serialize for Age {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+/// Reads an `Age` from a string, or from a bare integer counted in
+/// `legacy_unit`. Integers are how `stale_days` and `min_idle_minutes` were
+/// written before units could be chosen, so old configs keep their meaning.
+struct AgeVisitor {
+    legacy_unit: AgeUnit,
+}
+
+impl serde::de::Visitor<'_> for AgeVisitor {
+    type Value = Age;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an age like \"30m\", \"6h\" or \"14d\", or a whole number")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Age, E> {
+        Age::parse(v).map_err(E::custom)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Age, E> {
+        Ok(Age {
+            value: v,
+            unit: self.legacy_unit,
+        })
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Age, E> {
+        let v = u64::try_from(v)
+            .map_err(|_| E::custom(format!("an age must be zero or more, got {v}")))?;
+        self.visit_u64(v)
+    }
+}
+
+fn age_or_days<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Age, D::Error> {
+    d.deserialize_any(AgeVisitor {
+        legacy_unit: AgeUnit::Days,
+    })
+}
+
+fn age_or_minutes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Age, D::Error> {
+    d.deserialize_any(AgeVisitor {
+        legacy_unit: AgeUnit::Minutes,
+    })
 }
 
 /// One `[[task]]` entry. Tasks run in the order listed.
@@ -294,18 +449,30 @@ pub enum TaskConfig {
     GitWorktrees {
         #[serde(default = "default_true")]
         enabled: bool,
-        #[serde(default = "default_worktree_stale_days")]
-        stale_days: u32,
+        #[serde(
+            default = "default_worktree_stale_after",
+            alias = "stale_days",
+            deserialize_with = "age_or_days"
+        )]
+        stale_after: Age,
         /// How long a merged worktree must sit untouched before removal. Short,
         /// because disks fill fast; the in-use check guards live sessions.
-        #[serde(default = "default_min_idle_minutes")]
-        min_idle_minutes: u64,
+        #[serde(
+            default = "default_min_idle",
+            alias = "min_idle_minutes",
+            deserialize_with = "age_or_minutes"
+        )]
+        min_idle: Age,
     },
     NodeModules {
         #[serde(default = "default_true")]
         enabled: bool,
-        #[serde(default = "default_node_modules_stale_days")]
-        stale_days: u32,
+        #[serde(
+            default = "default_node_modules_stale_after",
+            alias = "stale_days",
+            deserialize_with = "age_or_days"
+        )]
+        stale_after: Age,
         /// Also run `npm cache clean --force` and `pnpm store prune`.
         #[serde(default)]
         prune_package_caches: bool,
@@ -315,8 +482,12 @@ pub enum TaskConfig {
         enabled: bool,
         #[serde(default = "default_cargo_mode")]
         mode: CargoMode,
-        #[serde(default = "default_worktree_stale_days")]
-        stale_days: u32,
+        #[serde(
+            default = "default_worktree_stale_after",
+            alias = "stale_days",
+            deserialize_with = "age_or_days"
+        )]
+        stale_after: Age,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         depth: Option<u32>,
     },
@@ -324,15 +495,23 @@ pub enum TaskConfig {
     PythonVenv {
         #[serde(default = "default_true")]
         enabled: bool,
-        #[serde(default = "default_node_modules_stale_days")]
-        stale_days: u32,
+        #[serde(
+            default = "default_node_modules_stale_after",
+            alias = "stale_days",
+            deserialize_with = "age_or_days"
+        )]
+        stale_after: Age,
     },
     /// Build output folders that git ignores, in idle projects.
     BuildOutput {
         #[serde(default = "default_true")]
         enabled: bool,
-        #[serde(default = "default_node_modules_stale_days")]
-        stale_days: u32,
+        #[serde(
+            default = "default_node_modules_stale_after",
+            alias = "stale_days",
+            deserialize_with = "age_or_days"
+        )]
+        stale_after: Age,
         /// Folder names to look for. Each must be a plain name, not a path.
         #[serde(default = "default_build_output_dirs")]
         dirs: Vec<String>,
@@ -364,14 +543,14 @@ pub enum TaskConfig {
 fn default_true() -> bool {
     true
 }
-fn default_worktree_stale_days() -> u32 {
-    14
+fn default_worktree_stale_after() -> Age {
+    Age::days(14)
 }
-fn default_min_idle_minutes() -> u64 {
-    30
+fn default_min_idle() -> Age {
+    Age::minutes(30)
 }
-fn default_node_modules_stale_days() -> u32 {
-    30
+fn default_node_modules_stale_after() -> Age {
+    Age::days(30)
 }
 fn default_cargo_mode() -> CargoMode {
     CargoMode::Stale
@@ -720,6 +899,7 @@ pub fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn home() -> PathBuf {
         PathBuf::from("/Users/test")
@@ -744,11 +924,19 @@ mod tests {
         assert_eq!(c.roots, vec![PathBuf::from("/Users/test/working")]);
         assert_eq!(c.tasks.len(), 5);
         assert_eq!(
+            c.tasks[0],
+            TaskConfig::GitWorktrees {
+                enabled: true,
+                stale_after: Age::days(14),
+                min_idle: Age::minutes(30)
+            }
+        );
+        assert_eq!(
             c.tasks[2],
             TaskConfig::CargoClean {
                 enabled: true,
                 mode: CargoMode::Stale,
-                stale_days: 14,
+                stale_after: Age::days(14),
                 depth: None
             }
         );
@@ -756,14 +944,14 @@ mod tests {
             c.tasks[3],
             TaskConfig::PythonVenv {
                 enabled: true,
-                stale_days: 30
+                stale_after: Age::days(30)
             }
         );
         assert_eq!(
             c.tasks[4],
             TaskConfig::BuildOutput {
                 enabled: true,
-                stale_days: 30,
+                stale_after: Age::days(30),
                 dirs: vec![
                     "dist".into(),
                     "build".into(),
@@ -1310,6 +1498,109 @@ mod tests {
     fn threshold_bytes() {
         assert_eq!(Threshold::Gb(30.0).bytes(0), 30_000_000_000);
         assert_eq!(Threshold::Pct(10.0).bytes(500_000_000_000), 50_000_000_000);
+    }
+
+    fn first_task(task_toml: &str) -> TaskConfig {
+        let text = format!("min_free_gb = 1\nroots = [\"/a\"]\n[[task]]\n{task_toml}\n");
+        parse_ok(&text).tasks.remove(0)
+    }
+
+    #[test]
+    fn ages_read_each_unit() {
+        for (text, age) in [
+            ("45m", Age::minutes(45)),
+            ("6h", Age::hours(6)),
+            ("14d", Age::days(14)),
+            ("0d", Age::days(0)),
+        ] {
+            let task = first_task(&format!("type = \"python_venv\"\nstale_after = \"{text}\""));
+            assert_eq!(
+                task,
+                TaskConfig::PythonVenv {
+                    enabled: true,
+                    stale_after: age
+                },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn old_integer_keys_keep_their_units() {
+        assert_eq!(
+            first_task("type = \"git_worktrees\"\nstale_days = 3\nmin_idle_minutes = 5"),
+            TaskConfig::GitWorktrees {
+                enabled: true,
+                stale_after: Age::days(3),
+                min_idle: Age::minutes(5)
+            }
+        );
+        assert_eq!(
+            first_task("type = \"node_modules\"\nstale_days = 7"),
+            TaskConfig::NodeModules {
+                enabled: true,
+                stale_after: Age::days(7),
+                prune_package_caches: false
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_ages() {
+        for bad in [
+            "\"\"",
+            "\"d\"",
+            "\"5\"",
+            "\"5s\"",
+            "\"-5d\"",
+            "\"5 d\"",
+            "\"1.5h\"",
+            "\"+5d\"",
+            "\"99999999999999999999d\"",
+            "-1",
+            "1.5",
+            "true",
+        ] {
+            let e = parse_err(&format!(
+                "min_free_gb = 1\nroots = [\"/a\"]\n[[task]]\ntype = \"node_modules\"\nstale_after = {bad}\n"
+            ));
+            assert!(
+                e.contains("age") || e.contains("invalid type"),
+                "{bad}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_old_and_new_key_together() {
+        parse_err(
+            "min_free_gb = 1\nroots = [\"/a\"]\n[[task]]\ntype = \"node_modules\"\nstale_days = 1\nstale_after = \"1d\"\n",
+        );
+    }
+
+    #[test]
+    fn age_duration_and_text() {
+        assert_eq!(Age::minutes(30).duration(), Duration::from_secs(1_800));
+        assert_eq!(Age::hours(2).duration(), Duration::from_secs(7_200));
+        assert_eq!(Age::days(1).duration(), Duration::from_secs(86_400));
+        assert_eq!(
+            Age::days(u64::MAX).duration(),
+            Duration::from_secs(u64::MAX)
+        );
+        assert_eq!(Age::hours(6).to_string(), "6h");
+        assert_eq!(Age::parse("6h"), Ok(Age::hours(6)));
+        assert_eq!(
+            Age::describe(Duration::from_secs(7_300), AgeUnit::Hours),
+            "2 hours"
+        );
+        assert_eq!(
+            Age::describe(Duration::from_secs(86_400), AgeUnit::Days),
+            "1 day"
+        );
+        assert_eq!(
+            Age::describe(Duration::from_secs(59), AgeUnit::Minutes),
+            "0 minutes"
+        );
     }
 
     #[test]

@@ -325,7 +325,7 @@ fn tasks_item(tasks: &[TaskConfig]) -> Result<Item> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CargoMode, DEFAULT_TOML};
+    use crate::config::{Age, CargoMode, DEFAULT_TOML};
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
@@ -448,12 +448,50 @@ mod tests {
         s.tasks[0] = TaskConfig::CargoClean {
             enabled: false,
             mode: CargoMode::All,
-            stale_days: 7,
+            stale_after: Age::hours(7),
             depth: Some(4),
         };
         let out = apply(DEFAULT_TOML, &s, home()).unwrap();
         let back = read(&out, home()).unwrap();
         assert_eq!(back.tasks, s.tasks);
+    }
+
+    #[test]
+    fn old_age_keys_are_rewritten_with_units() {
+        let old = DEFAULT_TOML.replace(
+            "stale_after = \"14d\"       # idle ages: minutes (\"30m\"), hours (\"6h\") or days (\"14d\")\nmin_idle = \"30m\"",
+            "stale_days = 3\nmin_idle_minutes = 45",
+        );
+        assert_ne!(old, DEFAULT_TOML);
+        let s = read(&old, home()).unwrap();
+        assert_eq!(
+            s.tasks[0],
+            TaskConfig::GitWorktrees {
+                enabled: true,
+                stale_after: Age::days(3),
+                min_idle: Age::minutes(45),
+            }
+        );
+        let out = apply(&old, &s, home()).unwrap();
+        assert!(out.contains("stale_after = \"3d\""), "{out}");
+        assert!(out.contains("min_idle = \"45m\""), "{out}");
+        assert!(
+            !out.contains("stale_days") && !out.contains("min_idle_minutes"),
+            "{out}"
+        );
+        assert_eq!(read(&out, home()).unwrap().tasks, s.tasks);
+    }
+
+    #[test]
+    fn ages_cross_to_the_window_as_text() {
+        let s = read(DEFAULT_TOML, home()).unwrap();
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"stale_after\":\"14d\""), "{json}");
+        assert!(json.contains("\"min_idle\":\"30m\""), "{json}");
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+        let bad = json.replacen("\"14d\"", "\"14 days\"", 1);
+        assert!(serde_json::from_str::<Settings>(&bad).is_err());
     }
 
     #[test]

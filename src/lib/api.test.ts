@@ -8,6 +8,7 @@ import {
   getNotActivity,
   getProtection,
   itemTitle,
+  joinAge,
   newTask,
   notifyIgnoreChanged,
   onIgnoreChanged,
@@ -15,6 +16,7 @@ import {
   saveSettings,
   setIgnored,
   shortPath,
+  splitAge,
   tildePath,
   withEveryBuiltIn,
   type IgnoreChange,
@@ -168,7 +170,7 @@ describe('withEveryBuiltIn', () => {
   it('keeps existing tasks first, in order, with their options', () => {
     const existing: Task[] = [
       { type: 'command', enabled: true, name: 'Prune', run: 'docker system prune -f', timeout_secs: 60 },
-      { type: 'node_modules', enabled: true, stale_days: 7, prune_package_caches: true },
+      { type: 'node_modules', enabled: true, stale_after: '7d', prune_package_caches: true },
     ]
     const tasks = withEveryBuiltIn(existing)
     expect(tasks.slice(0, 2)).toEqual(existing)
@@ -252,5 +254,20 @@ describe('backend commands', () => {
     const { sent } = fakeBackend({ get_not_activity: () => ['.claude'] })
     expect(await getNotActivity()).toEqual(['.claude'])
     expect(sent('get_not_activity')).toHaveLength(1)
+  })
+})
+
+describe('ages', () => {
+  it('splits an age into its number and unit', () => {
+    expect(splitAge('30m')).toEqual({ digits: '30', unit: 'm' })
+    expect(splitAge('6h')).toEqual({ digits: '6', unit: 'h' })
+    expect(splitAge('14d')).toEqual({ digits: '14', unit: 'd' })
+    expect(splitAge('d')).toEqual({ digits: '', unit: 'd' })
+  })
+
+  it('joins a number and a unit back into an age', () => {
+    expect(joinAge('6', 'h')).toBe('6h')
+    expect(joinAge(' 14 ', 'd')).toBe('14d')
+    expect(joinAge('', 'm')).toBe('m')
   })
 })

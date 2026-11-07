@@ -31,6 +31,8 @@ pub use notice_actions::{
 };
 pub use size::SizeCache;
 
+#[cfg(test)]
+use crate::config::Age;
 use crate::config::{CargoMode, TaskConfig, ToolOverrides};
 use crate::env::ToolEnv;
 use crate::volume::Volume;
@@ -353,10 +355,10 @@ pub fn from_config(
         match task {
             TaskConfig::NodeModules {
                 enabled: true,
-                stale_days,
+                stale_after,
                 prune_package_caches,
             } => {
-                let mut task = stale_dirs::node_modules(*stale_days);
+                let mut task = stale_dirs::node_modules(*stale_after);
                 if *prune_package_caches {
                     let steps = [
                         env.resolve("npm", overrides)
@@ -380,19 +382,19 @@ pub fn from_config(
             TaskConfig::CargoClean {
                 enabled: true,
                 mode,
-                stale_days,
+                stale_after,
                 depth,
             } => {
-                let stale_days = match mode {
-                    CargoMode::Stale => Some(*stale_days),
+                let stale_after = match mode {
+                    CargoMode::Stale => Some(*stale_after),
                     CargoMode::All => None,
                 };
-                out.push(Box::new(stale_dirs::cargo_clean(stale_days, *depth)));
+                out.push(Box::new(stale_dirs::cargo_clean(stale_after, *depth)));
             }
             TaskConfig::PythonVenv {
                 enabled: true,
-                stale_days,
-            } => out.push(Box::new(stale_dirs::python_venv(*stale_days))),
+                stale_after,
+            } => out.push(Box::new(stale_dirs::python_venv(*stale_after))),
             TaskConfig::ToolCaches {
                 enabled: true,
                 uv,
@@ -415,13 +417,13 @@ pub fn from_config(
             }
             TaskConfig::BuildOutput {
                 enabled: true,
-                stale_days,
+                stale_after,
                 dirs,
             } => match env.resolve("git", overrides) {
                 Some(git) => out.push(Box::new(build_output::BuildOutput::new(
                     git::GitCmd::new(git, env.path_var()),
                     dirs.clone(),
-                    *stale_days,
+                    *stale_after,
                 ))),
                 None => log::error!(
                     "build_output skipped: git not found on {} (set [tools] git)",
@@ -430,13 +432,13 @@ pub fn from_config(
             },
             TaskConfig::GitWorktrees {
                 enabled: true,
-                stale_days,
-                min_idle_minutes,
+                stale_after,
+                min_idle,
             } => match env.resolve("git", overrides) {
                 Some(git) => out.push(Box::new(git_worktrees::GitWorktrees::new(
                     git::GitCmd::new(git, env.path_var()),
-                    *stale_days,
-                    Duration::from_secs(min_idle_minutes.saturating_mul(60)),
+                    stale_after.duration(),
+                    min_idle.duration(),
                     Arc::new(in_use::InUse::load),
                 ))),
                 None => log::error!(
@@ -689,9 +691,12 @@ pub(crate) mod test_support {
 
         /// Sets the mtime of everything under `rel` (and `rel` itself) to `days` ago.
         pub fn age(&self, rel: &str, days: u64) {
-            let t = filetime::FileTime::from_system_time(
-                SystemTime::now() - std::time::Duration::from_secs(days * 86_400),
-            );
+            self.age_by(rel, std::time::Duration::from_secs(days * 86_400));
+        }
+
+        /// Sets the mtime of everything under `rel` (and `rel` itself) to `ago` ago.
+        pub fn age_by(&self, rel: &str, ago: std::time::Duration) {
+            let t = filetime::FileTime::from_system_time(SystemTime::now() - ago);
             for e in walkdir::WalkDir::new(self.root.join(rel)).contents_first(true) {
                 let e = e.unwrap();
                 filetime::set_symlink_file_times(e.path(), t, t).unwrap();
@@ -929,8 +934,8 @@ mod tests {
         let tasks = vec![
             TaskConfig::GitWorktrees {
                 enabled: false,
-                stale_days: 14,
-                min_idle_minutes: 30,
+                stale_after: Age::days(14),
+                min_idle: Age::minutes(30),
             },
             TaskConfig::Command {
                 enabled: true,
@@ -940,13 +945,13 @@ mod tests {
             },
             TaskConfig::NodeModules {
                 enabled: false,
-                stale_days: 30,
+                stale_after: Age::days(30),
                 prune_package_caches: false,
             },
             TaskConfig::CargoClean {
                 enabled: true,
                 mode: CargoMode::All,
-                stale_days: 14,
+                stale_after: Age::days(14),
                 depth: None,
             },
         ];

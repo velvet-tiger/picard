@@ -470,7 +470,7 @@ mod tests {
 
     fn two_tasks() -> Vec<Box<dyn CleanupTask>> {
         vec![
-            Box::new(stale_dirs::node_modules(30)),
+            Box::new(stale_dirs::node_modules(crate::config::Age::days(30))),
             Box::new(stale_dirs::cargo_clean(None, None)),
         ]
     }

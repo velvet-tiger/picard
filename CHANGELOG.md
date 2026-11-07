@@ -6,6 +6,11 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The idle time of each cleanup task can now be set in minutes, hours or days. Settings shows a unit menu next to each one. In `config.toml` the keys are `stale_after` and `min_idle`, written as an age such as `"30m"`, `"6h"` or `"14d"`. The old `stale_days` and `min_idle_minutes` keys still work with their old units. Saving from Settings rewrites them in the new form.
+- Reasons in the Clean list and `picard scan` give the idle time in the unit you chose, such as "untouched for 5 hours". Worktree reasons say "waits for stale_after" instead of "waits for stale_days".
+
 ## [0.10.0] - 2026-11-01
 
 ### Added

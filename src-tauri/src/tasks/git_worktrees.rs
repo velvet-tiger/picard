@@ -16,7 +16,7 @@
 //! - any checked-out submodule is clean and holds no commit missing from its
 //!   remote branches (`GitCmd::unsafe_to_inspect`)
 //! - it is done and the folder has been idle for `min_idle`, or it waits and
-//!   the folder has been idle for `stale_days`. It waits when only its own
+//!   the folder has been idle for `stale_after`. It waits when only its own
 //!   branch's upstream holds its commits, or when it is done but made
 //!   commits that are now on no branch.
 //!
@@ -43,14 +43,14 @@
 //!   reapplies a reverted change also counts as a copy of the original.
 //!
 //! A failed match only fails this rule. A pushed branch still waits for
-//! `stale_days`. An error here, such as a blob missing from a partial clone,
+//! `stale_after`. An error here, such as a blob missing from a partial clone,
 //! counts as no match, and the pushed check still runs.
 //!
 //! A done worktree can still hold commits that no branch does. A detached
 //! worktree can make a commit and then check out another one, after which
 //! only its HEAD reflog reaches that commit. Removal deletes that reflog. So
 //! a done worktree whose reflog shows a commit made in it, which no other
-//! local branch holds and which has no copy on one, waits for `stale_days`
+//! local branch holds and which has no copy on one, waits for `stale_after`
 //! instead. Commits it only checked out or reset to do not count. That
 //! includes a commit made outside the reflog, for example with `git
 //! commit-tree`, and then reached with `checkout` or `reset`. Drafts with a
@@ -88,7 +88,7 @@
 //! Git refuses it, so Picard removes it with `--force`, and only when its
 //! commits are safe by the rules above and nothing else has changed in it.
 //! A person can also be deleting files on purpose, so it always waits for
-//! `stale_days`, and the folder mtimes that record a deletion count towards
+//! `stale_after`, and the folder mtimes that record a deletion count towards
 //! its idle time. Its reason starts with "partly deleted".
 //!
 //! Picard also looks for broken worktrees: folders whose `.git` file names a
@@ -127,7 +127,6 @@ use super::{Candidate, CleanupTask, Ctx, Estimate, Notice, Removed, Report, chec
 /// Folders never descended into while looking for repos.
 pub(super) const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git"];
 pub(super) const SEARCH_DEPTH: usize = 8;
-const SECS_PER_DAY: u64 = 86_400;
 
 /// The largest `.git` file Picard reads. Git writes one line holding a path,
 /// so anything larger is not one of git's.
@@ -144,13 +143,13 @@ enum Standing {
     /// go once idle for `min_idle`. Holds the start of the candidate reason,
     /// such as "on main".
     Done(String),
-    /// Its commits survive the removal, but it must wait for `stale_days`.
+    /// Its commits survive the removal, but it must wait for `stale_after`.
     Elsewhere(Wait),
     /// Removing it could lose commits.
     Unsafe,
 }
 
-/// Why a worktree whose commits survive must still wait for `stale_days`.
+/// Why a worktree whose commits survive must still wait for `stale_after`.
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum Wait {
     /// Only its upstream holds its commits.
@@ -165,7 +164,7 @@ enum Wait {
 impl Wait {
     /// How the candidate reason starts, before the idle time. A done
     /// worktree's reason starts with how it is done, such as "on main", so
-    /// `waits_for_stale_days` can tell the kinds apart when a candidate is
+    /// `waits_for_stale_after` can tell the kinds apart when a candidate is
     /// judged again.
     fn prefix(self) -> &'static str {
         match self {
@@ -201,7 +200,7 @@ enum Assessed {
 
 impl Standing {
     /// The standing of a worktree with `tree`. A partly deleted one always
-    /// waits for `stale_days`, however done it is. An unsafe one stays unsafe.
+    /// waits for `stale_after`, however done it is. An unsafe one stays unsafe.
     fn with_tree(self, tree: Tree) -> Standing {
         match (tree, self) {
             (Tree::Clean, standing) | (_, standing @ Standing::Unsafe) => standing,
@@ -212,8 +211,8 @@ impl Standing {
 }
 
 /// True if candidate reason `reason` is one for a worktree that waited for
-/// `stale_days`, rather than one found done.
-fn waits_for_stale_days(reason: &str) -> bool {
+/// `stale_after`, rather than one found done.
+fn waits_for_stale_after(reason: &str) -> bool {
     [Wait::Pushed, Wait::Unbranched, Wait::PartlyDeleted]
         .iter()
         .any(|w| reason.starts_with(w.prefix()))
@@ -284,7 +283,7 @@ fn err_text(e: anyhow::Error) -> String {
 /// costs git a merge-base walk. On a repo with a short history, 100,000
 /// ranges took 1.5 s, against git's 60 s timeout. That leaves room for repos
 /// whose merge bases lie much further back. Past the limit the check is
-/// skipped, and the worktree waits for `stale_days`.
+/// skipped, and the worktree waits for `stale_after`.
 const REFLOG_COPY_LIMIT: usize = 100_000;
 
 /// The largest HEAD reflog file Picard reads to find a worktree's creation.
@@ -295,7 +294,7 @@ const REFLOG_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 
 pub struct GitWorktrees {
     git: GitCmd,
-    stale_days: u32,
+    stale_after: Duration,
     min_idle: Duration,
     in_use: InUseSource,
     /// `REFLOG_COPY_LIMIT`, lowered in tests.
@@ -308,10 +307,15 @@ pub struct GitWorktrees {
 }
 
 impl GitWorktrees {
-    pub fn new(git: GitCmd, stale_days: u32, min_idle: Duration, in_use: InUseSource) -> Self {
+    pub fn new(
+        git: GitCmd,
+        stale_after: Duration,
+        min_idle: Duration,
+        in_use: InUseSource,
+    ) -> Self {
         Self {
             git,
-            stale_days,
+            stale_after,
             min_idle,
             in_use,
             reflog_copy_limit: REFLOG_COPY_LIMIT,
@@ -403,7 +407,7 @@ impl GitWorktrees {
             _ => newest_mtime(&wt.path, &ctx.not_activity)?,
         };
         let idle = ctx.now.duration_since(newest).ok()?;
-        let stale = Duration::from_secs(u64::from(self.stale_days) * SECS_PER_DAY);
+        let stale = self.stale_after;
         let wait = match standing {
             Standing::Done(how) if idle >= self.min_idle => {
                 return Some(format!("{how}, idle {}", format_idle(idle)));
@@ -463,7 +467,7 @@ impl GitWorktrees {
     /// own git dir holds, which removal deletes. A per-worktree ref holding a
     /// commit no other branch holds makes it unsafe. A commit made here, by
     /// the HEAD reflog, that no branch holds or has a copy of makes a done
-    /// worktree wait for `stale_days`. Neither check ever makes it go sooner.
+    /// worktree wait for `stale_after`. Neither check ever makes it go sooner.
     fn standing(&self, repo: &Path, state: &RepoState, wt: &WorktreeEntry) -> Result<Standing> {
         let standing = self.head_standing(repo, state, wt)?;
         let path = wt.path.display();
@@ -483,7 +487,7 @@ impl GitWorktrees {
         match self.unkept_commit(repo, state, wt)? {
             Some(id) => {
                 log::debug!(
-                    "worktree {path}: waits for stale_days: commit {id} was made here, and no other branch holds it or a copy"
+                    "worktree {path}: waits for stale_after: commit {id} was made here, and no other branch holds it or a copy"
                 );
                 Ok(Standing::Elsewhere(Wait::Unbranched))
             }
@@ -622,7 +626,7 @@ impl GitWorktrees {
             Ok(marked) => marked,
             Err(e) => {
                 log::warn!(
-                    "worktree {path}: cannot look for copies of commits made here, so it waits for stale_days: {e:#}"
+                    "worktree {path}: cannot look for copies of commits made here, so it waits for stale_after: {e:#}"
                 );
                 return Ok(Some(first.to_string()));
             }
@@ -1106,9 +1110,9 @@ impl GitWorktrees {
         }
         match self.standing(repo, &state, wt).map_err(err_text)? {
             Standing::Done(_) => Ok(wt.clone()),
-            Standing::Elsewhere(_) if waits_for_stale_days(&c.reason) => Ok(wt.clone()),
+            Standing::Elsewhere(_) if waits_for_stale_after(&c.reason) => Ok(wt.clone()),
             Standing::Elsewhere(_) => {
-                Err("is no longer done, so it waits for stale_days".to_string())
+                Err("is no longer done, so it waits for stale_after".to_string())
             }
             Standing::Unsafe => Err("removing it could now lose commits".to_string()),
         }
@@ -1149,16 +1153,16 @@ impl GitWorktrees {
         Ok(())
     }
 
-    /// Refuses removal if partly deleted `c` has changed within `stale_days`.
+    /// Refuses removal if partly deleted `c` has changed within `stale_after`.
     /// A deletion leaves no file to see, so the checks that look for writes
     /// since the run started cannot catch one made after the scan.
-    fn stale_days_passed(&self, c: &Candidate, ctx: &Ctx) -> Result<(), String> {
-        let stale = Duration::from_secs(u64::from(self.stale_days) * SECS_PER_DAY);
+    fn stale_after_passed(&self, c: &Candidate, ctx: &Ctx) -> Result<(), String> {
+        let stale = self.stale_after;
         let idle = last_change(&c.path, &ctx.not_activity)
             .and_then(|newest| ctx.now.duration_since(newest).ok());
         match idle {
             Some(idle) if idle >= stale => Ok(()),
-            _ => Err("changed too recently, so it waits for stale_days".to_string()),
+            _ => Err("changed too recently, so it waits for stale_after".to_string()),
         }
     }
 
@@ -1208,7 +1212,7 @@ impl GitWorktrees {
         let repo = self.repo_of(&c.path).map_err(err_text)?;
         let wt = self.recheck(&repo, c, &canon)?;
         if partly_deleted {
-            self.stale_days_passed(c, ctx)?;
+            self.stale_after_passed(c, ctx)?;
         }
         if self.written_during_run(c, ctx, stores)? {
             return Err("changed since the run started".to_string());
@@ -1864,11 +1868,15 @@ mod tests {
         p
     }
 
-    fn task(stale_days: u32, in_use: Vec<PathBuf>) -> GitWorktrees {
+    fn days(n: u64) -> Duration {
+        Duration::from_secs(n * 86_400)
+    }
+
+    fn task(stale_days: u64, in_use: Vec<PathBuf>) -> GitWorktrees {
         let used = InUse::from_cwds(in_use);
         GitWorktrees::new(
             GitCmd::default(),
-            stale_days,
+            days(stale_days),
             Duration::from_secs(30 * 60),
             Arc::new(move || Ok(used.clone())),
         )
@@ -1917,7 +1925,7 @@ mod tests {
         let t = GitWorktrees::new(
             git_slow_to_remove(fx.dir.path())
                 .with_limits(Duration::from_secs(60), Duration::from_millis(100)),
-            14,
+            days(14),
             Duration::from_secs(30 * 60),
             Arc::new(move || Ok(used.clone())),
         );
@@ -1972,7 +1980,7 @@ mod tests {
     }
 
     #[test]
-    fn partly_deleted_worktree_waits_for_stale_days_and_then_goes() {
+    fn partly_deleted_worktree_waits_for_stale_after_and_then_goes() {
         let fx = Fixture::new(&[]);
         let r = repo(&fx);
         let wt = partly_deleted(&fx, &r, "half");
@@ -2093,7 +2101,7 @@ mod tests {
         assert!(report.removed.is_empty(), "{report:?}");
         assert_eq!(
             report.failed[0].1,
-            "changed too recently, so it waits for stale_days"
+            "changed too recently, so it waits for stale_after"
         );
         assert!(wt.exists());
     }
@@ -2110,7 +2118,7 @@ mod tests {
         let used = InUse::from_cwds(vec![]);
         let t = GitWorktrees::new(
             git_with_hook(fx.dir.path(), "status", 2, &armed, &make),
-            14,
+            days(14),
             Duration::from_secs(30 * 60),
             Arc::new(move || Ok(used.clone())),
         );
@@ -2180,7 +2188,7 @@ mod tests {
         let lsof_broken = Arc::clone(&broken);
         let t = GitWorktrees::new(
             GitCmd::default(),
-            1,
+            days(1),
             Duration::from_secs(30 * 60),
             Arc::new(move || {
                 if lsof_broken.load(Ordering::SeqCst) {
@@ -2247,7 +2255,7 @@ mod tests {
         let used = InUse::from_cwds(vec![]);
         let t = GitWorktrees::new(
             git_with_hook(fx.dir.path(), "status", 2, &armed, &edit),
-            14,
+            days(14),
             Duration::from_secs(30 * 60),
             Arc::new(move || Ok(used.clone())),
         );
@@ -2604,7 +2612,7 @@ mod tests {
         let used = InUse::from_cwds(vec![]);
         let t = GitWorktrees::new(
             git_with_hook(fx.dir.path(), "status", 2, &armed, &hide),
-            14,
+            days(14),
             Duration::from_secs(30 * 60),
             Arc::new(move || Ok(used.clone())),
         );
@@ -2634,7 +2642,7 @@ mod tests {
         let used = InUse::from_cwds(vec![]);
         let t = GitWorktrees::new(
             git_with_hook(fx.dir.path(), "worktree", 1, &armed, &write),
-            14,
+            days(14),
             Duration::from_secs(30 * 60),
             Arc::new(move || Ok(used.clone())),
         );
@@ -3670,7 +3678,7 @@ mod tests {
     }
 
     #[test]
-    fn pushed_branch_with_only_some_commits_copied_waits_for_stale_days() {
+    fn pushed_branch_with_only_some_commits_copied_waits_for_stale_after() {
         let fx = Fixture::new(&[]);
         let r = repo(&fx);
         let (wt, one, _) = pushed_two_commits(&fx, &r);
@@ -3779,7 +3787,7 @@ mod tests {
     /// it never fetched, so the cherry-pick check fails with an error. That
     /// must not stop the pushed check.
     #[test]
-    fn cherry_pick_check_error_still_lets_a_pushed_worktree_wait_for_stale_days() {
+    fn cherry_pick_check_error_still_lets_a_pushed_worktree_wait_for_stale_after() {
         let fx = Fixture::new(&[]);
         let r = blobless_clone(&fx);
         let wt = worktree(&r, "feat");
@@ -3959,7 +3967,7 @@ mod tests {
         assert_eq!(why("local"), "removing it could now lose commits");
         assert_eq!(
             why("pushed"),
-            "is no longer done, so it waits for stale_days"
+            "is no longer done, so it waits for stale_after"
         );
     }
 
@@ -4055,7 +4063,7 @@ mod tests {
     /// A detached worktree makes a commit, then checks out main. Only the
     /// HEAD reflog reaches the commit, and removal deletes that reflog.
     #[test]
-    fn commit_left_behind_by_a_checkout_waits_for_stale_days() {
+    fn commit_left_behind_by_a_checkout_waits_for_stale_after() {
         let fx = Fixture::new(&[]);
         let r = repo(&fx);
         let wt = detached(&r, "left-behind");
@@ -4072,7 +4080,7 @@ mod tests {
             reason_of(&found, "left-behind"),
             "has commits on no branch, idle 20 days"
         );
-        // Judged again, it still waited for stale_days, so it goes.
+        // Judged again, it still waited for stale_after, so it goes.
         let report = t.run(&ctx, &found);
         assert_eq!(report.removed.len(), 1, "{report:?}");
         assert!(!wt.exists());
@@ -4110,7 +4118,7 @@ mod tests {
     }
 
     #[test]
-    fn content_amend_leaves_a_draft_that_waits_for_stale_days() {
+    fn content_amend_leaves_a_draft_that_waits_for_stale_after() {
         let fx = Fixture::new(&[]);
         let r = repo(&fx);
         let wt = detached(&r, "redrafted");
@@ -4232,7 +4240,7 @@ mod tests {
         };
         assert_eq!(
             why("late-draft"),
-            "is no longer done, so it waits for stale_days"
+            "is no longer done, so it waits for stale_after"
         );
         assert_eq!(why("late-ref"), "removing it could now lose commits");
     }
@@ -4284,7 +4292,7 @@ mod tests {
         );
     }
 
-    /// Asserts `name` is kept while fresh, then found after `stale_days`
+    /// Asserts `name` is kept while fresh, then found after `stale_after`
     /// because it made commits that are on no branch.
     fn waits_for_its_unbranched_commits(fx: &Fixture, t: &GitWorktrees, wt: &Path, name: &str) {
         age(fx, wt, 1);
@@ -4302,7 +4310,7 @@ mod tests {
     /// `git worktree add` does. Only the first entry is the worktree's own
     /// creation, so a later empty one counts as a commit made here.
     #[test]
-    fn plumbing_commit_with_an_empty_reflog_message_waits_for_stale_days() {
+    fn plumbing_commit_with_an_empty_reflog_message_waits_for_stale_after() {
         let fx = Fixture::new(&[]);
         let r = repo(&fx);
         let wt = detached(&r, "plumbed");
@@ -4381,7 +4389,7 @@ mod tests {
     /// entry with an empty message is the oldest one left. Its old value is
     /// the commit HEAD left, not all zeros, so it still counts as made here.
     #[test]
-    fn plumbing_commit_after_the_reflog_expired_waits_for_stale_days() {
+    fn plumbing_commit_after_the_reflog_expired_waits_for_stale_after() {
         let fx = Fixture::new(&[]);
         let r = repo(&fx);
         let wt = detached(&r, "expired");
@@ -4493,7 +4501,7 @@ mod tests {
     /// A fixup rebase folds two commits into one. Main holds the result, but
     /// neither original has a copy, so the worktree waits.
     #[test]
-    fn fixup_rebase_leaves_originals_without_a_copy_and_waits_for_stale_days() {
+    fn fixup_rebase_leaves_originals_without_a_copy_and_waits_for_stale_after() {
         let fx = Fixture::new(&[]);
         let r = repo(&fx);
         let wt = worktree(&r, "squashed");
@@ -4636,7 +4644,7 @@ mod tests {
         repo(&fx);
         let t = GitWorktrees::new(
             GitCmd::default(),
-            14,
+            days(14),
             Duration::from_secs(1800),
             Arc::new(|| anyhow::bail!("lsof broke")),
         );

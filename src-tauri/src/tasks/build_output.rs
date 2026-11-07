@@ -26,8 +26,9 @@ use anyhow::Result;
 
 use super::git::{GitCmd, output_git_dirs};
 use super::git_worktrees::written_since;
-use super::stale_dirs::{find_pairs, idle_days, is_file};
+use super::stale_dirs::{find_pairs, idle_for, is_file};
 use super::{Candidate, CleanupTask, Ctx, Estimate, Report, Stop, check_target, remove_dirs};
+use crate::config::Age;
 
 /// How deep to search under each root for projects.
 const SEARCH_DEPTH: usize = 8;
@@ -54,11 +55,13 @@ enum Voucher {
 
 impl Voucher {
     /// The candidate reason for a folder with this voucher.
-    fn reason(self, idle: u64) -> String {
+    /// `idle` is how long the project has been untouched, already worded,
+    /// such as "3 hours".
+    fn reason(self, idle: &str) -> String {
         match self {
-            Voucher::Git => format!("ignored by git, untouched for {idle} days"),
+            Voucher::Git => format!("ignored by git, untouched for {idle}"),
             Voucher::ToolFile(what) => {
-                format!("{what}, not in a git repo, untouched for {idle} days")
+                format!("{what}, not in a git repo, untouched for {idle}")
             }
         }
     }
@@ -83,16 +86,16 @@ fn holds_file(dir: &Path, parts: &[&str]) -> bool {
 pub struct BuildOutput {
     git: GitCmd,
     dirs: Vec<String>,
-    stale_days: u32,
+    stale_after: Age,
 }
 
 impl BuildOutput {
     /// `dirs` are plain folder names. Config validation has checked them.
-    pub fn new(git: GitCmd, dirs: Vec<String>, stale_days: u32) -> Self {
+    pub fn new(git: GitCmd, dirs: Vec<String>, stale_after: Age) -> Self {
         Self {
             git,
             dirs,
-            stale_days,
+            stale_after,
         }
     }
 
@@ -197,15 +200,17 @@ impl CleanupTask for BuildOutput {
             }
             // Staleness first: it is cheap, and it spares running git for
             // every project that is still in use.
-            let idle = match idle_days(&project, ctx, &names) {
-                Some(idle) if idle >= u64::from(self.stale_days) => idle,
+            let idle = match idle_for(&project, ctx, &names) {
+                Some(idle) if idle >= self.stale_after.duration() => {
+                    Age::describe(idle, self.stale_after.unit)
+                }
                 _ => continue,
             };
             let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
             match self.judge(&project, name, ctx.stop) {
-                Ok(voucher) => found.push((target, voucher.reason(idle))),
+                Ok(voucher) => found.push((target, voucher.reason(&idle))),
                 Err(why) => log::debug!("build_output: keeping {}: {why}", target.display()),
             }
         }
@@ -301,7 +306,7 @@ mod tests {
             ["dist", "build", ".next", "vendor"]
                 .map(String::from)
                 .to_vec(),
-            30,
+            Age::days(30),
         )
     }
 
@@ -493,7 +498,7 @@ mod tests {
         fx.file("p/.terraform/modules/vpc/main.tf", 1);
         clone_like(&dir.join(".terraform/modules/vpc"));
         fx.age("p", 60);
-        let t = BuildOutput::new(GitCmd::default(), vec![".terraform".into()], 30);
+        let t = BuildOutput::new(GitCmd::default(), vec![".terraform".into()], Age::days(30));
         let found = t.scan(&fx.ctx()).unwrap();
         assert_eq!(names(&found, &fx.root), vec!["p/.terraform"]);
     }
@@ -696,7 +701,7 @@ mod tests {
         let t = BuildOutput::new(
             git_with_hook(fx.dir.path(), "rev-list", 1, &armed, &write),
             vec!["vendor".into()],
-            30,
+            Age::days(30),
         );
         let ctx = fx.ctx();
         let found = t.scan(&ctx).unwrap();

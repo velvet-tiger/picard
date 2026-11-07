@@ -16,9 +16,17 @@
     newTask,
     withEveryBuiltIn,
     TASK_LABELS,
+    AGE_UNITS,
+    isAgeUnit,
+    joinAge,
+    splitAge,
+    type AgeText,
+    type AgeUnit,
     type Settings,
     type Task,
   } from './api'
+
+  const AGE_UNIT_NAMES: Record<AgeUnit, string> = { m: 'minutes', h: 'hours', d: 'days' }
 
   let settings = $state<Settings | null>(null)
   let launchAtLogin = $state(false)
@@ -215,6 +223,39 @@
   loadDefaultNames()
 </script>
 
+<!-- A whole number and a unit menu for an age such as "6h". Switching the unit
+     keeps the number, so 2 days becomes 2 hours, not 48. -->
+{#snippet ageControl(
+  text: AgeText,
+  update: (next: AgeText) => void,
+  label: string,
+  disabled: boolean = false,
+)}
+  {@const age = splitAge(text)}
+  <input
+    type="number"
+    min="0"
+    step="1"
+    aria-label={label}
+    {disabled}
+    value={age.digits}
+    oninput={(e) => update(joinAge(e.currentTarget.value, age.unit))}
+  />
+  <select
+    aria-label={`${label} unit`}
+    {disabled}
+    value={age.unit}
+    onchange={(e) => {
+      const unit = e.currentTarget.value
+      if (isAgeUnit(unit)) update(joinAge(age.digits, unit))
+    }}
+  >
+    {#each AGE_UNITS as unit (unit)}
+      <option value={unit}>{AGE_UNIT_NAMES[unit]}</option>
+    {/each}
+  </select>
+{/snippet}
+
 <main>
   <h1>Settings</h1>
   <p class="muted">Saved to config.toml. Comments and sections not shown here are kept.</p>
@@ -398,23 +439,20 @@
               <div class="field">
                 <span>Merged worktrees, once idle for</span>
                 <span class="control">
-                  <input type="number" min="0" bind:value={task.min_idle_minutes} />
-                  <span class="unit">minutes</span>
+                  {@render ageControl(task.min_idle, (v) => (task.min_idle = v), 'Merged worktree idle time')}
                 </span>
               </div>
               <div class="field">
                 <span>Other worktrees, once idle for</span>
                 <span class="control">
-                  <input type="number" min="0" bind:value={task.stale_days} />
-                  <span class="unit">days</span>
+                  {@render ageControl(task.stale_after, (v) => (task.stale_after = v), 'Other worktree idle time')}
                 </span>
               </div>
             {:else if task.type === 'node_modules'}
               <div class="field">
                 <span>Projects untouched for</span>
                 <span class="control">
-                  <input type="number" min="0" bind:value={task.stale_days} />
-                  <span class="unit">days</span>
+                  {@render ageControl(task.stale_after, (v) => (task.stale_after = v), `${TASK_LABELS[task.type]} idle time`)}
                 </span>
               </div>
               <label class="field check">
@@ -424,7 +462,7 @@
                 </span>
               </label>
             {:else if task.type === 'cargo_clean'}
-              <!-- One row for one rule: unticking is mode = "all", which ignores the day count. -->
+              <!-- One row for one rule: unticking is mode = "all", which ignores the idle time. -->
               <div class="field">
                 <label class="check">
                   <input
@@ -435,14 +473,12 @@
                   Only projects untouched for
                 </label>
                 <span class="control">
-                  <input
-                    type="number"
-                    min="0"
-                    aria-label="Days untouched"
-                    disabled={task.mode === 'all'}
-                    bind:value={task.stale_days}
-                  />
-                  <span class="unit">days</span>
+                  {@render ageControl(
+                    task.stale_after,
+                    (v) => (task.stale_after = v),
+                    `${TASK_LABELS[task.type]} idle time`,
+                    task.mode === 'all',
+                  )}
                 </span>
               </div>
               {#if task.mode === 'all'}
@@ -452,16 +488,14 @@
               <div class="field">
                 <span>Projects untouched for</span>
                 <span class="control">
-                  <input type="number" min="0" bind:value={task.stale_days} />
-                  <span class="unit">days</span>
+                  {@render ageControl(task.stale_after, (v) => (task.stale_after = v), `${TASK_LABELS[task.type]} idle time`)}
                 </span>
               </div>
             {:else if task.type === 'build_output'}
               <div class="field">
                 <span>Projects untouched for</span>
                 <span class="control">
-                  <input type="number" min="0" bind:value={task.stale_days} />
-                  <span class="unit">days</span>
+                  {@render ageControl(task.stale_after, (v) => (task.stale_after = v), `${TASK_LABELS[task.type]} idle time`)}
                 </span>
               </div>
               <div class="field">
