@@ -347,6 +347,19 @@ mod tests {
         assert_eq!(dist.reason, "ignored by git, untouched for 60 days");
     }
 
+    #[test]
+    fn a_wait_in_hours_is_reported_in_hours() {
+        let fx = Fixture::new(&[]);
+        repo(&fx, "p");
+        fx.file("p/dist/app.js", 10);
+        fx.age_by("p", std::time::Duration::from_secs(5 * 3_600 + 60));
+        let t = |age| BuildOutput::new(GitCmd::default(), vec!["dist".into()], age);
+        let found = t(Age::hours(4)).scan(&fx.ctx()).unwrap();
+        assert_eq!(names(&found, &fx.root), vec!["p/dist"]);
+        assert_eq!(found[0].reason, "ignored by git, untouched for 5 hours");
+        assert!(t(Age::hours(6)).scan(&fx.ctx()).unwrap().is_empty());
+    }
+
     /// Records this thread's log lines, so tests running at the same time
     /// cannot add to them. Only this module's test installs a logger.
     struct ThreadLog;

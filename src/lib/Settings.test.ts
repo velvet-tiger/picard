@@ -352,7 +352,7 @@ describe('Settings', () => {
     })
     await renderLoaded()
     const box = screen.getByRole('checkbox', { name: 'Only projects untouched for' })
-    const days = screen.getByRole('spinbutton', { name: 'Cargo target folders idle time' })
+    const days = screen.getByRole('textbox', { name: 'Cargo target folders idle time' })
     const unit = screen.getByRole('combobox', { name: 'Cargo target folders idle time unit' })
     expect(box).toBeChecked()
     expect(days).toBeEnabled()
@@ -382,9 +382,9 @@ describe('Settings', () => {
   it('saves an idle time in the unit picked for it', async () => {
     const { sent } = backend()
     await renderLoaded()
-    const value = screen.getByRole('spinbutton', { name: 'node_modules idle time' })
+    const value = screen.getByRole('textbox', { name: 'node_modules idle time' })
     const unit = screen.getByRole('combobox', { name: 'node_modules idle time unit' })
-    expect(value).toHaveValue(30)
+    expect(value).toHaveValue('30')
     expect(unit).toHaveValue('d')
 
     await fireEvent.change(unit, { target: { value: 'h' } })
@@ -404,6 +404,28 @@ describe('Settings', () => {
     )
   })
 
+  it('blocks Save while an idle time is not a whole number', async () => {
+    backend()
+    await renderLoaded()
+    const value = screen.getByRole('textbox', { name: 'node_modules idle time' })
+    const unit = screen.getByRole('combobox', { name: 'node_modules idle time unit' })
+
+    await fireEvent.input(value, { target: { value: '' } })
+    await fireEvent.change(unit, { target: { value: 'm' } })
+
+    expect(value).toHaveValue('')
+    expect(value).toHaveAttribute('aria-invalid', 'true')
+    expect(saveButton()).toBeDisabled()
+    expect(screen.getByText('Each idle time must be a whole number.')).toBeInTheDocument()
+
+    await fireEvent.input(value, { target: { value: '1.5' } })
+    expect(saveButton()).toBeDisabled()
+
+    await fireEvent.input(value, { target: { value: '45' } })
+    expect(value).toHaveAttribute('aria-invalid', 'false')
+    expect(saveButton()).toBeEnabled()
+  })
+
   it('shows both worktree waits with their own units', async () => {
     backend({
       get_settings: () => ({
@@ -412,9 +434,9 @@ describe('Settings', () => {
       }),
     })
     await renderLoaded()
-    expect(screen.getByRole('spinbutton', { name: 'Merged worktree idle time' })).toHaveValue(30)
+    expect(screen.getByRole('textbox', { name: 'Merged worktree idle time' })).toHaveValue('30')
     expect(screen.getByRole('combobox', { name: 'Merged worktree idle time unit' })).toHaveValue('m')
-    expect(screen.getByRole('spinbutton', { name: 'Other worktree idle time' })).toHaveValue(12)
+    expect(screen.getByRole('textbox', { name: 'Other worktree idle time' })).toHaveValue('12')
     expect(screen.getByRole('combobox', { name: 'Other worktree idle time unit' })).toHaveValue('h')
   })
 

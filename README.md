@@ -214,7 +214,7 @@ enabled = false
 
 Every task also accepts `enabled = false`.
 
-`stale_after` and `min_idle` take an age: a whole number followed by `m` for minutes, `h` for hours or `d` for days. Settings shows a unit menu for each one. Older configs that use `stale_days` (a number of days) or `min_idle_minutes` (a number of minutes) still work. Saving from Settings rewrites them in the new form.
+`stale_after` and `min_idle` take an age: a whole number followed by `m` for minutes, `h` for hours or `d` for days. Settings shows a unit menu for each one. Older configs that use `stale_days` (a number of days) or `min_idle_minutes` (a number of minutes) still work. A bare number with no unit is still read the old way: days for `stale_after`, minutes for `min_idle`. Saving from Settings rewrites them in the new form.
 
 `dirs` entries must be plain folder names. Picard refuses paths, `.git`, and names with glob characters such as `*`. A `dirs` list you set replaces the defaults, so a later release that adds a default name does not reach it. Add new names yourself. Other build folders work the same way. For example, add `Pods` for CocoaPods projects.
 

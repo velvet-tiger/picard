@@ -1546,6 +1546,28 @@ mod tests {
     }
 
     #[test]
+    fn every_task_reads_the_old_day_key() {
+        let cases = [
+            ("type = \"git_worktrees\"", "git_worktrees"),
+            ("type = \"node_modules\"", "node_modules"),
+            ("type = \"cargo_clean\"", "cargo_clean"),
+            ("type = \"python_venv\"", "python_venv"),
+            ("type = \"build_output\"", "build_output"),
+        ];
+        for (head, name) in cases {
+            let age = match first_task(&format!("{head}\nstale_days = 4")) {
+                TaskConfig::GitWorktrees { stale_after, .. }
+                | TaskConfig::NodeModules { stale_after, .. }
+                | TaskConfig::CargoClean { stale_after, .. }
+                | TaskConfig::PythonVenv { stale_after, .. }
+                | TaskConfig::BuildOutput { stale_after, .. } => stale_after,
+                other => panic!("{name}: unexpected task {other:?}"),
+            };
+            assert_eq!(age, Age::days(4), "{name}");
+        }
+    }
+
+    #[test]
     fn rejects_malformed_ages() {
         for bad in [
             "\"\"",

@@ -18,7 +18,9 @@
     TASK_LABELS,
     AGE_UNITS,
     isAgeUnit,
+    isValidAge,
     joinAge,
+    taskAges,
     splitAge,
     type AgeText,
     type AgeUnit,
@@ -41,6 +43,10 @@
   // WebKit sets a cleared or half-typed time field to ''. Saving that would only
   // fail with a parse error, so Save waits until a time is picked.
   const dailyTimeMissing = $derived(settings?.daily_scan === '')
+  // The backend would refuse these too, but its message cannot say which field.
+  const badAge = $derived(
+    settings?.tasks.some((t) => taskAges(t).some((a) => !isValidAge(a))) ?? false,
+  )
   // Edited one entry at a time and saved at once, not with Save: the Clean tab
   // changes this list too, and Save must not write back an older copy.
   let ignoredFolders = $state<string[]>([])
@@ -232,11 +238,14 @@
   disabled: boolean = false,
 )}
   {@const age = splitAge(text)}
+  <!-- Text, not number: a number field reports "" for "1." or "1e" while the
+       user is still typing, and writing that back would clear the field. -->
   <input
-    type="number"
-    min="0"
-    step="1"
+    type="text"
+    inputmode="numeric"
+    class="age"
     aria-label={label}
+    aria-invalid={!isValidAge(text)}
     {disabled}
     value={age.digits}
     oninput={(e) => update(joinAge(e.currentTarget.value, age.unit))}
@@ -601,10 +610,11 @@
         <button onclick={() => close(true)}>Discard and close</button>
       {:else}
         {#if saveError}<span class="error">{saveError}</span>{/if}
+        {#if badAge}<span class="error">Each idle time must be a whole number.</span>{/if}
         {#if saved && !dirty}<span class="ok">Saved. Picard has reloaded the settings.</span>{/if}
         <span class="spacer"></span>
         <button onclick={() => close()}>Close</button>
-        <button class="primary" onclick={save} disabled={saving || dailyTimeMissing}
+        <button class="primary" onclick={save} disabled={saving || dailyTimeMissing || badAge}
           >{saving ? 'Saving…' : 'Save'}</button
         >
       {/if}
@@ -640,6 +650,12 @@
   .unit {
     color: var(--muted);
     min-width: 52px;
+  }
+  .age {
+    width: 80px;
+  }
+  .age[aria-invalid='true'] {
+    border-color: var(--danger);
   }
   .check {
     cursor: pointer;

@@ -7,6 +7,7 @@ import {
   getAppearance,
   getNotActivity,
   getProtection,
+  isValidAge,
   itemTitle,
   joinAge,
   newTask,
@@ -17,6 +18,7 @@ import {
   setIgnored,
   shortPath,
   splitAge,
+  taskAges,
   tildePath,
   withEveryBuiltIn,
   type IgnoreChange,
@@ -263,6 +265,17 @@ describe('ages', () => {
     expect(splitAge('6h')).toEqual({ digits: '6', unit: 'h' })
     expect(splitAge('14d')).toEqual({ digits: '14', unit: 'd' })
     expect(splitAge('d')).toEqual({ digits: '', unit: 'd' })
+  })
+
+  it('accepts only a whole number and a unit', () => {
+    for (const ok of ['0m', '6h', '14d']) expect(isValidAge(ok)).toBe(true)
+    for (const bad of ['d', '1.5h', '-1d', '1e3d', '6', '6s', ' 6h']) expect(isValidAge(bad)).toBe(false)
+  })
+
+  it('lists the ages each task holds', () => {
+    expect(taskAges(newTask('git_worktrees'))).toEqual(['14d', '30m'])
+    expect(taskAges(newTask('cargo_clean'))).toEqual(['14d'])
+    expect(taskAges(newTask('command'))).toEqual([])
   })
 
   it('joins a number and a unit back into an age', () => {

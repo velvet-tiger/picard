@@ -38,6 +38,11 @@ export function splitAge(text: AgeText): { digits: string; unit: AgeUnit } {
     : { digits: text, unit: 'd' }
 }
 
+/** True when `text` is an age the backend accepts: a whole number and a unit letter. */
+export function isValidAge(text: AgeText): boolean {
+  return /^\d+[mhd]$/.test(text)
+}
+
 /** Joins a number, as typed, and a unit into an age. */
 export function joinAge(digits: string, unit: AgeUnit): AgeText {
   return `${digits.trim()}${unit}`
@@ -471,4 +476,20 @@ export function formatBytes(bytes: number): string {
   if (bytes >= 10 * GB) return `${Math.round(bytes / GB)} GB`
   if (bytes >= GB) return `${(bytes / GB).toFixed(1)} GB`
   return `${Math.round(bytes / 1e6)} MB`
+}
+
+/** Every age a task holds, so the window can check them before saving. */
+export function taskAges(task: Task): AgeText[] {
+  switch (task.type) {
+    case 'git_worktrees':
+      return [task.stale_after, task.min_idle]
+    case 'node_modules':
+    case 'cargo_clean':
+    case 'python_venv':
+    case 'build_output':
+      return [task.stale_after]
+    case 'tool_caches':
+    case 'command':
+      return []
+  }
 }
