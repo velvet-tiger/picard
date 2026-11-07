@@ -17,6 +17,7 @@
     withEveryBuiltIn,
     TASK_LABELS,
     AGE_UNITS,
+    ageMinutes,
     isAgeUnit,
     isValidAge,
     joinAge,
@@ -29,6 +30,13 @@
   } from './api'
 
   const AGE_UNIT_NAMES: Record<AgeUnit, string> = { m: 'minutes', h: 'hours', d: 'days' }
+  // Below these, a wait is short enough to catch a project still in use.
+  // Merged worktrees default to 30 minutes and have an in-use check, so their
+  // bar is lower.
+  const SHORT_WAIT_MINUTES = 60
+  const SHORT_MERGED_WAIT_MINUTES = 5
+  const PROJECT_WARNING =
+    'Under an hour. Picard judges this by file changes only, so it may remove this folder from a project that is still running.'
 
   let settings = $state<Settings | null>(null)
   let launchAtLogin = $state(false)
@@ -265,6 +273,14 @@
   </select>
 {/snippet}
 
+<!-- Shown under an idle time that is valid but shorter than `minutes`. -->
+{#snippet shortWait(text: AgeText, minutes: number, message: string)}
+  {@const length = ageMinutes(text)}
+  {#if length !== null && length < minutes}
+    <p class="warning">{message}</p>
+  {/if}
+{/snippet}
+
 <main>
   <h1>Settings</h1>
   <p class="muted">Saved to config.toml. Comments and sections not shown here are kept.</p>
@@ -451,12 +467,22 @@
                   {@render ageControl(task.min_idle, (v) => (task.min_idle = v), 'Merged worktree idle time')}
                 </span>
               </div>
+              {@render shortWait(
+                task.min_idle,
+                SHORT_MERGED_WAIT_MINUTES,
+                'Under 5 minutes. A merged worktree may go before you have finished with it.',
+              )}
               <div class="field">
                 <span>Other worktrees, once idle for</span>
                 <span class="control">
                   {@render ageControl(task.stale_after, (v) => (task.stale_after = v), 'Other worktree idle time')}
                 </span>
               </div>
+              {@render shortWait(
+                task.stale_after,
+                SHORT_WAIT_MINUTES,
+                'Under an hour. Pushed and partly deleted worktrees will go this soon too.',
+              )}
             {:else if task.type === 'node_modules'}
               <div class="field">
                 <span>Projects untouched for</span>
@@ -464,6 +490,7 @@
                   {@render ageControl(task.stale_after, (v) => (task.stale_after = v), `${TASK_LABELS[task.type]} idle time`)}
                 </span>
               </div>
+              {@render shortWait(task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
               <label class="field check">
                 <span>Also prune npm and pnpm caches</span>
                 <span class="control">
@@ -492,6 +519,8 @@
               </div>
               {#if task.mode === 'all'}
                 <p class="muted">Cleans every project, including ones you are working on.</p>
+              {:else}
+                {@render shortWait(task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
               {/if}
             {:else if task.type === 'python_venv'}
               <div class="field">
@@ -500,6 +529,7 @@
                   {@render ageControl(task.stale_after, (v) => (task.stale_after = v), `${TASK_LABELS[task.type]} idle time`)}
                 </span>
               </div>
+              {@render shortWait(task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
             {:else if task.type === 'build_output'}
               <div class="field">
                 <span>Projects untouched for</span>
@@ -507,6 +537,7 @@
                   {@render ageControl(task.stale_after, (v) => (task.stale_after = v), `${TASK_LABELS[task.type]} idle time`)}
                 </span>
               </div>
+              {@render shortWait(task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
               <div class="field">
                 <span>Folder names</span>
                 <input

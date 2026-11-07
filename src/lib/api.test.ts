@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  ageMinutes,
   applyAppearance,
   BUILT_IN_TASKS,
   errorText,
@@ -270,6 +271,13 @@ describe('ages', () => {
   it('accepts only a whole number and a unit', () => {
     for (const ok of ['0m', '6h', '14d', '9999999999999999999d']) expect(isValidAge(ok)).toBe(true)
     for (const bad of ['d', '1.5h', '-1d', '1e3d', '6', '6s', ' 6h', '99999999999999999999d']) expect(isValidAge(bad)).toBe(false)
+  })
+
+  it('gives the length of a valid age in minutes', () => {
+    expect(ageMinutes('45m')).toBe(45)
+    expect(ageMinutes('2h')).toBe(120)
+    expect(ageMinutes('1d')).toBe(1440)
+    expect(ageMinutes('1.5h')).toBeNull()
   })
 
   it('lists the ages each task holds', () => {

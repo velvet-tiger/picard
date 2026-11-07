@@ -46,6 +46,15 @@ export function isValidAge(text: AgeText): boolean {
   return /^\d{1,19}[mhd]$/.test(text)
 }
 
+const MINUTES_PER_UNIT: Record<AgeUnit, number> = { m: 1, h: 60, d: 1440 }
+
+/** The length of a valid age in minutes, or null while it is not valid. */
+export function ageMinutes(text: AgeText): number | null {
+  if (!isValidAge(text)) return null
+  const { digits, unit } = splitAge(text)
+  return Number(digits) * MINUTES_PER_UNIT[unit]
+}
+
 /** Joins a number, as typed, and a unit into an age. */
 export function joinAge(digits: string, unit: AgeUnit): AgeText {
   return `${digits.trim()}${unit}`

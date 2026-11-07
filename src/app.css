@@ -7,6 +7,7 @@
   --line: #d2d2d7;
   --accent: #0a66d8;
   --danger: #c62828;
+  --warn: #9a5800;
   --ok: #2e7d32;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
   font-size: 13px;
@@ -29,6 +30,7 @@
   --line: #3a3a3c;
   --accent: #4c9bff;
   --danger: #ff6b6b;
+  --warn: #ffb74d;
   --ok: #66bb6a;
 }
 
@@ -41,6 +43,7 @@
     --line: #3a3a3c;
     --accent: #4c9bff;
     --danger: #ff6b6b;
+  --warn: #ffb74d;
     --ok: #66bb6a;
   }
 }
@@ -91,6 +94,10 @@ h2 {
 
 .error {
   color: var(--danger);
+}
+
+.warning {
+  color: var(--warn);
 }
 
 .ok {

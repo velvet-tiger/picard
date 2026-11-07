@@ -426,6 +426,38 @@ describe('Settings', () => {
     expect(saveButton()).toBeEnabled()
   })
 
+  it('warns when a project idle time is under an hour', async () => {
+    backend()
+    await renderLoaded()
+    const warning = /^Under an hour\. Picard judges this by file changes only/
+    const value = screen.getByRole('textbox', { name: 'node_modules idle time' })
+    const unit = screen.getByRole('combobox', { name: 'node_modules idle time unit' })
+    expect(screen.queryByText(warning)).toBeNull()
+
+    await fireEvent.change(unit, { target: { value: 'm' } })
+    expect(screen.getByText(warning)).toBeInTheDocument()
+
+    await fireEvent.input(value, { target: { value: '60' } })
+    expect(screen.queryByText(warning)).toBeNull()
+  })
+
+  it('warns about merged worktrees only under 5 minutes', async () => {
+    backend({
+      get_settings: () => ({
+        ...config(),
+        tasks: [{ type: 'git_worktrees', enabled: true, stale_after: '14d', min_idle: '30m' }],
+      }),
+    })
+    await renderLoaded()
+    const warning = /^Under 5 minutes\./
+    expect(screen.queryByText(warning)).toBeNull()
+
+    const merged = screen.getByRole('textbox', { name: 'Merged worktree idle time' })
+    await fireEvent.input(merged, { target: { value: '4' } })
+    expect(screen.getByText(warning)).toBeInTheDocument()
+    expect(saveButton()).toBeEnabled()
+  })
+
   it('shows both worktree waits with their own units', async () => {
     backend({
       get_settings: () => ({
