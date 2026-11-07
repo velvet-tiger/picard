@@ -244,6 +244,7 @@
   update: (next: AgeText) => void,
   label: string,
   disabled: boolean = false,
+  describedBy: string | undefined = undefined,
 )}
   {@const age = splitAge(text)}
   <!-- Text, not number: a number field reports "" for "1." or "1e" while the
@@ -254,6 +255,7 @@
     class="age"
     aria-label={label}
     aria-invalid={!isValidAge(text)}
+    aria-describedby={describedBy}
     {disabled}
     value={age.digits}
     oninput={(e) => update(joinAge(e.currentTarget.value, age.unit))}
@@ -273,11 +275,12 @@
   </select>
 {/snippet}
 
-<!-- Shown under an idle time that is valid but shorter than `minutes`. -->
-{#snippet shortWait(text: AgeText, minutes: number, message: string)}
+<!-- Shown under an idle time that is valid but shorter than `minutes`. The field
+     names `id` in aria-describedby, so a screen reader reads it with the field. -->
+{#snippet shortWait(id: string, text: AgeText, minutes: number, message: string)}
   {@const length = ageMinutes(text)}
   {#if length !== null && length < minutes}
-    <p class="warning">{message}</p>
+    <p class="warning" {id}>{message}</p>
   {/if}
 {/snippet}
 
@@ -464,10 +467,17 @@
               <div class="field">
                 <span>Merged worktrees, once idle for</span>
                 <span class="control">
-                  {@render ageControl(task.min_idle, (v) => (task.min_idle = v), 'Merged worktree idle time')}
+                  {@render ageControl(
+                    task.min_idle,
+                    (v) => (task.min_idle = v),
+                    'Merged worktree idle time',
+                    false,
+                    `short-wait-${i}-merged`,
+                  )}
                 </span>
               </div>
               {@render shortWait(
+                `short-wait-${i}-merged`,
                 task.min_idle,
                 SHORT_MERGED_WAIT_MINUTES,
                 'Under 5 minutes. A merged worktree may go before you have finished with it.',
@@ -475,22 +485,35 @@
               <div class="field">
                 <span>Other worktrees, once idle for</span>
                 <span class="control">
-                  {@render ageControl(task.stale_after, (v) => (task.stale_after = v), 'Other worktree idle time')}
+                  {@render ageControl(
+                    task.stale_after,
+                    (v) => (task.stale_after = v),
+                    'Other worktree idle time',
+                    false,
+                    `short-wait-${i}`,
+                  )}
                 </span>
               </div>
               {@render shortWait(
+                `short-wait-${i}`,
                 task.stale_after,
                 SHORT_WAIT_MINUTES,
-                'Under an hour. Pushed and partly deleted worktrees will go this soon too.',
+                'Under an hour. Pushed, partly deleted and other waiting worktrees will be removed this soon.',
               )}
             {:else if task.type === 'node_modules'}
               <div class="field">
                 <span>Projects untouched for</span>
                 <span class="control">
-                  {@render ageControl(task.stale_after, (v) => (task.stale_after = v), `${TASK_LABELS[task.type]} idle time`)}
+                  {@render ageControl(
+                    task.stale_after,
+                    (v) => (task.stale_after = v),
+                    `${TASK_LABELS[task.type]} idle time`,
+                    false,
+                    `short-wait-${i}`,
+                  )}
                 </span>
               </div>
-              {@render shortWait(task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
+              {@render shortWait(`short-wait-${i}`, task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
               <label class="field check">
                 <span>Also prune npm and pnpm caches</span>
                 <span class="control">
@@ -514,30 +537,43 @@
                     (v) => (task.stale_after = v),
                     `${TASK_LABELS[task.type]} idle time`,
                     task.mode === 'all',
+                    `short-wait-${i}`,
                   )}
                 </span>
               </div>
               {#if task.mode === 'all'}
                 <p class="muted">Cleans every project, including ones you are working on.</p>
               {:else}
-                {@render shortWait(task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
+                {@render shortWait(`short-wait-${i}`, task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
               {/if}
             {:else if task.type === 'python_venv'}
               <div class="field">
                 <span>Projects untouched for</span>
                 <span class="control">
-                  {@render ageControl(task.stale_after, (v) => (task.stale_after = v), `${TASK_LABELS[task.type]} idle time`)}
+                  {@render ageControl(
+                    task.stale_after,
+                    (v) => (task.stale_after = v),
+                    `${TASK_LABELS[task.type]} idle time`,
+                    false,
+                    `short-wait-${i}`,
+                  )}
                 </span>
               </div>
-              {@render shortWait(task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
+              {@render shortWait(`short-wait-${i}`, task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
             {:else if task.type === 'build_output'}
               <div class="field">
                 <span>Projects untouched for</span>
                 <span class="control">
-                  {@render ageControl(task.stale_after, (v) => (task.stale_after = v), `${TASK_LABELS[task.type]} idle time`)}
+                  {@render ageControl(
+                    task.stale_after,
+                    (v) => (task.stale_after = v),
+                    `${TASK_LABELS[task.type]} idle time`,
+                    false,
+                    `short-wait-${i}`,
+                  )}
                 </span>
               </div>
-              {@render shortWait(task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
+              {@render shortWait(`short-wait-${i}`, task.stale_after, SHORT_WAIT_MINUTES, PROJECT_WARNING)}
               <div class="field">
                 <span>Folder names</span>
                 <input

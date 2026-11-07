@@ -435,9 +435,37 @@ describe('Settings', () => {
     expect(screen.queryByText(warning)).toBeNull()
 
     await fireEvent.change(unit, { target: { value: 'm' } })
-    expect(screen.getByText(warning)).toBeInTheDocument()
+    const shown = screen.getByText(warning)
+    expect(value.getAttribute('aria-describedby')).toBe(shown.id)
 
     await fireEvent.input(value, { target: { value: '60' } })
+    expect(screen.queryByText(warning)).toBeNull()
+  })
+
+  it('warns about other worktrees under an hour', async () => {
+    backend({
+      get_settings: () => ({
+        ...config(),
+        tasks: [{ type: 'git_worktrees', enabled: true, stale_after: '30m', min_idle: '30m' }],
+      }),
+    })
+    await renderLoaded()
+    expect(screen.getByText(/^Under an hour\. Pushed, partly deleted/)).toBeInTheDocument()
+  })
+
+  it('drops the Cargo warning once every project is cleaned', async () => {
+    backend({
+      get_settings: () => ({
+        ...config(),
+        tasks: [{ type: 'cargo_clean', enabled: true, mode: 'stale', stale_after: '5m' }],
+      }),
+    })
+    await renderLoaded()
+    const warning = /^Under an hour\. Picard judges this by file changes only/
+    expect(screen.getByText(warning)).toBeInTheDocument()
+
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Only projects untouched for' }))
+
     expect(screen.queryByText(warning)).toBeNull()
   })
 
