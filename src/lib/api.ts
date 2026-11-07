@@ -38,9 +38,12 @@ export function splitAge(text: AgeText): { digits: string; unit: AgeUnit } {
     : { digits: text, unit: 'd' }
 }
 
-/** True when `text` is an age the backend accepts: a whole number and a unit letter. */
+/**
+ * True when `text` is an age the backend accepts: a whole number and a unit
+ * letter. At most 19 digits, so the number always fits the backend's u64.
+ */
 export function isValidAge(text: AgeText): boolean {
-  return /^\d+[mhd]$/.test(text)
+  return /^\d{1,19}[mhd]$/.test(text)
 }
 
 /** Joins a number, as typed, and a unit into an age. */

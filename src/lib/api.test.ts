@@ -268,8 +268,8 @@ describe('ages', () => {
   })
 
   it('accepts only a whole number and a unit', () => {
-    for (const ok of ['0m', '6h', '14d']) expect(isValidAge(ok)).toBe(true)
-    for (const bad of ['d', '1.5h', '-1d', '1e3d', '6', '6s', ' 6h']) expect(isValidAge(bad)).toBe(false)
+    for (const ok of ['0m', '6h', '14d', '9999999999999999999d']) expect(isValidAge(ok)).toBe(true)
+    for (const bad of ['d', '1.5h', '-1d', '1e3d', '6', '6s', ' 6h', '99999999999999999999d']) expect(isValidAge(bad)).toBe(false)
   })
 
   it('lists the ages each task holds', () => {
