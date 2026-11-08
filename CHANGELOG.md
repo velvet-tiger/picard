@@ -6,6 +6,8 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-08
+
 ### Changed
 
 - The idle time of each cleanup task can now be set in minutes, hours or days. Settings shows a unit menu next to each one. In `config.toml` the keys are `stale_after` and `min_idle`, written as an age such as `"30m"`, `"6h"` or `"14d"`. The old `stale_days` and `min_idle_minutes` keys still work with their old units. Saving from Settings rewrites them in the new form.
@@ -231,6 +233,7 @@ and removes build output and finished work when a drive runs low.
 - Disk image volume test (a918137).
 - Vitest tests for `api.ts`, Preview and Settings (5eeb28a).
 
+[1.0.0]: https://github.com/velvet-tiger/picard/releases/tag/v1.0.0
 [0.10.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.10.0
 [0.9.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.9.0
 [0.8.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.8.0
