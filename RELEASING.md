@@ -8,8 +8,9 @@ the GitHub release that `.github/workflows/release.yml` builds from that tag.
 1. Find the last tag: `git describe --tags --abbrev=0 --match 'v*'`. A release
    is due only if `git diff --name-only <tag>..origin/main` lists a path under
    `src/` or `src-tauri/`.
-2. Pick the version. Any `feat` or breaking commit since the tag bumps the
-   minor version (pre-1.0, so never the major). Anything else bumps the patch.
+2. Pick the version. Any breaking commit since the tag bumps the major
+   version. Otherwise any `feat` commit bumps the minor version. Anything
+   else bumps the patch.
 3. Update `CHANGELOG.md`. Keep the existing `[Unreleased]` entries, add
    entries for functional commits that have none, then rename the content to
    `## [X.Y.Z] - YYYY-MM-DD` (today in Australia/Sydney) under an empty
