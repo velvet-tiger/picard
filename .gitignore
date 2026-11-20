@@ -33,8 +33,7 @@ dist-ssr
 /.codex/
 /.cursor/
 /.mcp.json
-/.opencode/
 /AGENTS.md
+/CLAUDE.local.md
 /CLAUDE.md
-/opencode.json
 # END Automatic-managed
