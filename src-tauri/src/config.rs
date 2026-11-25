@@ -882,6 +882,10 @@ fn parse_uuid(raw: &str) -> Result<String> {
 }
 
 /// Expands a leading `~` and requires the result to be absolute.
+///
+/// Refuses any `..` component. Roots and mounts decide where Picard deletes,
+/// and the ignore list is matched by path prefix, so a path must mean what it
+/// says when read: `~/../..` must not quietly become `/` (VEL-453).
 pub fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
     let path = if raw == "~" {
         home.to_path_buf()
@@ -892,6 +896,12 @@ pub fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
     };
     if !path.is_absolute() {
         bail!("path must be absolute or start with ~/");
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("path must not contain `..`");
     }
     Ok(path)
 }
@@ -1185,6 +1195,35 @@ mod tests {
                 PathBuf::from("/Volumes/X")
             ]
         );
+    }
+
+    #[test]
+    fn expand_path_refuses_parent_components() {
+        for raw in ["~/..", "~/../..", "~/code/../../etc", "/a/../b", "/.."] {
+            let err = expand_path(raw, &home()).expect_err(raw);
+            assert!(format!("{err}").contains(".."), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn expand_path_keeps_names_that_only_contain_dots() {
+        for (raw, want) in [
+            ("~/a..b", "/Users/test/a..b"),
+            ("/a/...", "/a/..."),
+            ("~/.config", "/Users/test/.config"),
+            ("/a/./b", "/a/b"),
+        ] {
+            assert_eq!(expand_path(raw, &home()).unwrap(), PathBuf::from(want));
+        }
+    }
+
+    #[test]
+    fn config_with_parent_component_fails_to_load() {
+        let msg = parse_err("min_free_gb = 1\nroots = [\"~/../..\"]");
+        assert!(msg.contains("roots entry"), "{msg}");
+        assert!(msg.contains(".."), "{msg}");
+        let msg = parse_err("min_free_gb = 1\nroots = [\"/a\"]\nignore = [\"/a/../b\"]");
+        assert!(msg.contains("ignore entry"), "{msg}");
     }
 
     #[test]
