@@ -288,6 +288,11 @@ impl CachePrune {
         }
     }
 
+    /// Security (VEL-454): no outside input reaches these commands. Every
+    /// argument list is a constant set by a `PruneStep` constructor. `program`
+    /// comes from `ToolEnv::resolve`: a `[tools]` override, which must be
+    /// absolute and sits in a config `config::load` refuses unless only this
+    /// user can change it, or an executable on the login shell's PATH.
     fn command(&self, program: &Path) -> Command {
         let mut cmd = Command::new(program);
         // Run from the home folder. Not a root: npm and pnpm read `.npmrc` from

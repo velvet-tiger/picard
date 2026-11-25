@@ -110,6 +110,10 @@ fn shell_from_env(value: Option<OsString>) -> PathBuf {
 
 /// Runs `shell -lc 'printf %s "$PATH"'`. A login shell reads the user's profile
 /// files, exactly as opening a Terminal window would.
+///
+/// Security (VEL-454): no outside input reaches this command. `shell` has
+/// passed `shell_from_env`, so it is an absolute path to an existing file, and
+/// the script is a fixed string. Only the user's own environment sets `$SHELL`.
 fn login_shell_path(shell: &Path) -> Result<String> {
     let mut cmd = Command::new(shell);
     cmd.args(["-lc", "printf %s \"$PATH\""]);
