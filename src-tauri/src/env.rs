@@ -26,6 +26,9 @@ const STANDARD_DIRS: &[&str] = &[
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",
     "/usr/local/bin",
+    // The official Go installer puts `go` here and only adds it to PATH
+    // through /etc/paths.d, which a login shell reads but a GUI app does not.
+    "/usr/local/go/bin",
     "/usr/bin",
     "/bin",
     "/usr/sbin",
@@ -185,6 +188,7 @@ mod tests {
         let dirs = build_dirs(None, Path::new("/Users/me"));
         assert_eq!(dirs[0], PathBuf::from("/Users/me/.cargo/bin"));
         assert!(dirs.contains(&PathBuf::from("/usr/bin")));
+        assert!(dirs.contains(&PathBuf::from("/usr/local/go/bin")));
     }
 
     #[test]

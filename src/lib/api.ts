@@ -78,6 +78,8 @@ export type Task =
       homebrew: boolean
       simulators: boolean
       bun: boolean
+      go_build: boolean
+      go_modules: boolean
     }
   | { type: 'command'; enabled: boolean; name: string; run: string; timeout_secs: number }
 
@@ -297,7 +299,16 @@ export function newTask(type: TaskType): Task {
         dirs: ['dist', 'build', '.next', 'vendor', '.terraform', 'target'],
       }
     case 'tool_caches':
-      return { type, enabled: true, uv: true, homebrew: true, simulators: true, bun: true }
+      return {
+        type,
+        enabled: true,
+        uv: true,
+        homebrew: true,
+        simulators: true,
+        bun: true,
+        go_build: true,
+        go_modules: true,
+      }
     case 'command':
       return { type, enabled: false, name: 'My cleanup', run: '', timeout_secs: 600 }
   }

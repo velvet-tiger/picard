@@ -401,8 +401,18 @@ pub fn from_config(
                 homebrew,
                 simulators,
                 bun,
+                go_build,
+                go_modules,
             } => {
-                let steps = tool_cache_steps(env, overrides, *uv, *homebrew, *simulators, *bun);
+                let switches = ToolCacheSwitches {
+                    uv: *uv,
+                    homebrew: *homebrew,
+                    simulators: *simulators,
+                    bun: *bun,
+                    go_build: *go_build,
+                    go_modules: *go_modules,
+                };
+                let steps = tool_cache_steps(env, overrides, &switches);
                 if steps.is_empty() {
                     log::warn!("tool_caches skipped: none of its tools were found or turned on");
                 } else {
@@ -465,24 +475,34 @@ pub fn from_config(
     out
 }
 
+/// Which `tool_caches` steps are switched on, as read from the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolCacheSwitches {
+    uv: bool,
+    homebrew: bool,
+    simulators: bool,
+    bun: bool,
+    go_build: bool,
+    go_modules: bool,
+}
+
 /// Prune steps for the tools that are turned on and installed. A missing tool
 /// is logged and left out, so one absent tool does not stop the others.
 fn tool_cache_steps(
     env: &ToolEnv,
     overrides: &ToolOverrides,
-    uv: bool,
-    homebrew: bool,
-    simulators: bool,
-    bun: bool,
+    on: &ToolCacheSwitches,
 ) -> Vec<cache_prune::PruneStep> {
     use cache_prune::PruneStep;
     /// Builds a step from the tool's path and the home folder.
     type MakeStep = fn(PathBuf, &Path) -> PruneStep;
-    let wanted: [(bool, &str, MakeStep); 4] = [
-        (uv, "uv", |p, _| PruneStep::uv(p)),
-        (homebrew, "brew", |p, _| PruneStep::homebrew(p)),
-        (simulators, "xcrun", PruneStep::simulators),
-        (bun, "bun", |p, _| PruneStep::bun(p)),
+    let wanted: [(bool, &str, MakeStep); 6] = [
+        (on.uv, "uv", |p, _| PruneStep::uv(p)),
+        (on.homebrew, "brew", |p, _| PruneStep::homebrew(p)),
+        (on.simulators, "xcrun", PruneStep::simulators),
+        (on.bun, "bun", |p, _| PruneStep::bun(p)),
+        (on.go_build, "go", |p, _| PruneStep::go_build(p)),
+        (on.go_modules, "go", |p, _| PruneStep::go_modules(p)),
     ];
     let mut steps = Vec::new();
     for (on, tool, step) in wanted {
@@ -967,7 +987,7 @@ mod tests {
     fn tool_caches_keeps_only_tools_that_are_on_and_installed() {
         use std::os::unix::fs::PermissionsExt;
         let bin = tempfile::tempdir().unwrap();
-        for tool in ["uv", "brew"] {
+        for tool in ["uv", "brew", "go"] {
             let p = bin.path().join(tool);
             std::fs::write(&p, "#!/bin/sh\n").unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -977,14 +997,32 @@ mod tests {
         let labels = |steps: Vec<cache_prune::PruneStep>| -> Vec<String> {
             steps.into_iter().map(|s| s.label).collect()
         };
+        let all = ToolCacheSwitches {
+            uv: true,
+            homebrew: true,
+            simulators: true,
+            bun: true,
+            go_build: true,
+            go_modules: true,
+        };
         // bun and xcrun are not on this PATH.
         assert_eq!(
-            labels(tool_cache_steps(&env, &o, true, true, true, true)),
-            vec!["uv cache", "Homebrew cache"]
+            labels(tool_cache_steps(&env, &o, &all)),
+            vec![
+                "uv cache",
+                "Homebrew cache",
+                "Go build cache",
+                "Go module cache"
+            ]
         );
+        let some = ToolCacheSwitches {
+            uv: false,
+            go_modules: false,
+            ..all
+        };
         assert_eq!(
-            labels(tool_cache_steps(&env, &o, false, true, true, true)),
-            vec!["Homebrew cache"]
+            labels(tool_cache_steps(&env, &o, &some)),
+            vec!["Homebrew cache", "Go build cache"]
         );
         let none = vec![TaskConfig::ToolCaches {
             enabled: true,
@@ -992,6 +1030,8 @@ mod tests {
             homebrew: false,
             simulators: true,
             bun: true,
+            go_build: false,
+            go_modules: false,
         }];
         assert!(from_config(&none, &env, &o).is_empty());
     }

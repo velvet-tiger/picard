@@ -6,6 +6,10 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `tool_caches` can now prune Go's caches. `go_build` runs `go clean -cache`, and `go_modules` runs `go clean -modcache`. Both are on by default once you add the task. After a module prune, Go downloads modules again, so set `go_modules = false` if you build Go offline. `[tools]` accepts a `go` path, and Picard now also looks for tools in `/usr/local/go/bin`, where the official Go installer puts `go`.
+
 ## [1.0.0] - 2026-11-08
 
 ### Changed
