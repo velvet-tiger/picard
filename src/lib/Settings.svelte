@@ -611,6 +611,14 @@
                 <span>bun (bun pm cache rm)</span>
                 <span class="control"><input type="checkbox" bind:checked={task.bun} /></span>
               </label>
+              <label class="field check">
+                <span>Go build cache (go clean -cache)</span>
+                <span class="control"><input type="checkbox" bind:checked={task.go_build} /></span>
+              </label>
+              <label class="field check">
+                <span>Go module cache (go clean -modcache, downloads again)</span>
+                <span class="control"><input type="checkbox" bind:checked={task.go_modules} /></span>
+              </label>
             {:else if task.type === 'command'}
               <div class="field">
                 <span>Name</span>

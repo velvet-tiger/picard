@@ -234,6 +234,7 @@ pub struct ToolOverrides {
     pub brew: Option<PathBuf>,
     pub bun: Option<PathBuf>,
     pub xcrun: Option<PathBuf>,
+    pub go: Option<PathBuf>,
 }
 
 impl ToolOverrides {
@@ -246,6 +247,7 @@ impl ToolOverrides {
             "brew" => self.brew.as_deref(),
             "bun" => self.bun.as_deref(),
             "xcrun" => self.xcrun.as_deref(),
+            "go" => self.go.as_deref(),
             _ => None,
         }
     }
@@ -529,6 +531,13 @@ pub enum TaskConfig {
         simulators: bool,
         #[serde(default = "default_true")]
         bun: bool,
+        /// `go clean -cache`. Go rebuilds what it needs.
+        #[serde(default = "default_true")]
+        go_build: bool,
+        /// `go clean -modcache`. Go downloads modules again, so a build with
+        /// no network fails until it can reach the module proxy.
+        #[serde(default = "default_true")]
+        go_modules: bool,
     },
     Command {
         #[serde(default = "default_true")]
@@ -648,6 +657,7 @@ struct RawTools {
     brew: Option<String>,
     bun: Option<String>,
     xcrun: Option<String>,
+    go: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -835,6 +845,7 @@ fn parse_tools(raw: &RawTools, home: &Path) -> Result<ToolOverrides> {
         brew: one("brew", &raw.brew)?,
         bun: one("bun", &raw.bun)?,
         xcrun: one("xcrun", &raw.xcrun)?,
+        go: one("go", &raw.go)?,
     })
 }
 
@@ -1277,7 +1288,7 @@ mod tests {
         assert_eq!(c.tools.get("npm"), Some(Path::new("/Users/test/bin/npm")));
         assert_eq!(c.tools.get("pnpm"), None);
         let c = parse_ok(
-            "min_free_gb = 1\nroots = [\"/a\"]\n[tools]\nuv = \"~/.local/bin/uv\"\nbrew = \"/opt/homebrew/bin/brew\"\nbun = \"/b/bun\"\nxcrun = \"/usr/bin/xcrun\"\n",
+            "min_free_gb = 1\nroots = [\"/a\"]\n[tools]\nuv = \"~/.local/bin/uv\"\nbrew = \"/opt/homebrew/bin/brew\"\nbun = \"/b/bun\"\nxcrun = \"/usr/bin/xcrun\"\ngo = \"/usr/local/go/bin/go\"\n",
         );
         assert_eq!(
             c.tools.get("uv"),
@@ -1289,6 +1300,7 @@ mod tests {
         );
         assert_eq!(c.tools.get("bun"), Some(Path::new("/b/bun")));
         assert_eq!(c.tools.get("xcrun"), Some(Path::new("/usr/bin/xcrun")));
+        assert_eq!(c.tools.get("go"), Some(Path::new("/usr/local/go/bin/go")));
         assert!(
             parse_err("min_free_gb = 1\nroots = [\"/a\"]\n[tools]\ncargo = \"/x\"")
                 .contains("cargo")
@@ -1448,7 +1460,9 @@ mod tests {
                 uv: true,
                 homebrew: true,
                 simulators: true,
-                bun: true
+                bun: true,
+                go_build: true,
+                go_modules: true
             }
         );
         assert!(matches!(
@@ -1456,6 +1470,14 @@ mod tests {
             TaskConfig::ToolCaches {
                 homebrew: false,
                 uv: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_ok(&format!("{base}go_modules = false\n")).tasks[0],
+            TaskConfig::ToolCaches {
+                go_modules: false,
+                go_build: true,
                 ..
             }
         ));

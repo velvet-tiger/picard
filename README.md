@@ -1,6 +1,6 @@
 # Picard
 
-Picard is a macOS menu bar app that watches free disk space. When a drive runs low, it finds build output and finished work you can safely remove: stale `node_modules`, Cargo `target/` folders, Python virtualenvs, git-ignored build folders, and merged git worktrees. It can also ask uv, Homebrew, the iOS Simulator and bun to prune their caches, and it runs any cleanup scripts you add.
+Picard is a macOS menu bar app that watches free disk space. When a drive runs low, it finds build output and finished work you can safely remove: stale `node_modules`, Cargo `target/` folders, Python virtualenvs, git-ignored build folders, and merged git worktrees. It can also ask uv, Homebrew, the iOS Simulator, bun and Go to prune their caches, and it runs any cleanup scripts you add.
 
 It lives only in the menu bar. There is no Dock icon and no main window.
 
@@ -203,6 +203,8 @@ uv = true                 # uv cache prune
 homebrew = true           # brew cleanup --prune=all
 simulators = true         # xcrun simctl delete unavailable
 bun = true                # bun pm cache rm
+go_build = true           # go clean -cache
+go_modules = true         # go clean -modcache
 
 [[task]]
 type = "command"
@@ -221,6 +223,8 @@ Every task also accepts `enabled = false`.
 `appearance` sets the Picard window to light or dark. Left out, the window follows the macOS setting. Saving **System** in Settings takes the key out of the config. A change from Settings applies when you press **Save**. A change made by editing the file applies the next time the window opens.
 
 Preview shows each `tool_caches` step as "up to" its cache's current size, and leaves it out of the total. Each tool keeps what is still in use, so Picard cannot know in advance how much a prune frees. Picard measures the space freed after the run. A `command` task shows "unknown" for the same reason. Docker is not part of `tool_caches`. Use a `command` task for it, as in the example above.
+
+`go_modules` empties the whole Go module cache. Go downloads each module again the next time a build needs it, so a Go build with no network fails until it can reach the module proxy. Set `go_modules = false` if you build Go offline. `go_build` has no such cost: Go only rebuilds what it needs.
 
 ### Drives
 
@@ -258,6 +262,7 @@ uv = "~/.local/bin/uv"
 brew = "/opt/homebrew/bin/brew"
 bun = "~/.bun/bin/bun"
 xcrun = "/usr/bin/xcrun"
+go = "/usr/local/go/bin/go"
 ```
 
 ## Command line

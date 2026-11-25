@@ -1,5 +1,5 @@
 //! Asks developer tools to prune their own caches: uv, Homebrew, the iOS
-//! Simulator and bun.
+//! Simulator, bun and Go.
 //!
 //! Off unless added to the config, because it runs other programs. Each tool
 //! decides what to remove, so `scan` cannot know how much a prune will free.
@@ -111,5 +111,66 @@ mod tests {
         );
         assert_eq!(report.removed[0].path, PathBuf::from("Homebrew cache"));
         assert!(t.run(&ctx, &[]).removed.is_empty());
+    }
+
+    /// A fake `go` that reports a different folder for each `go env` query,
+    /// as the real one does for GOCACHE and GOMODCACHE.
+    fn fake_go(
+        dir: &std::path::Path,
+        build: &std::path::Path,
+        modules: &std::path::Path,
+        log: &std::path::Path,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("go");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh
+case \"$*\" in
+'env GOCACHE') echo '{}'; exit 0;;
+'env GOMODCACHE') echo '{}'; exit 0;;
+esac
+echo \"go $*\" >> '{}'
+",
+                build.display(),
+                modules.display(),
+                log.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn go_steps_find_their_own_caches_and_run_separately() {
+        let fx = Fixture::new(&[]);
+        let log = fx.dir.path().join("calls.log");
+        let build = fx.dir.path().join("go-build");
+        let modules = fx.dir.path().join("go-mod");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(modules.join("module.zip"), vec![b'x'; 40_000]).unwrap();
+        let go = fake_go(fx.dir.path(), &build, &modules, &log);
+        let t = ToolCaches::new(CachePrune::new(
+            vec![PruneStep::go_build(go.clone()), PruneStep::go_modules(go)],
+            "/usr/bin:/bin".into(),
+            fx.dir.path().to_path_buf(),
+        ));
+        let ctx = fx.ctx();
+        let found = t.scan(&ctx).unwrap();
+        assert_eq!(found[0].reason, "runs go clean -cache");
+        assert_eq!(found[1].reason, "runs go clean -modcache");
+        assert_eq!(found[0].estimate, Estimate::UpTo(0));
+        match found[1].estimate {
+            Estimate::UpTo(ceiling) => assert!(ceiling >= 40_000, "{ceiling}"),
+            other => panic!("module cache should be a ceiling, got {other:?}"),
+        }
+        assert!(!log.exists(), "scan must not run a prune");
+
+        let report = t.run(&ctx, &found[..1]);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "go clean -cache\n");
+        assert_eq!(report.removed[0].path, PathBuf::from("Go build cache"));
     }
 }

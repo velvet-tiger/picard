@@ -1,7 +1,8 @@
 //! Asks tools to shrink their own caches.
 //!
 //! Used in two places. `prune_package_caches` on the `node_modules` task runs
-//! npm and pnpm, and the `tool_caches` task runs uv, Homebrew, simctl and bun.
+//! npm and pnpm, and the `tool_caches` task runs uv, Homebrew, simctl, bun and
+//! Go.
 //! The caches live outside the roots, so Picard never deletes them itself: it
 //! runs each tool's own prune command and lets the tool decide.
 //!
@@ -104,6 +105,21 @@ impl PruneStep {
     pub fn bun(program: PathBuf) -> Self {
         let cache = CacheDir::Ask(strings(&["pm", "cache"]));
         Self::new("bun cache", program, &["pm", "cache", "rm"], cache)
+    }
+
+    /// Empties Go's build cache. Go rebuilds what it needs.
+    pub fn go_build(program: PathBuf) -> Self {
+        let cache = CacheDir::Ask(strings(&["env", "GOCACHE"]));
+        Self::new("Go build cache", program, &["clean", "-cache"], cache)
+    }
+
+    /// Empties Go's module cache. Go downloads modules again on the next
+    /// build, so an offline build fails until the module proxy is reachable.
+    /// `go clean` is needed rather than a plain delete: Go makes the files
+    /// read-only.
+    pub fn go_modules(program: PathBuf) -> Self {
+        let cache = CacheDir::Ask(strings(&["env", "GOMODCACHE"]));
+        Self::new("Go module cache", program, &["clean", "-modcache"], cache)
     }
 
     /// The command as a user would type it, for preview reasons.
@@ -570,6 +586,12 @@ mod tests {
     fn command_text_names_the_tool_and_its_arguments() {
         let step = PruneStep::uv(PathBuf::from("/opt/homebrew/bin/uv"));
         assert_eq!(step.command_text(), "uv cache prune");
+        let step = PruneStep::go_build(PathBuf::from("/usr/local/go/bin/go"));
+        assert_eq!(step.command_text(), "go clean -cache");
+        assert_eq!(step.cache, CacheDir::Ask(strings(&["env", "GOCACHE"])));
+        let step = PruneStep::go_modules(PathBuf::from("/usr/local/go/bin/go"));
+        assert_eq!(step.command_text(), "go clean -modcache");
+        assert_eq!(step.cache, CacheDir::Ask(strings(&["env", "GOMODCACHE"])));
         let step = PruneStep::simulators(PathBuf::from("/usr/bin/xcrun"), Path::new("/Users/me"));
         assert_eq!(step.command_text(), "xcrun simctl delete unavailable");
         assert_eq!(
