@@ -70,6 +70,7 @@ function status(volumes: Partial<Status['volumes'][number]>[] = [{}]): Status {
       free_text: '112 GB free (11%)',
       free_bytes: 112e9,
       total_bytes: 994e9,
+      threshold_bytes: 30e9,
       low: false,
       ...v,
     })),

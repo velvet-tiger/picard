@@ -41,6 +41,9 @@ pub struct VolumeStatus {
     /// Raw capacity, so the Clean tab can show disk size and free space.
     pub free_bytes: u64,
     pub total_bytes: u64,
+    /// This volume's low-space threshold in bytes, so the Clean tab can show
+    /// whether a clean would bring free space back above it.
+    pub threshold_bytes: u64,
     pub low: bool,
 }
 
@@ -552,6 +555,9 @@ fn status_view(
                 free_text: disk::format_free(*space),
                 free_bytes: space.free_bytes,
                 total_bytes: space.total_bytes,
+                threshold_bytes: config
+                    .threshold_for(&v.mount, v.uuid.as_deref())
+                    .bytes(space.total_bytes),
                 low: crate::monitor::is_low(config, v, *space),
             })
             .collect(),
@@ -1001,6 +1007,7 @@ mod tests {
         assert!(status.volumes[0].low);
         assert_eq!(status.volumes[0].free_bytes, SPACE.free_bytes);
         assert_eq!(status.volumes[0].total_bytes, SPACE.total_bytes);
+        assert_eq!(status.volumes[0].threshold_bytes, 30_000_000_000);
         assert_eq!(status.unavailable, vec!["Projects: not mounted"]);
         assert_eq!(status.mode, Mode::Ask);
         assert!(status.cleaning);
