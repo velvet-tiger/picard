@@ -74,7 +74,7 @@
 {#if active === null}
   <main><p>Unknown view “{initial}”.</p></main>
 {:else}
-  <div class="tabs" role="tablist" aria-label="Picard">
+  <div class="tabs" role="tablist" aria-label="Picard" data-tauri-drag-region>
     {#each TABS as t}
       <button
         role="tab"
@@ -109,17 +109,35 @@
 {/if}
 
 <style>
-  /* A top bar: the hairline runs edge to edge, the tabs line up with the
-     content's left edge. The current tab is ink over a 2px orange rule. */
+  /* The window has no title strip, so this bar is the top of the window and
+     its drag handle. The traffic lights float over its left end:
+     windows.rs insets them 20px and they end near 74px, so the tabs start
+     clear of them, or at the content's left edge when that is further in.
+     The bar stays put so the page never scrolls under the buttons. The
+     hairline runs edge to edge. The current tab is ink over a 2px orange
+     rule. */
   .tabs {
+    --traffic-lights: 92px;
+    position: sticky;
+    top: 0;
+    z-index: var(--z-sticky);
     display: flex;
     gap: var(--space-lg);
     padding-inline: max(var(--gutter), calc((100% - var(--container)) / 2 + var(--gutter)));
+    padding-left: max(
+      var(--traffic-lights),
+      calc((100% - var(--container)) / 2 + var(--gutter))
+    );
+    background: var(--color-paper);
     border-bottom: var(--rule-hair) solid var(--color-rule);
+  }
+  /* Keyboard focus scrolls a field into view below the bar, not under it. */
+  :global(html) {
+    scroll-padding-top: 53px;
   }
   .tabs button {
     position: relative;
-    min-height: 40px;
+    min-height: 52px;
     padding: 0;
     border: none;
     background: none;

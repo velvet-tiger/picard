@@ -69,12 +69,14 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, tab: Tab) -> tauri::Result<()> {
         return existing.set_focus();
     }
     let url = WebviewUrl::App(format!("index.html#/{}", tab.id()).into());
-    let window = WebviewWindowBuilder::new(app, WINDOW_LABEL, url)
+    let builder = WebviewWindowBuilder::new(app, WINDOW_LABEL, url)
         .title("Picard")
         .inner_size(760.0, 720.0)
         .min_inner_size(480.0, 400.0)
-        .center()
-        .build()?;
+        .center();
+    #[cfg(target_os = "macos")]
+    let builder = without_title_strip(builder);
+    let window = builder.build()?;
     poll::request_refresh(app);
     // The config read can block (a stalled network mount, say), and this runs
     // on the event thread, so the title bar catches up once the read is done.
@@ -90,6 +92,21 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, tab: Tab) -> tauri::Result<()> {
     // A menu bar app is never the active app, so the new window would open
     // behind whatever the user is working in without an explicit focus.
     window.set_focus()
+}
+
+/// Drops the title strip so the tab bar is the top of the window.
+///
+/// The page runs under the traffic lights, which float over the tab bar's
+/// left end. App.svelte pads the tabs clear of them and makes the bar the
+/// drag handle, so its height and padding must change with this position.
+#[cfg(target_os = "macos")]
+fn without_title_strip<R: Runtime>(
+    builder: WebviewWindowBuilder<'_, R, AppHandle<R>>,
+) -> WebviewWindowBuilder<'_, R, AppHandle<R>> {
+    builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(20.0, 20.0))
 }
 
 /// The native theme for `appearance`. `None` lets macOS decide.
