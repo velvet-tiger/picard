@@ -108,15 +108,16 @@ const box = (title: string) =>
  */
 const settle = () => new Promise((r) => setTimeout(r, 0))
 
-/** The value and caption of the stat tile labelled `label`, with whitespace collapsed. */
+/** The value and caption of the figure labelled `label`, with whitespace collapsed. */
 function tile(label: string): string[] {
-  const stat = screen.getByText(label).parentElement!
+  // A label's <dt>, so a legend entry with the same word does not match.
+  const stat = screen.getByText(label, { selector: 'dt' }).parentElement!
   return within(stat)
     .getAllByRole('definition')
     .map((dd) => dd.textContent!.replace(/\s+/g, ' ').trim())
 }
 
-/** Waits for the freed tile to show `value` and `items` removed since 3 Sep 2026. */
+/** Waits for the freed total to show `value` and `items` removed since 3 Sep 2026. */
 async function findFreed(value: string, items: string) {
   const since = new Date('2026-09-03T08:30:00Z').toLocaleDateString(undefined, {
     day: 'numeric',
@@ -233,7 +234,7 @@ describe('Preview', () => {
     await waitFor(() => expect(tile('Freed by Picard')).toEqual(['0 MB', 'Nothing removed yet']))
   })
 
-  it('shows disk size and available space in one row per volume', async () => {
+  it("shows each volume's size and available space in its own section", async () => {
     backend({
       get_status: () =>
         status([
@@ -243,26 +244,23 @@ describe('Preview', () => {
     })
     render(Preview)
 
-    await waitFor(() => expect(screen.getAllByText('Disk size')).toHaveLength(2))
-    const sizes = screen.getAllByText('Disk size').map((dt) => dt.parentElement!)
+    await waitFor(() => expect(screen.getAllByText('Available')).toHaveLength(2))
     const available = screen.getAllByText('Available').map((dt) => dt.parentElement!)
     const text = (el: HTMLElement) =>
       within(el)
         .getAllByRole('definition')
         .map((dd) => dd.textContent!.replace(/\s+/g, ' ').trim())
-    expect(sizes.map(text)).toEqual([
-      ['994 GB', 'Startup disk'],
-      ['500 GB', 'Projects'],
-    ])
+    expect(screen.getByRole('heading', { name: 'Startup disk' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Projects' })).toBeInTheDocument()
+    expect(screen.getByText('994 GB disk')).toBeInTheDocument()
+    expect(screen.getByText('500 GB disk')).toBeInTheDocument()
     expect(available.map(text)).toEqual([
       ['112 GB', '11% free'],
       ['8.0 GB', '2% free, below your threshold'],
     ])
     expect(available[1]).toHaveClass('low')
-    // The freed tile covers every volume, so it spans both rows.
-    expect(screen.getByText('Freed by Picard').parentElement!.getAttribute('style')).toContain(
-      'grid-row: 1 / span 2',
-    )
+    // The freed total covers every volume, so it shows once, with the history.
+    expect(screen.getAllByText('Freed by Picard')).toHaveLength(1)
   })
 
   it('leaves out a volume that reports no capacity from the percentage', async () => {
@@ -272,7 +270,7 @@ describe('Preview', () => {
     await waitFor(() => expect(tile('Available')).toEqual(['0 MB', '']))
   })
 
-  it('hides the disk tiles when free space cannot be read, but keeps the total', async () => {
+  it('hides the disk figures when free space cannot be read, but keeps the total', async () => {
     const { sent } = backend({
       get_status: () => {
         throw 'statfs failed'
@@ -283,13 +281,11 @@ describe('Preview', () => {
     await findFreed('42 GB', '318 items')
 
     expect(sent('get_status')).toHaveLength(1)
-    expect(screen.queryByText('Disk size')).not.toBeInTheDocument()
+    expect(screen.queryByText('Available')).not.toBeInTheDocument()
     expect(screen.queryByText('statfs failed')).not.toBeInTheDocument()
-    // Alone, the freed tile takes the whole strip rather than the third column.
-    expect(screen.getByText('Freed by Picard').parentElement).toHaveClass('solo')
   })
 
-  it('hides disk tiles that loaded earlier when a later read fails', async () => {
+  it('hides disk figures that loaded earlier when a later read fails', async () => {
     let fail = false
     const { sent } = backend({
       get_status: () => {
@@ -299,14 +295,13 @@ describe('Preview', () => {
     })
     render(Preview)
     await waitFor(() => expect(tile('Available')).toEqual(['112 GB', '11% free']))
-    expect(screen.getByText('Freed by Picard').parentElement).not.toHaveClass('solo')
 
     fail = true
     await emit('history-changed')
     await waitFor(() => expect(sent('get_status')).toHaveLength(2))
     await settle()
 
-    expect(screen.queryByText('Disk size')).not.toBeInTheDocument()
+    expect(screen.queryByText('Available')).not.toBeInTheDocument()
   })
 
   it('reloads the available space when the poll loop reads it again', async () => {
@@ -346,11 +341,34 @@ describe('Preview', () => {
     expect(tile('Available')).toEqual(['80 GB', '8% free'])
   })
 
-  it('names the summary for screen readers', async () => {
+  it("names each volume's section for screen readers", async () => {
     backend()
     render(Preview)
 
-    expect(await screen.findByRole('region', { name: 'Disk summary' })).toBeInTheDocument()
+    expect(await screen.findByRole('region', { name: 'Startup disk' })).toBeInTheDocument()
+  })
+
+  it('shows what a clean would leave free and where the threshold sits', async () => {
+    backend()
+    await renderScanned()
+
+    await waitFor(() =>
+      expect(tile('Selected')).toEqual(['3.5 GB', 'Up to 116 GB free after this clean']),
+    )
+    expect(screen.getByText('30 GB threshold')).toBeInTheDocument()
+  })
+
+  it('says when a clean would still leave the volume below its threshold', async () => {
+    backend({ get_status: () => status([{ free_bytes: 10e9, threshold_bytes: 30e9, low: true }]) })
+    await renderScanned()
+
+    await waitFor(() =>
+      expect(tile('Selected')[1]).toBe(
+        'Up to 14 GB free after this clean, still below your threshold',
+      ),
+    )
+    // Free space plus everything found stays under 30 GB, so the pin is off the meter.
+    expect(screen.queryByText('30 GB threshold')).not.toBeInTheDocument()
   })
 
   it('hides the total when it cannot be read', async () => {
@@ -364,7 +382,7 @@ describe('Preview', () => {
     await settle()
 
     expect(screen.queryByText('Freed by Picard')).not.toBeInTheDocument()
-    expect(screen.getByText('Disk size')).toBeInTheDocument()
+    expect(screen.getByText('Available')).toBeInTheDocument()
     expect(screen.queryByText('history.jsonl is unreadable')).not.toBeInTheDocument()
   })
 
@@ -769,8 +787,8 @@ describe('Preview', () => {
     const now = new Date(today[0].scanned_at)
     const then = new Date(older[0].scanned_at)
     const day = then.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
-    expect(screen.getByText(`· scanned ${clock(now)}`)).toBeInTheDocument()
-    expect(screen.getByText(`· scanned ${day}, ${clock(then)}`)).toBeInTheDocument()
+    expect(screen.getByText(`Scanned ${clock(now)}`)).toBeInTheDocument()
+    expect(screen.getByText(`Scanned ${day}, ${clock(then)}`)).toBeInTheDocument()
   })
 
   it('reloads the total and recent list when a background clean writes history, without rescanning', async () => {
@@ -947,7 +965,7 @@ describe('Preview', () => {
       expect(box('api/core')).toBeDisabled()
       expect(screen.getByText('skipped this time')).toBeInTheDocument()
       expect(screen.getByText('2 selected, 2.5 GB')).toBeInTheDocument()
-      expect(screen.getByText('up to 2.5 GB')).toBeInTheDocument()
+      expect(tile('Found, up to')[0]).toBe('2.5 GB')
 
       await fireEvent.click(screen.getByRole('button', { name: 'Clean selected' }))
       await waitFor(() => expect(sent('run_selected')).toHaveLength(1))
@@ -983,7 +1001,7 @@ describe('Preview', () => {
       expect(box('api/core')).toBeEnabled()
       expect(box('api/core')).not.toBeChecked()
       expect(screen.queryByText('skipped this time')).not.toBeInTheDocument()
-      expect(screen.getByText('up to 3.5 GB')).toBeInTheDocument()
+      expect(tile('Found, up to')[0]).toBe('3.5 GB')
     })
 
     it('clears every skip when the list is scanned again', async () => {
@@ -1298,7 +1316,7 @@ describe('Preview', () => {
       await renderScanned()
       const region = screen.getByRole('region', { name: 'Needs you' })
       expect(within(region).queryByRole('checkbox')).toBeNull()
-      expect(screen.getByText(/^up to 3\.5 GB/)).toBeInTheDocument()
+      expect(tile('Found, up to')[0]).toBe('3.5 GB')
     })
 
     it('opens any notice in Finder', async () => {

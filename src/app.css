@@ -1,148 +1,312 @@
+/* Hallmark · shape: app screen · genre: modern-minimal · theme: Rim (deal 1/3, seed macos-menu-bar-utility-9235·17bcb72c·2026-11-26·r0) · redesign: full
+ * nav: kept, the three tabs as a left-aligned top bar · signature: the headroom meter, free now, selected and found on one line against the threshold · states: first run, scanning, error, full
+ * axes: dark/grotesk-sans/warm · posture: committed · contrast: pass · modes: light+dark · v2.0.0 */
+/* Hallmark · pre-emit critique: P4 H4 E4 S5 R4 V4 · weakest: P, a ledger is the expected answer for a cleaner; the argument is the meter, which shows whether this clean clears the threshold before you press it */
+/* Hallmark · dismissed F4 · the selected tab carries a 2px orange rule under ink text, not a filled control; Clean selected is the one fill */
+/* Hallmark · dismissed 23 · the scan loader is a 2px line at 35% of the window width, well under the accent budget */
+/* Hallmark · dismissed 49 · every button sets white-space: nowrap in app.css; About's in-sentence links wrap on purpose */
+/* Hallmark · answered F3 · app.css sets text-wrap: balance on h1 to h3, and component heads inherit it */
+/* Hallmark · answered F1 · the redesign keeps Picard's copy as it was, and its tests match the straight apostrophes */
+
+/* Rim, two colourways from one system. Day (light) is derived from Rim's
+   night. The Appearance setting sets data-theme on <html> to force one; with
+   no attribute the window follows macOS. */
 :root {
   color-scheme: light dark;
-  --bg: #f5f5f7;
-  --panel: #ffffff;
-  --text: #1d1d1f;
-  --muted: #6e6e73;
-  --line: #d2d2d7;
-  --accent: #0a66d8;
-  --danger: #c62828;
-  --warn: #9a5800;
-  --ok: #2e7d32;
-  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
-  font-size: 13px;
-  line-height: 1.4;
+  --space-3xs: 2px; --space-2xs: 4px; --space-xs: 8px; --space-sm: 12px; --space-md: 16px; --space-lg: 24px; --space-xl: 40px; --space-2xl: 64px;
+
+  /* App scale at a 1.15 ratio from the 13px macOS body. Fixed sizes: an app
+     window is not a page, and nothing here grows with the viewport. */
+  --text-xs: 11px; --text-sm: 12px; --text-md: 13px; --text-lg: 15px; --text-xl: 17px; --text-display-s: 20px;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1); --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 120ms; --dur-short: 220ms;
+  --container: 880px; --gutter: 24px;
+  --z-sticky: 200;
+
+  /* The CSP allows no web fonts, so the system faces stand in for Rim's
+     Switzer and Geist Mono, in the same roles. */
+  --font-body: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --rule-hair: 1px;
+
+  --color-paper: oklch(97% 0.006 75); --color-paper-2: oklch(94% 0.008 75); --color-paper-3: oklch(99% 0.004 75);
+  --color-ink: oklch(20% 0.012 80); --color-ink-2: oklch(32% 0.012 80); --color-muted: oklch(45% 0.012 80); --color-muted-2: oklch(62% 0.010 80);
+  --color-rule: oklch(82% 0.010 78); --color-rule-2: oklch(90% 0.008 78);
+  --color-accent: oklch(66% 0.18 45); --color-accent-ink: oklch(14% 0.02 45); --color-accent-2: oklch(60% 0.12 250); --color-focus: oklch(62% 0.19 45);
+  --color-error: oklch(50% 0.18 27); --color-warn: oklch(50% 0.11 70); --color-success: oklch(48% 0.12 150);
 }
 
-/* The Appearance setting sets data-theme on <html> to force light or dark. With
-   no attribute the window follows macOS. The dark palette appears twice, once
-   per route to dark. App.test.ts fails if the two blocks differ. */
 :root[data-theme='light'] {
   color-scheme: light;
 }
 
+/* Night is Rim as dealt. It appears twice, once per route to dark.
+   App.test.ts fails if the two blocks differ. */
 :root[data-theme='dark'] {
   color-scheme: dark;
-  --bg: #1e1e1e;
-  --panel: #2a2a2c;
-  --text: #f5f5f7;
-  --muted: #98989d;
-  --line: #3a3a3c;
-  --accent: #4c9bff;
-  --danger: #ff6b6b;
-  --warn: #ffb74d;
-  --ok: #66bb6a;
+  --color-paper: oklch(9% 0.008 75); --color-paper-2: oklch(12.5% 0.009 75); --color-paper-3: oklch(6.5% 0.007 75);
+  --color-ink: oklch(94% 0.010 80); --color-ink-2: oklch(84% 0.011 80); --color-muted: oklch(68% 0.012 80); --color-muted-2: oklch(50% 0.010 80);
+  --color-rule: oklch(25% 0.010 78); --color-rule-2: oklch(16% 0.009 78);
+  --color-accent: oklch(72% 0.17 45); --color-accent-ink: oklch(10% 0.02 45); --color-accent-2: oklch(74% 0.12 250); --color-focus: oklch(78% 0.15 45);
+  --color-error: oklch(72% 0.15 27); --color-warn: oklch(80% 0.13 75); --color-success: oklch(76% 0.13 150);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme]) {
-    --bg: #1e1e1e;
-    --panel: #2a2a2c;
-    --text: #f5f5f7;
-    --muted: #98989d;
-    --line: #3a3a3c;
-    --accent: #4c9bff;
-    --danger: #ff6b6b;
-    --warn: #ffb74d;
-    --ok: #66bb6a;
+    --color-paper: oklch(9% 0.008 75); --color-paper-2: oklch(12.5% 0.009 75); --color-paper-3: oklch(6.5% 0.007 75);
+    --color-ink: oklch(94% 0.010 80); --color-ink-2: oklch(84% 0.011 80); --color-muted: oklch(68% 0.012 80); --color-muted-2: oklch(50% 0.010 80);
+    --color-rule: oklch(25% 0.010 78); --color-rule-2: oklch(16% 0.009 78);
+    --color-accent: oklch(72% 0.17 45); --color-accent-ink: oklch(10% 0.02 45); --color-accent-2: oklch(74% 0.12 250); --color-focus: oklch(78% 0.15 45);
+    --color-error: oklch(72% 0.15 27); --color-warn: oklch(80% 0.13 75); --color-success: oklch(76% 0.13 150);
   }
 }
 
 /* Settings is taller than the window and the other tabs are not. Without a
    permanent scrollbar track, Settings would be narrower and the tab bar would
-   sit further left on that tab. scrollbar-gutter would do this too, but it
-   needs macOS 15.2 and the app sets no minimum macOS version. */
+   move between tabs. scrollbar-gutter would do this too, but it needs macOS
+   15.2 and the app sets no minimum macOS version. Beside overflow-y: scroll,
+   overflow-x: clip computes to hidden on the root; the viewport scrolls
+   either way, so sticky footers keep working. */
 html {
+  overflow-x: clip;
   overflow-y: scroll;
+  scrollbar-color: var(--color-muted-2) var(--color-paper);
 }
 
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
 }
 
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
+  overflow-x: clip;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  font-size: var(--text-md);
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  caret-color: var(--color-accent);
+}
+
+::selection {
+  background: color-mix(in oklab, var(--color-accent) 35%, transparent);
+  color: var(--color-ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
 }
 
 main {
-  padding: 16px 20px 24px;
+  max-width: var(--container);
+  margin-inline: auto;
+  padding: var(--space-lg) var(--gutter) var(--space-lg);
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 500;
+  font-synthesis: none;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  overflow-wrap: break-word;
+  min-width: 0;
+  text-wrap: balance;
 }
 
 h1 {
-  font-size: 18px;
-  margin: 0 0 4px;
+  font-size: var(--text-xl);
 }
 
 h2 {
-  font-size: 14px;
+  font-size: var(--text-lg);
+}
+
+h3 {
+  font-size: var(--text-md);
+  letter-spacing: 0;
+}
+
+p {
   margin: 0;
+  text-wrap: pretty;
 }
 
 .muted {
-  color: var(--muted);
-}
-
-.panel {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 12px 14px;
-  margin-top: 12px;
+  color: var(--color-muted);
 }
 
 .error {
-  color: var(--danger);
+  color: var(--color-error);
 }
 
 .warning {
-  color: var(--warn);
+  color: var(--color-warn);
 }
 
 .ok {
-  color: var(--ok);
+  color: var(--color-success);
 }
 
+/* A section of a tab: a hairline above it does the dividing, no card. */
+.panel {
+  margin-top: var(--space-lg);
+  padding-top: var(--space-sm);
+  border-top: var(--rule-hair) solid var(--color-rule);
+}
+
+/* Square controls, Rim's pair: quiet outline and one orange fill. All eight
+   states: rest, hover, active, focus, disabled, busy, and pressed for toggles. */
 button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 0 var(--space-sm);
+  border: var(--rule-hair) solid var(--color-rule);
+  border-radius: 0;
+  background: transparent;
+  color: var(--color-ink);
   font: inherit;
-  padding: 5px 12px;
-  border-radius: 6px;
-  border: 1px solid var(--line);
-  background: var(--panel);
-  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
   cursor: pointer;
+  transition:
+    background-color var(--dur-short) var(--ease-out),
+    transform var(--dur-micro) var(--ease-out);
 }
 
-button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+button:hover {
+  background: var(--color-paper-2);
+}
+
+button:active {
+  transform: translateY(1px);
 }
 
 button:disabled {
-  opacity: 0.5;
-  cursor: default;
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+  background: transparent;
+}
+
+button[aria-busy='true'] {
+  cursor: progress;
+}
+
+button.primary {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-accent-ink);
+}
+
+button.primary:hover {
+  background: var(--color-focus);
+  border-color: var(--color-focus);
+}
+
+button.primary:disabled {
+  background: var(--color-paper-2);
+  border-color: var(--color-rule);
+  color: var(--color-muted);
 }
 
 input,
-select {
+select,
+textarea {
   font: inherit;
-  padding: 4px 6px;
-  border-radius: 5px;
-  border: 1px solid var(--line);
-  background: var(--panel);
-  color: var(--text);
+  min-height: 28px;
+  padding: var(--space-2xs) var(--space-xs);
+  border: var(--rule-hair) solid var(--color-muted-2);
+  border-radius: 0;
+  background: var(--color-paper);
+  color: var(--color-ink);
+}
+
+input:disabled,
+select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline-offset: -1px;
 }
 
 input[type='number'] {
   width: 80px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Square checkbox, drawn: Rim has nothing round. Radios keep their native
+   circle, which is what marks them as one-of-many. */
+input[type='checkbox'] {
+  appearance: none;
+  flex-shrink: 0;
+  display: inline-grid;
+  place-content: center;
+  width: 14px;
+  height: 14px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: var(--rule-hair) solid var(--color-muted);
+  vertical-align: -2px;
+  cursor: pointer;
+}
+
+input[type='checkbox']::after {
+  content: '';
+  width: 8px;
+  height: 8px;
+  background: var(--color-accent-ink);
+  opacity: 0;
+}
+
+input[type='checkbox']:checked,
+input[type='checkbox']:indeterminate {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+}
+
+input[type='checkbox']:checked::after {
+  opacity: 1;
+  clip-path: polygon(14% 44%, 0 59%, 40% 100%, 100% 22%, 86% 8%, 39% 70%);
+}
+
+input[type='checkbox']:indeterminate::after {
+  opacity: 1;
+  height: 2px;
+}
+
+input[type='checkbox']:hover {
+  border-color: var(--color-ink);
+}
+
+input[type='checkbox']:focus-visible {
+  outline-offset: 2px;
+}
+
+input[type='radio'] {
+  accent-color: var(--color-accent);
+  min-height: 0;
 }
 
 .row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-xs);
   flex-wrap: wrap;
 }
 
@@ -151,7 +315,13 @@ input[type='number'] {
 }
 
 .path {
-  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-  font-size: 12px;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
   overflow-wrap: anywhere;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button {
+    transition: none;
+  }
 }
