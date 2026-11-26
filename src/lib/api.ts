@@ -181,6 +181,8 @@ export interface VolumeStatus {
   free_text: string
   free_bytes: number
   total_bytes: number
+  /** This volume's low-space threshold, in bytes. */
+  threshold_bytes: number
   /** Free space is below this volume's threshold. */
   low: boolean
 }
@@ -499,6 +501,51 @@ export function formatBytes(bytes: number): string {
   if (bytes >= 10 * GB) return `${Math.round(bytes / GB)} GB`
   if (bytes >= GB) return `${(bytes / GB).toFixed(1)} GB`
   return `${Math.round(bytes / 1e6)} MB`
+}
+
+/** The Clean tab's headroom meter: segment widths and the pin, in percent of its length. */
+export interface Headroom {
+  free: number
+  selected: number
+  /** Found but not selected. */
+  found: number
+  /** Where the threshold sits, or null when it lies past the end of the meter. */
+  pin: number | null
+  /** The meter's full length: free space now plus everything found. */
+  scaleBytes: number
+}
+
+/**
+ * Lays out the headroom meter for one volume. Its scale is the most the volume
+ * could have free after a clean, so used space is left out: nothing on the page
+ * changes it, and it would shrink the part the user is deciding on to a sliver.
+ * `selectedBytes` is capped at `foundBytes`, since only found items can be ticked.
+ */
+export function headroom(
+  freeBytes: number,
+  selectedBytes: number,
+  foundBytes: number,
+  thresholdBytes: number,
+): Headroom {
+  const selected = Math.min(selectedBytes, foundBytes)
+  const scaleBytes = freeBytes + foundBytes
+  if (scaleBytes <= 0) return { free: 0, selected: 0, found: 0, pin: null, scaleBytes: 0 }
+  const pct = (bytes: number) => (bytes / scaleBytes) * 100
+  return {
+    free: pct(freeBytes),
+    selected: pct(selected),
+    found: pct(foundBytes - selected),
+    pin: thresholdBytes <= scaleBytes ? pct(thresholdBytes) : null,
+    scaleBytes,
+  }
+}
+
+/** "Up to 42 GB free after this clean", and whether that still falls short of the threshold. */
+export function afterCleanText(freeBytes: number, selectedBytes: number, thresholdBytes: number): string {
+  if (selectedBytes <= 0) return 'Nothing selected yet'
+  const after = freeBytes + selectedBytes
+  const short = after < thresholdBytes ? ', still below your threshold' : ''
+  return `Up to ${formatBytes(after)} free after this clean${short}`
 }
 
 /** Every age a task holds, so the window can check them before saving. */

@@ -21,6 +21,8 @@
     onStatusChanged,
     errorText,
     formatBytes,
+    headroom,
+    afterCleanText,
     itemTitle,
     shortPath,
     tildePath,
@@ -486,6 +488,49 @@
     return t.since ? `${items} since ${sinceText(t.since)}` : items
   }
 
+  /** "112 GB" as ["112", "GB"], so the unit can sit smaller beside the number. */
+  function sizeParts(bytes: number): [string, string] {
+    const text = formatBytes(bytes)
+    const gap = text.lastIndexOf(' ')
+    return [text.slice(0, gap), text.slice(gap + 1)]
+  }
+
+  /** Bytes ticked on one volume. */
+  const volumeSelected = (v: VolumePreview) =>
+    v.tasks
+      .flatMap((t) => t.items)
+      .filter((i) => checked[key(v.mount, i.path)])
+      .reduce((sum, i) => sum + i.bytes, 0)
+
+  /** Rows on one volume that Clean could remove now. */
+  const volumeCount = (v: VolumePreview) =>
+    v.tasks.reduce((n, t) => n + selectable(v.mount, t).length, 0)
+
+  /** What one category could free now, following Ignore and Skip clicks. */
+  const taskTotal = (mount: string, t: PreviewTask) =>
+    selectable(mount, t).reduce((sum, i) => sum + i.bytes, 0)
+
+  // The scan's list is hidden while a scan runs, so its figures go with it.
+  const showList = $derived(scanned && !scanning)
+
+  /**
+   * One section per volume: its disk reading, which loads without a scan, and
+   * its scan results, paired by mount point. Either can be missing, since a
+   * reading can fail and a volume can go unscanned.
+   */
+  const sections = $derived.by(() => {
+    const found = showList ? volumes : []
+    const byMount = new Map(found.map((v) => [v.mount, v]))
+    const fromDisks = diskRows.map((disk) => {
+      const scan = byMount.get(disk.mount)
+      return { mount: disk.mount, name: scan?.name ?? disk.name, disk, scan }
+    })
+    const scanOnly = found
+      .filter((v) => !diskRows.some((d) => d.mount === v.mount))
+      .map((scan) => ({ mount: scan.mount, name: scan.name, disk: undefined, scan }))
+    return [...fromDisks, ...scanOnly]
+  })
+
   async function clean() {
     cleaning = true
     error = null
@@ -714,71 +759,35 @@
   loadStored()
 </script>
 
-<main>
-  <div class="row">
+<main class="clean">
+  <header class="head">
     <h1>Clean up</h1>
-    <span class="spacer"></span>
-    <button onclick={scan} disabled={busy()}>{scanned ? 'Rescan' : 'Scan'}</button
+    <button class:primary={!scanned && !scanning} onclick={scan} disabled={busy()}
+      >{scanned ? 'Rescan' : 'Scan'}</button
     >
-  </div>
-  <p class="muted">
-    Nothing is removed until you press Clean. Picard re-checks every item just before removing it.
-  </p>
-
-  {#if diskRows.length > 0 || totals}
-    <!-- One row of disk tiles per volume; the freed tile spans them, since it covers every volume. -->
-    <section aria-label="Disk summary">
-      <dl class="stats">
-        {#each diskRows as v, row}
-          <div class="stat disk" style="grid-row: {row + 1}">
-            <dt>Disk size</dt>
-            <dd class="value">{formatBytes(v.total_bytes)}</dd>
-            <dd class="sub" title={v.mount}>{v.name}</dd>
-          </div>
-          <div class="stat available" class:low={v.low} style="grid-row: {row + 1}">
-            <dt>Available</dt>
-            <dd class="value">{formatBytes(v.free_bytes)}</dd>
-            <dd class="sub">{availableCaption(v)}</dd>
-          </div>
-        {/each}
-        {#if totals}
-          <div
-            class="stat freed"
-            class:solo={diskRows.length === 0}
-            style="grid-row: 1 / span {Math.max(diskRows.length, 1)}"
-          >
-            <dt>Freed by Picard</dt>
-            {#if totals.items > 0}
-              <dd class="value">{formatBytes(totals.bytes)}</dd>
-              <dd class="sub">{freedCaption(totals)}</dd>
-            {:else}
-              <dd class="value">0 MB</dd>
-              <dd class="sub">Nothing removed yet</dd>
-            {/if}
-          </div>
-        {/if}
-      </dl>
-    </section>
-  {/if}
+    <p class="note">
+      Nothing is removed until you press Clean. Picard re-checks every item just before removing it.
+    </p>
+  </header>
 
   {#if error}
-    <p class="error">{error}</p>
+    <p class="error alert">{error}</p>
   {/if}
 
   {#if cleaningAnywhere && !cleaning}
-    <p class="muted" role="status">
+    <p class="note" role="status">
       Picard is cleaning in the background. You can clean again when it finishes.
     </p>
   {/if}
 
   {#if stale?.kind === 'newer'}
     {@const found = stale.found}
-    <p class="panel stale" role="status">
+    <p class="stale" role="status">
       <span>A newer scan from {scannedText(new Date(newest(found)).toISOString())} is ready.</span>
       <button onclick={showLatest} disabled={busy()}>Show it</button>
     </p>
   {:else if stale?.kind === 'cleaned'}
-    <p class="panel stale" role="status">
+    <p class="stale" role="status">
       <span>Picard cleaned in the background, so this list may be out of date.</span>
       <button onclick={scan} disabled={busy()}>Scan again</button>
     </p>
@@ -786,7 +795,7 @@
 
   {#if results}
     {#each results as r}
-      <div class="panel">
+      <div class="result">
         <h2>{r.name}: freed {r.freed_text}</h2>
         {#if r.error}<p class="error">{r.error}</p>{/if}
         {#if r.stopped}<p class="muted">Stopped: {r.stopped}</p>{/if}
@@ -804,53 +813,83 @@
     {/each}
   {/if}
 
-  {#if scanning}
-    <div class="panel scanning" role="status" aria-live="polite">
-      <div class="row">
-        <span class="spinner" aria-hidden="true"></span>
-        <strong>
-          {waitingForClean ? 'Waiting for Picard to finish cleaning…' : 'Scanning your folders…'}
-        </strong>
-        <span class="muted elapsed">{elapsed} s</span>
-        <span class="spacer"></span>
-        <button onclick={cancel}>Cancel scan</button>
-      </div>
-      <div class="bar" aria-hidden="true"><span></span></div>
-      <p class="muted hint">
-        {#if waitingForClean}
-          The scan starts when the clean ends, so it never lists folders being removed.
-        {:else}
-          Measuring build folders and checking worktrees. Large folders can take half a minute.
+  {#each sections as s, si (s.mount)}
+    {@const notices = s.scan ? s.scan.tasks.flatMap((t) => t.notices ?? []) : []}
+    <section class="volume" aria-labelledby="volume-{si}">
+      <div class="volume-head">
+        <h2 id="volume-{si}">{s.name}</h2>
+        {#if s.disk && s.disk.total_bytes > 0}
+          <span class="muted disk-size">{formatBytes(s.disk.total_bytes)} disk</span>
         {/if}
-      </p>
-      {#each [72, 58, 66] as width}
-        <div class="skeleton" aria-hidden="true">
-          <span class="box"></span>
-          <span class="lines"
-            ><span style="width: {width}%"></span><span style="width: {width - 20}%"></span></span
-          >
-          <span class="box"></span>
-        </div>
-      {/each}
-    </div>
-  {:else if !scanned}
-    <!-- After a failed first scan the error says what happened; the prompt would hide it. -->
-    {#if !error}
-      <p class="muted">Press Scan to find build folders, caches and stale worktrees.</p>
-    {/if}
-  {:else if volumes.length === 0}
-    <p class="muted">No mounted volumes hold a configured root.</p>
-  {:else}
-    {#each volumes as v, vi}
-      {@const notices = v.tasks.flatMap((t) => t.notices ?? [])}
-      <div class="panel">
-        <div class="row">
-          <h2>{v.name}</h2>
-          <span class="muted">{v.free_text}</span>
-          <span class="muted">· scanned {scannedText(v.scanned_at)}</span>
-          <span class="spacer"></span>
-          <span class="muted">up to {formatBytes(volumeTotal(v))}</span>
-        </div>
+        <span class="spacer"></span>
+        {#if s.scan}
+          <span class="muted">Scanned {scannedText(s.scan.scanned_at)}</span>
+        {/if}
+      </div>
+
+      <!-- Measurements as figures: what is free, what was found, what is ticked. -->
+      <dl class="figures">
+        {#if s.disk}
+          {@const [n, u] = sizeParts(s.disk.free_bytes)}
+          <div class="figure-cell available" class:low={s.disk.low}>
+            <dt>Available</dt>
+            <dd class="value"><span class="n">{n}</span> <span class="u">{u}</span></dd>
+            <dd class="caption">{availableCaption(s.disk)}</dd>
+          </div>
+        {/if}
+        {#if s.scan}
+          {@const [fn, fu] = sizeParts(volumeTotal(s.scan))}
+          {@const count = volumeCount(s.scan)}
+          {@const [sn, su] = sizeParts(volumeSelected(s.scan))}
+          <div class="figure-cell">
+            <dt>Found, up to</dt>
+            <dd class="value"><span class="n">{fn}</span> <span class="u">{fu}</span></dd>
+            <dd class="caption">in {count} {count === 1 ? 'item' : 'items'}</dd>
+          </div>
+          <div class="figure-cell">
+            <dt>Selected</dt>
+            <dd class="value"><span class="n">{sn}</span> <span class="u">{su}</span></dd>
+            {#if s.disk}
+              <dd class="caption">
+                {afterCleanText(s.disk.free_bytes, volumeSelected(s.scan), s.disk.threshold_bytes)}
+              </dd>
+            {/if}
+          </div>
+        {/if}
+      </dl>
+
+      <!-- The headroom meter: free now, ticked and the rest found, against the threshold. -->
+      {#if s.disk && s.scan}
+        {@const h = headroom(
+          s.disk.free_bytes,
+          volumeSelected(s.scan),
+          volumeTotal(s.scan),
+          s.disk.threshold_bytes,
+        )}
+        {#if h.scaleBytes > 0}
+          <div class="meter" aria-hidden="true">
+            <div class="track">
+              <span class="seg free" style="flex-basis: {h.free}%"></span>
+              <span class="seg chosen" style="flex-basis: {h.selected}%"></span>
+              <span class="seg found" style="flex-basis: {h.found}%"></span>
+              {#if h.pin !== null}
+                <span class="pin" style="left: {h.pin}%"
+                  ><span>{formatBytes(s.disk.threshold_bytes)} threshold</span></span
+                >
+              {/if}
+            </div>
+            <div class="axis"><span>0</span><span>{formatBytes(h.scaleBytes)}</span></div>
+          </div>
+          <ul class="legend" aria-hidden="true">
+            <li><span class="key free"></span>Free now</li>
+            <li><span class="key chosen"></span>Selected</li>
+            <li><span class="key found"></span>Found, not selected</li>
+          </ul>
+        {/if}
+      {/if}
+
+      {#if s.scan}
+        {@const v = s.scan}
         {#if notices.length > 0}
           <section class="notices" aria-label="Needs you">
             <h3>Needs you</h3>
@@ -863,25 +902,27 @@
                     <span class="reason">{n.message}</span>
                   </span>
                   <span class="size">{n.size_text}</span>
-                  <button
-                    class="row-action"
-                    onclick={() => reveal(v.mount, n.path)}
-                    disabled={toggling[k] || cleaning}
-                    aria-label="Open {tildePath(n.path)} in Finder">Open in Finder</button
-                  >
-                  {#if n.deletable && confirmingDelete !== k}
+                  <span class="actions">
                     <button
                       class="row-action"
-                      onclick={() => (confirmingDelete = k)}
-                      disabled={deleteBlocked(k)}
-                      aria-label="Delete {tildePath(n.path)}">Delete</button
+                      onclick={() => reveal(v.mount, n.path)}
+                      disabled={toggling[k] || cleaning}
+                      aria-label="Open {tildePath(n.path)} in Finder">Open in Finder</button
                     >
-                  {/if}
+                    {#if n.deletable && confirmingDelete !== k}
+                      <button
+                        class="row-action"
+                        onclick={() => (confirmingDelete = k)}
+                        disabled={deleteBlocked(k)}
+                        aria-label="Delete {tildePath(n.path)}">Delete</button
+                      >
+                    {/if}
+                  </span>
                   {#if n.deletable && confirmingDelete === k}
                     <div class="confirm">
                       <span>Move {tildePath(n.path)} ({n.size_text}) to the Trash?</span>
                       <button
-                        class="row-action"
+                        class="row-action danger"
                         onclick={() => deleteConfirmed(v.mount, n.path)}
                         disabled={deleteBlocked(k)}
                         aria-label="Move {tildePath(n.path)} to the Trash">Move to Trash</button
@@ -898,72 +939,65 @@
             </ul>
           </section>
         {/if}
-        {#each v.tasks as t, ti}
-          {@const tk = key(v.mount, t.task)}
-          {@const label = TASK_LABELS[t.task] ?? t.task}
-          {@const listId = `task-${vi}-${ti}`}
-          <!-- The toggle and summary sit outside the h3 so the heading's name is the category alone. -->
-          <div class="task">
-            <button
-              class="toggle"
-              aria-expanded={open[tk]}
-              aria-controls={listId}
-              aria-label="{label} list"
-              onclick={() => (open[tk] = !open[tk])}
-              ><svg
-                class="chevron"
-                class:open={open[tk]}
-                viewBox="0 0 16 16"
-                aria-hidden="true"
-                ><path d="M6 3l5 5-5 5" /></svg
-              ></button
-            >
-            <h3>
-              {#if !t.error && selectable(v.mount, t).length > 0}
-                {@const ticked = taskTickedCount(v.mount, t)}
-                {@const total = selectable(v.mount, t).length}
-                <label class="group">
-                  <input
-                    type="checkbox"
-                    checked={ticked === total}
-                    indeterminate={ticked > 0 && ticked < total}
-                    onchange={(e) => setTask(v.mount, t, e.currentTarget.checked)}
-                  />
+
+        <div class="ledger">
+          {#each v.tasks as t, ti}
+            {@const tk = key(v.mount, t.task)}
+            {@const label = TASK_LABELS[t.task] ?? t.task}
+            {@const listId = `task-${si}-${ti}`}
+            <!-- The toggle and summary sit outside the h3 so the heading's name is the category alone. -->
+            <div class="task">
+              <button
+                class="toggle"
+                aria-expanded={open[tk]}
+                aria-controls={listId}
+                aria-label="{label} list"
+                onclick={() => (open[tk] = !open[tk])}
+                ><svg class="chevron" class:open={open[tk]} viewBox="0 0 16 16" aria-hidden="true"
+                  ><path d="M6 3l5 5-5 5" /></svg
+                ></button
+              >
+              <h3>
+                {#if !t.error && selectable(v.mount, t).length > 0}
+                  {@const ticked = taskTickedCount(v.mount, t)}
+                  {@const total = selectable(v.mount, t).length}
+                  <label class="group">
+                    <input
+                      type="checkbox"
+                      checked={ticked === total}
+                      indeterminate={ticked > 0 && ticked < total}
+                      onchange={(e) => setTask(v.mount, t, e.currentTarget.checked)}
+                    />
+                    {label}
+                  </label>
+                {:else}
                   {label}
-                </label>
+                {/if}
+              </h3>
+              <span class="summary">{#if !open[tk]}{closedSummary(v.mount, t)}{/if}</span>
+              <span class="size">{#if !t.error && t.items.length > 0}{formatBytes(taskTotal(v.mount, t))}{/if}</span>
+            </div>
+            <div id={listId} class="items" hidden={!open[tk]}>
+              {#if t.error}
+                <p class="error">Could not scan: {t.error}</p>
+              {:else if t.items.length === 0}
+                <p class="muted">Nothing to remove.</p>
               {:else}
-                {label}
-              {/if}
-            </h3>
-            {#if !open[tk]}
-              <span class="muted summary">{closedSummary(v.mount, t)}</span>
-            {/if}
-          </div>
-          <div id={listId} class="items" hidden={!open[tk]}>
-            {#if t.error}
-              <p class="error">Could not scan: {t.error}</p>
-            {:else if t.items.length === 0}
-              <p class="muted">Nothing to remove.</p>
-            {:else}
-              <ul>
-                {#each t.items as i}
-                  {@const k = key(v.mount, i.path)}
-                  {@const skip = isSkipped(v.mount, i)}
-                  <li class="candidate" class:excluded={isExcluded(v.mount, i)}>
-                    <!-- The row already shows the path; a tooltip only helps when shortPath has elided part of it. -->
-                    <label
-                      class="item"
-                      title={shortPath(i.path) !== tildePath(i.path) ? tildePath(i.path) : undefined}
-                    >
-                      <input
-                        type="checkbox"
-                        bind:checked={checked[k]}
-                        disabled={isExcluded(v.mount, i) || cleaning}
-                      />
-                      <span class="text">
-                        <span class="title"
-                          >{itemTitle(t.task, i.path)}
-                          <span class="muted reason"
+                <ul>
+                  {#each t.items as i}
+                    {@const k = key(v.mount, i.path)}
+                    {@const skip = isSkipped(v.mount, i)}
+                    <li class="candidate" class:excluded={isExcluded(v.mount, i)}>
+                      <!-- One line per row. The path gives way first, and at narrow widths it is only in the tooltip. -->
+                      <label class="item" title={tildePath(i.path)}>
+                        <input
+                          type="checkbox"
+                          bind:checked={checked[k]}
+                          disabled={isExcluded(v.mount, i) || cleaning}
+                        />
+                        <span class="text">
+                          <span class="title">{itemTitle(t.task, i.path)}</span>
+                          <span class="reason"
                             >{i.ignored
                               ? 'ignored, never cleaned'
                               : i.holds_ignored
@@ -971,47 +1005,84 @@
                                 : skip
                                   ? 'skipped this time'
                                   : i.reason}</span
-                          ></span
-                        >
-                        <span class="path muted">{shortPath(i.path)}</span>
+                          >
+                          <span class="path">{shortPath(i.path)}</span>
+                        </span>
+                        <span class="size">{i.size_text}</span>
+                      </label>
+                      <span class="actions">
+                        <!-- A protected row is never cleaned, so skipping it would change nothing. -->
+                        {#if !isProtected(i)}
+                          <button
+                            class="row-action"
+                            onclick={() => toggleSkip(v.mount, i)}
+                            disabled={toggling[k] || cleaning}
+                            title={skip ? undefined : 'Leave out of this clean only'}
+                            aria-pressed={skip}
+                            aria-label="{skip ? 'Unskip' : 'Skip'} {tildePath(i.path)}"
+                            >{skip ? 'Unskip' : 'Skip'}</button
+                          >
+                        {/if}
+                        {#if IGNORABLE_TASKS.includes(t.task)}
+                          <button
+                            class="row-action"
+                            onclick={() => toggleIgnore(v.mount, i)}
+                            disabled={toggling[k] || cleaning}
+                            aria-label="{i.ignored ? 'Unignore' : 'Ignore'} {tildePath(i.path)}"
+                            >{i.ignored ? 'Unignore' : 'Ignore'}</button
+                          >
+                        {/if}
                       </span>
-                      <span class="size">{i.size_text}</span>
-                    </label>
-                    <!-- A protected row is never cleaned, so skipping it would change nothing. -->
-                    {#if !isProtected(i)}
-                      <button
-                        class="row-action"
-                        onclick={() => toggleSkip(v.mount, i)}
-                        disabled={toggling[k] || cleaning}
-                        title={skip ? undefined : 'Leave out of this clean only'}
-                        aria-pressed={skip}
-                        aria-label="{skip ? 'Unskip' : 'Skip'} {tildePath(i.path)}"
-                        >{skip ? 'Unskip' : 'Skip'}</button
-                      >
-                    {/if}
-                    {#if IGNORABLE_TASKS.includes(t.task)}
-                      <button
-                        class="row-action"
-                        onclick={() => toggleIgnore(v.mount, i)}
-                        disabled={toggling[k] || cleaning}
-                        aria-label="{i.ignored ? 'Unignore' : 'Ignore'} {tildePath(i.path)}"
-                        >{i.ignored ? 'Unignore' : 'Ignore'}</button
-                      >
-                    {/if}
-                  </li>
-                {/each}
-              </ul>
-            {/if}
-          </div>
-        {/each}
-      </div>
-    {/each}
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+  {/each}
 
+  {#if scanning}
+    <div class="scanning" role="status" aria-live="polite">
+      <div class="row">
+        <strong>
+          {waitingForClean ? 'Waiting for Picard to finish cleaning…' : 'Scanning your folders…'}
+        </strong>
+        <span class="spacer"></span>
+        <span class="elapsed">{elapsed} s</span>
+        <button onclick={cancel}>Cancel scan</button>
+      </div>
+      <div class="bar" aria-hidden="true"><span></span></div>
+      <p class="note">
+        {#if waitingForClean}
+          The scan starts when the clean ends, so it never lists folders being removed.
+        {:else}
+          Measuring build folders and checking worktrees. Large folders can take half a minute.
+        {/if}
+      </p>
+      {#each [72, 58, 66] as width}
+        <div class="skeleton" aria-hidden="true">
+          <span class="box"></span>
+          <span class="line" style="width: {width}%"></span>
+          <span class="box"></span>
+        </div>
+      {/each}
+    </div>
+  {:else if !scanned}
+    <!-- After a failed first scan the error says what happened; the prompt would hide it. -->
+    {#if !error}
+      <p class="empty">Press Scan to find build folders, caches and stale worktrees.</p>
+    {/if}
+  {:else if volumes.length === 0}
+    <p class="empty">No mounted volumes hold a configured root.</p>
+  {:else}
     <div class="row footer">
       <button onclick={() => setAll(true)} disabled={cleaning}>Select all</button>
       <button onclick={() => setAll(false)} disabled={cleaning}>Select none</button>
       <span class="spacer"></span>
-      <span class="muted">{selectedCount} selected, {formatBytes(selectedBytes)}</span>
+      <span class="tally">{selectedCount} selected, {formatBytes(selectedBytes)}</span>
       <button
         class="primary"
         onclick={clean}
@@ -1026,360 +1097,602 @@
     </div>
   {/if}
 
-  {#if history.length > 0}
-    <div class="panel">
-      <h2>Recently removed</h2>
-      <ul class="history">
-        {#each history as h}
-          <li class="history-row" title={tildePath(h.path)}>
-            <span class="muted">{new Date(h.time).toLocaleString()}</span>
-            <span class="text">{itemTitle(h.task, h.path)}</span>
-            <span class="size">{formatBytes(h.bytes)}</span>
-          </li>
-        {/each}
-      </ul>
-    </div>
+  {#if history.length > 0 || totals}
+    <section class="history" aria-label="Recently removed">
+      <div class="history-head">
+        {#if history.length > 0}
+          <h2>Recently removed</h2>
+        {/if}
+        <span class="spacer"></span>
+        {#if totals}
+          <dl class="freed">
+            <div>
+              <dt>Freed by Picard</dt>
+              {#if totals.items > 0}
+                <dd class="value">{formatBytes(totals.bytes)}</dd>
+                <dd class="caption">{freedCaption(totals)}</dd>
+              {:else}
+                <dd class="value">0 MB</dd>
+                <dd class="caption">Nothing removed yet</dd>
+              {/if}
+            </div>
+          </dl>
+        {/if}
+      </div>
+      {#if history.length > 0}
+        <ul>
+          {#each history as h}
+            <li class="history-row" title={tildePath(h.path)}>
+              <span class="when">{new Date(h.time).toLocaleString()}</span>
+              <span class="text">{itemTitle(h.task, h.path)}</span>
+              <span class="size">{formatBytes(h.bytes)}</span>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
   {/if}
 </main>
 
 <style>
-  h3 {
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--muted);
+  .clean {
+    display: grid;
+    gap: var(--space-lg);
+    align-content: start;
+    /* Shared by the category heading and its rows, so the rows line up under its checkbox. */
+    --toggle-size: var(--space-lg);
+    --task-gap: var(--space-xs);
   }
-  /* Shared by the heading row and the list under it, so the list lines up with the heading's checkbox. */
-  main {
-    --toggle-size: 28px;
-    --task-gap: 6px;
+
+  .head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: var(--space-xs) var(--space-md);
   }
-  /* chevron | checkbox and name | summary when closed */
-  .notices h3 {
-    margin: 0;
+  .note {
+    grid-column: 1 / -1;
+    color: var(--color-muted);
+    font-size: var(--text-sm);
   }
-  .notice {
+  .alert {
+    padding: var(--space-sm) var(--space-md);
+    background: var(--color-paper-2);
+    border-left: 2px solid var(--color-error);
+    font-weight: 500;
+  }
+  .stale {
     display: flex;
+    align-items: center;
     flex-wrap: wrap;
-    align-items: start;
-    gap: 4px 8px;
+    gap: var(--space-xs);
+    padding: var(--space-xs) var(--space-md);
+    background: var(--color-paper-2);
+    border-left: 2px solid var(--color-accent-2);
   }
-  .notice .text {
+  .stale span {
+    flex: 1;
+  }
+  .result {
+    display: grid;
+    gap: var(--space-2xs);
+    padding-top: var(--space-sm);
+    border-top: var(--rule-hair) solid var(--color-rule);
+  }
+  .result h2 {
+    font-size: var(--text-md);
+  }
+
+  /* One volume: head, figures, meter, then what the scan found on it. */
+  .volume {
+    display: grid;
+    gap: var(--space-md);
+  }
+  .volume-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-xs);
+    padding-top: var(--space-sm);
+    border-top: var(--rule-hair) solid var(--color-rule);
+    font-size: var(--text-sm);
+  }
+  .volume-head h2 {
+    font-size: var(--text-lg);
+  }
+
+  /* Three across at every window width; the numbers are set to fit 480px. */
+  .figures {
+    display: flex;
+    margin: 0;
+  }
+  .figure-cell {
     flex: 1 1 0;
+    display: grid;
+    gap: var(--space-3xs);
+    align-content: start;
     min-width: 0;
+    padding: 0 var(--space-sm);
+    border-left: var(--rule-hair) solid var(--color-rule);
   }
-  .notice .confirm {
-    display: flex;
-    flex: 1 0 100%;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
+  .figure-cell:first-child {
+    padding-left: 0;
+    border-left: 0;
   }
-  .notice .confirm span {
-    flex: 1;
-    min-width: 0;
-    overflow-wrap: anywhere;
+  .figure-cell:last-child {
+    padding-right: 0;
   }
-  .notice .reason {
-    margin-left: 0;
+  .figure-cell dt {
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+    font-weight: 500;
   }
-  .task {
-    display: flex;
-    align-items: center;
-    gap: var(--task-gap);
-    margin: 12px 0 4px;
-  }
-  .task h3 {
+  .figure-cell dd {
     margin: 0;
   }
-  /* Above the 24px minimum target WCAG 2.2 (2.5.8) allows. */
-  .toggle {
-    min-width: var(--toggle-size);
-    min-height: var(--toggle-size);
-    border: none;
-    background: none;
-    padding: 0;
-    color: var(--muted);
-    cursor: pointer;
-  }
-  .items {
-    padding-left: calc(var(--toggle-size) + var(--task-gap));
-  }
-  /* Drawn, not a text glyph: the small-triangle characters stay tiny at any font size. */
-  .chevron {
-    display: block;
-    width: 16px;
-    height: 16px;
-    margin: auto;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 2;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-    transition: transform 0.15s;
-  }
-  .chevron.open {
-    transform: rotate(90deg);
-  }
-  .summary {
-    font-size: 12px;
-  }
-  .group {
-    display: inline-flex;
-    align-items: center;
-    gap: 10px;
-    cursor: pointer;
-  }
-  .group input {
-    margin: 0;
-  }
-  ul {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-  }
-  li {
-    padding: 4px 0;
-    border-bottom: 1px solid var(--line);
-  }
-  li:last-child {
-    border-bottom: none;
-  }
-  /* item | Skip button | Ignore button */
-  .candidate {
-    display: flex;
-    align-items: start;
-    gap: 10px;
-  }
-  .candidate .item {
-    flex: 1;
-    min-width: 0;
-  }
-  .candidate.excluded .item {
-    opacity: 0.55;
-    cursor: default;
-  }
-  .row-action {
-    font-size: 11px;
-    padding: 1px 8px;
+  .value {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
-  /* checkbox | name, reason and path | size */
-  .item {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    column-gap: 10px;
-    align-items: start;
-    cursor: pointer;
+  .value .n {
+    font-size: var(--text-display-s);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.03em;
+    line-height: 1;
   }
-  .item input {
-    margin-top: 2px;
+  .value .u {
+    color: var(--color-muted);
+    font-size: var(--text-sm);
   }
+  .caption {
+    color: var(--color-muted);
+    font-size: var(--text-xs);
+    overflow-wrap: break-word;
+  }
+  .figure-cell.low .n,
+  .figure-cell.low .caption {
+    color: var(--color-error);
+  }
+
+  .meter {
+    padding-top: var(--space-lg);
+  }
+  .track {
+    position: relative;
+    display: flex;
+    height: 8px;
+    outline: var(--rule-hair) solid var(--color-rule);
+  }
+  .seg {
+    flex-grow: 0;
+    flex-shrink: 0;
+    min-width: 0;
+  }
+  .seg.free,
+  .key.free {
+    background: var(--color-muted-2);
+  }
+  .seg.chosen,
+  .key.chosen {
+    background: var(--color-accent);
+  }
+  .seg.found,
+  .key.found {
+    background: var(--color-accent-2);
+  }
+  .pin {
+    position: absolute;
+    top: -18px;
+    bottom: -4px;
+    width: 0;
+    border-left: var(--rule-hair) solid var(--color-ink);
+  }
+  .pin span {
+    position: absolute;
+    bottom: 100%;
+    right: 0;
+    padding-right: var(--space-2xs);
+    color: var(--color-ink-2);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+  }
+  .axis {
+    display: flex;
+    justify-content: space-between;
+    padding-top: var(--space-2xs);
+    color: var(--color-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2xs) var(--space-md);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+  }
+  .legend li {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+  }
+  .key {
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+  }
+
+  ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .items li + li,
+  .notices li + li,
+  .history li + li {
+    border-top: var(--rule-hair) solid var(--color-rule-2);
+  }
+
+  /* Rows: one line each. Name and reason first, the path takes what is left. */
   .text {
     display: flex;
-    flex-direction: column;
+    align-items: baseline;
+    gap: var(--space-xs);
     min-width: 0;
   }
   .title {
-    font-weight: 600;
+    flex: 0 0 auto;
+    max-width: 65%;
+    min-width: 0;
+    font-weight: 500;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .reason {
-    font-weight: normal;
-    font-size: 12px;
-    margin-left: 6px;
+    flex: 0 1 auto;
+    min-width: 0;
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .item .path {
-    font-size: 11px;
+  .text .path {
+    flex: 1 1 0;
+    min-width: 0;
+    color: var(--color-muted);
+    font-size: var(--text-xs);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .size {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
     text-align: right;
     white-space: nowrap;
-    font-variant-numeric: tabular-nums;
   }
-  .scanning .row {
-    gap: 10px;
+  .actions {
+    display: flex;
+    gap: var(--space-3xs);
+    justify-content: end;
+  }
+  .row-action {
+    min-height: 20px;
+    padding: 0 var(--space-2xs);
+    border: 0;
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+    font-weight: 400;
+  }
+  .row-action:hover {
+    background: none;
+    color: var(--color-ink);
+    text-decoration: underline;
+  }
+  .row-action:active {
+    transform: none;
+    color: var(--color-ink-2);
+  }
+  .row-action:disabled {
+    background: none;
+  }
+  .row-action[aria-pressed='true'] {
+    color: var(--color-ink);
+  }
+  .row-action.danger {
+    color: var(--color-error);
+  }
+
+  .notices {
+    display: grid;
+    gap: var(--space-xs);
+    padding: var(--space-sm) var(--space-md);
+    background: var(--color-paper-2);
+    border-left: 2px solid var(--color-accent);
+  }
+  .notices h3 {
+    font-size: var(--text-md);
+  }
+  .notice {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: baseline;
+    column-gap: var(--space-sm);
+    padding: var(--space-2xs) 0;
+  }
+  .notice .text {
+    flex-wrap: wrap;
+  }
+  .notice .title {
+    flex: 1 1 100%;
+    max-width: none;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    font-weight: 400;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .confirm {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-xs);
+    padding-top: var(--space-xs);
+    font-size: var(--text-sm);
+  }
+  .confirm span {
+    flex: 1 1 16rem;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  /* chevron | checkbox and name | summary when closed | what it could free */
+  .task {
+    display: grid;
+    grid-template-columns: var(--toggle-size) minmax(0, 1fr) auto 64px;
+    align-items: center;
+    column-gap: var(--task-gap);
+    padding: var(--space-2xs) 0;
+    border-top: var(--rule-hair) solid var(--color-rule);
+  }
+  .task h3 {
+    line-height: 1.45;
+  }
+  .summary {
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+  }
+  /* Above the 24px minimum target WCAG 2.2 (2.5.8) allows. */
+  .toggle {
+    width: var(--toggle-size);
+    height: var(--toggle-size);
+    min-height: 0;
+    padding: 0;
+    border: none;
+    color: var(--color-muted);
+  }
+  .toggle:hover {
+    background: none;
+    color: var(--color-ink);
+  }
+  .toggle:active {
+    transform: none;
+    color: var(--color-ink-2);
+  }
+  /* Drawn, not a text glyph: the small-triangle characters stay tiny at any font size. */
+  .chevron {
+    display: block;
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: square;
+    transition: transform var(--dur-short) var(--ease-in-out);
+  }
+  .chevron.open {
+    transform: rotate(90deg);
+  }
+  .group {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+    cursor: pointer;
+  }
+  .items {
+    padding: 0 0 var(--space-xs) calc(var(--toggle-size) + var(--task-gap));
+  }
+  .items > p {
+    padding: var(--space-2xs) 0;
+    font-size: var(--text-sm);
+  }
+
+  /* item | Skip and Ignore */
+  .candidate {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 92px;
+    align-items: center;
+    column-gap: var(--space-xs);
+    min-height: 24px;
+    padding: var(--space-3xs) 0;
+  }
+  .candidate:has(input:checked) {
+    background: var(--color-paper-3);
+  }
+  /* checkbox | name, reason and path | size */
+  .item {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) 64px;
+    align-items: center;
+    column-gap: var(--space-sm);
+    min-width: 0;
+    cursor: pointer;
+  }
+  .candidate.excluded .item {
+    opacity: 0.55;
+    cursor: default;
+  }
+
+  .scanning {
+    display: grid;
+    gap: var(--space-sm);
+    padding-top: var(--space-sm);
+    border-top: var(--rule-hair) solid var(--color-rule);
+  }
+  .scanning strong {
+    font-weight: 500;
   }
   .elapsed {
+    color: var(--color-muted);
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
-  .hint {
-    margin: 8px 0 12px;
-  }
-  .spinner {
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    border: 2px solid var(--line);
-    border-top-color: var(--accent);
-    animation: spin 0.8s linear infinite;
-  }
-  /* Indeterminate bar: a short stripe that sweeps across. */
+  /* Indeterminate: a short stripe that sweeps across. The scan reports no progress. */
   .bar {
     position: relative;
-    height: 4px;
-    margin-top: 12px;
-    border-radius: 2px;
-    background: var(--line);
+    height: 2px;
     overflow: hidden;
+    background: var(--color-rule);
   }
   .bar span {
     position: absolute;
     inset: 0 auto 0 0;
     width: 35%;
-    border-radius: 2px;
-    background: var(--accent);
-    animation: sweep 1.4s ease-in-out infinite;
-  }
-  /* Placeholder rows in the shape of results: checkbox | two lines | size. */
-  .skeleton {
-    display: grid;
-    grid-template-columns: 14px minmax(0, 1fr) 48px;
-    column-gap: 10px;
-    align-items: start;
-    padding: 8px 0;
-    border-top: 1px solid var(--line);
-  }
-  .skeleton .box,
-  .skeleton .lines span {
-    display: block;
-    height: 12px;
-    border-radius: 4px;
-    background: linear-gradient(90deg, var(--line) 25%, var(--bg) 50%, var(--line) 75%);
-    background-size: 200% 100%;
-    animation: shimmer 1.6s linear infinite;
-  }
-  .skeleton .box {
-    height: 14px;
-  }
-  .skeleton .lines {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
+    background: var(--color-accent);
+    animation: sweep 1.4s linear infinite;
   }
   @keyframes sweep {
-    0% {
+    from {
       transform: translateX(-100%);
     }
-    100% {
+    to {
       transform: translateX(290%);
     }
   }
-  @keyframes shimmer {
-    to {
-      background-position: -200% 0;
-    }
+  /* Placeholder rows in the shape of results: checkbox | name | size. */
+  .skeleton {
+    display: grid;
+    grid-template-columns: 14px 1fr 48px;
+    column-gap: var(--space-sm);
+    align-items: center;
+    height: 24px;
+    border-top: var(--rule-hair) solid var(--color-rule-2);
   }
-  @media (prefers-reduced-motion: reduce) {
-    .chevron {
-      transition: none;
-    }
-    .spinner,
-    .bar span,
-    .skeleton .box,
-    .skeleton .lines span {
-      animation: none;
-    }
+  .skeleton .box,
+  .skeleton .line {
+    display: block;
+    height: 10px;
+    background: var(--color-rule);
+  }
+  .empty {
+    padding-top: var(--space-sm);
+    border-top: var(--rule-hair) solid var(--color-rule);
+    color: var(--color-ink-2);
+  }
+
+  /* The action bar stays in reach while the list scrolls, edge to edge. */
+  .footer {
+    position: sticky;
+    bottom: 0;
+    z-index: var(--z-sticky);
+    margin-inline: calc(-1 * var(--gutter));
+    padding: var(--space-sm) var(--gutter);
+    background: var(--color-paper);
+    border-top: var(--rule-hair) solid var(--color-rule);
+  }
+  /* One line at any width: the tally gives way before Clean selected wraps. */
+  .footer {
+    flex-wrap: nowrap;
+  }
+  .tally {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+    font-variant-numeric: tabular-nums;
+    padding-right: var(--space-xs);
+  }
+
+  .history {
+    display: grid;
+    gap: var(--space-xs);
+  }
+  .history-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-xs) var(--space-md);
+    padding-top: var(--space-sm);
+    border-top: var(--rule-hair) solid var(--color-rule);
+  }
+  .history-head h2 {
+    font-size: var(--text-lg);
+  }
+  .freed {
+    margin: 0;
+  }
+  .freed div {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-xs);
+  }
+  .freed dt {
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+  }
+  .freed dd {
+    margin: 0;
+  }
+  .freed .value {
+    font-size: var(--text-lg);
+  }
+  .freed .caption {
+    font-size: var(--text-sm);
   }
   .history-row {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr) auto;
-    column-gap: 10px;
+    column-gap: var(--space-sm);
+    padding: var(--space-3xs) 0;
+    font-size: var(--text-sm);
   }
-  .history-row .text {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    display: block;
-  }
-  .footer {
-    margin-top: 14px;
-    position: sticky;
-    bottom: 0;
-    background: var(--bg);
-    padding: 10px 0;
-  }
-  .history li {
-    font-size: 12px;
-  }
-  /* size | available | freed, with freed spanning every volume's row. */
-  .stats {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 10px;
-    margin: 12px 0 0;
-  }
-  .stat {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 10px 14px;
-    min-width: 0;
-  }
-  .stat.disk {
-    grid-column: 1;
-  }
-  .stat.available {
-    grid-column: 2;
-  }
-  .stat.freed {
-    grid-column: 3;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-  }
-  .stat dt {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--muted);
-  }
-  .stat dd {
-    margin: 0;
-  }
-  .stat .value {
-    font-size: 22px;
-    font-weight: 600;
+  .history-row .when {
+    color: var(--color-muted);
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
-  .stat .sub {
-    font-size: 12px;
-    color: var(--muted);
+  .history-row .text {
+    display: block;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* The threshold warning must stay readable at the 480px minimum window width. */
-  .stat.available .sub {
-    white-space: normal;
-  }
-  /* With no volume rows, the freed tile takes the whole strip instead of the third column. */
-  .stat.freed.solo {
-    grid-column: 1 / -1;
-  }
-  .stat.low .value,
-  .stat.low .sub {
-    color: var(--danger);
+
+  /* Narrow windows: a row's path moves to its tooltip, since a few characters of it say nothing. */
+  @media (max-width: 40rem) {
+    .text .path {
+      display: none;
+    }
   }
 
-  .stale {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-
-  .stale span {
-    flex: 1;
+  @media (prefers-reduced-motion: reduce) {
+    .chevron {
+      transition: none;
+    }
+    .bar span {
+      animation: none;
+      width: 100%;
+      opacity: 0.4;
+    }
   }
 </style>

@@ -148,20 +148,34 @@
 
 <style>
   .status {
-    margin-top: 8px;
+    margin-top: var(--space-xs);
   }
   ul {
-    margin: 8px 0 0;
-    padding-left: 18px;
+    margin: var(--space-xs) 0 0;
+    padding-left: var(--space-md);
   }
   li + li {
-    margin-top: 4px;
+    margin-top: var(--space-2xs);
   }
+  /* Rim's links are ink, underlined. Orange is kept for the action and state. */
   button.link {
+    display: inline;
+    min-height: 0;
     border: none;
     padding: 0;
     background: none;
-    color: var(--accent);
+    color: var(--color-ink);
+    font-weight: 400;
     text-decoration: underline;
+    text-decoration-color: var(--color-muted-2);
+    text-underline-offset: 0.2em;
+    white-space: normal;
+  }
+  button.link:hover {
+    text-decoration-color: currentColor;
+  }
+  button.link:active {
+    transform: none;
+    color: var(--color-ink-2);
   }
 </style>

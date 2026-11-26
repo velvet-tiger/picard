@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  afterCleanText,
   ageMinutes,
   applyAppearance,
   BUILT_IN_TASKS,
@@ -8,6 +9,7 @@ import {
   getAppearance,
   getNotActivity,
   getProtection,
+  headroom,
   isValidAge,
   itemTitle,
   joinAge,
@@ -107,6 +109,47 @@ describe('formatBytes', () => {
     [1.56e12, '1.6 TB'],
   ])('formats %d bytes as %s', (bytes, text) => {
     expect(formatBytes(bytes)).toBe(text)
+  })
+})
+
+describe('headroom', () => {
+  it('scales the meter to free space plus everything found', () => {
+    expect(headroom(20e9, 10e9, 30e9, 25e9)).toEqual({
+      free: 40,
+      selected: 20,
+      found: 40,
+      pin: 50,
+      scaleBytes: 50e9,
+    })
+  })
+
+  it('leaves out the pin when no clean could reach the threshold', () => {
+    expect(headroom(10e9, 0, 10e9, 30e9).pin).toBeNull()
+  })
+
+  it('never shows more selected than found', () => {
+    const h = headroom(10e9, 15e9, 10e9, 5e9)
+    expect([h.selected, h.found]).toEqual([50, 0])
+  })
+
+  it('draws an empty meter when nothing is free and nothing was found', () => {
+    expect(headroom(0, 0, 0, 30e9)).toEqual({ free: 0, selected: 0, found: 0, pin: null, scaleBytes: 0 })
+  })
+})
+
+describe('afterCleanText', () => {
+  it('says how much would be free after the clean', () => {
+    expect(afterCleanText(24e9, 18e9, 30e9)).toBe('Up to 42 GB free after this clean')
+  })
+
+  it('says when the clean would still leave the volume below its threshold', () => {
+    expect(afterCleanText(10e9, 5e9, 30e9)).toBe(
+      'Up to 15 GB free after this clean, still below your threshold',
+    )
+  })
+
+  it('says when nothing is selected', () => {
+    expect(afterCleanText(24e9, 0, 30e9)).toBe('Nothing selected yet')
   })
 })
 

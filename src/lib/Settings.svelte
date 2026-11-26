@@ -699,15 +699,15 @@
 
 <style>
   section .row {
-    margin: 6px 0;
+    margin: var(--space-xs) 0;
   }
   /* One option per row: label on the left, input and unit kept together on the right. */
   .field {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
-    column-gap: 12px;
-    margin: 6px 0;
+    column-gap: var(--space-sm);
+    margin: var(--space-xs) 0;
   }
   .field .wide {
     width: 100%;
@@ -719,48 +719,54 @@
   .control {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--space-xs);
     justify-self: end;
   }
   .unit {
-    color: var(--muted);
+    color: var(--color-muted);
     min-width: 52px;
   }
+  /* An age is a measurement, so it types in mono like the other figures. */
   .age {
     width: 80px;
+    font-family: var(--font-mono);
   }
   .age[aria-invalid='true'] {
-    border-color: var(--danger);
+    border-color: var(--color-error);
   }
   .check {
     cursor: pointer;
   }
   .choice {
     display: block;
-    margin: 6px 0;
+    margin: var(--space-xs) 0;
   }
   .wide {
     flex: 1;
     min-width: 240px;
   }
   .sub {
-    margin-top: 14px;
+    margin-top: var(--space-md);
+    font-size: var(--text-md);
   }
   .task {
-    border-top: 1px solid var(--line);
-    padding: 8px 0;
+    border-top: var(--rule-hair) solid var(--color-rule-2);
+    padding: var(--space-xs) 0;
   }
   .task:first-of-type {
     border-top: none;
   }
   .opts {
-    margin-left: 24px;
+    margin-left: var(--space-lg);
   }
+  /* Save stays in reach while the form scrolls, edge to edge like Clean's bar. */
   .footer {
-    margin-top: 14px;
+    margin: var(--space-lg) calc(-1 * var(--gutter)) 0;
     position: sticky;
     bottom: 0;
-    background: var(--bg);
-    padding: 10px 0;
+    z-index: var(--z-sticky);
+    background: var(--color-paper);
+    border-top: var(--rule-hair) solid var(--color-rule);
+    padding: var(--space-sm) var(--gutter);
   }
 </style>

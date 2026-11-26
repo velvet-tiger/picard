@@ -109,26 +109,44 @@
 {/if}
 
 <style>
+  /* A top bar: the hairline runs edge to edge, the tabs line up with the
+     content's left edge. The current tab is ink over a 2px orange rule. */
   .tabs {
     display: flex;
-    justify-content: center;
-    gap: 2px;
-    width: fit-content;
-    margin: 12px auto 0;
-    padding: 2px;
-    border: 1px solid var(--line);
-    border-radius: 7px;
-    background: var(--panel);
+    gap: var(--space-lg);
+    padding-inline: max(var(--gutter), calc((100% - var(--container)) / 2 + var(--gutter)));
+    border-bottom: var(--rule-hair) solid var(--color-rule);
   }
   .tabs button {
+    position: relative;
+    min-height: 40px;
+    padding: 0;
     border: none;
-    border-radius: 5px;
-    padding: 3px 18px;
-    background: transparent;
-    color: var(--text);
+    background: none;
+    color: var(--color-muted);
+    transition: color var(--dur-short) var(--ease-out);
+  }
+  .tabs button:hover {
+    background: none;
+    color: var(--color-ink);
+  }
+  .tabs button:active {
+    transform: none;
+    color: var(--color-ink-2);
   }
   .tabs button.selected {
-    background: var(--accent);
-    color: #fff;
+    color: var(--color-ink);
+  }
+  .tabs button.selected::after {
+    content: '';
+    position: absolute;
+    inset: auto 0 -1px 0;
+    height: 2px;
+    background: var(--color-accent);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .tabs button {
+      transition: none;
+    }
   }
 </style>
