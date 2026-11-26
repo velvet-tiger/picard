@@ -99,6 +99,10 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, tab: Tab) -> tauri::Result<()> {
 /// The page runs under the traffic lights, which float over the tab bar's
 /// left end. App.svelte pads the tabs clear of them and makes the bar the
 /// drag handle, so its height and padding must change with this position.
+///
+/// The y inset is not the buttons' top edge: AppKit keeps them a few points
+/// up from the bottom of their container. Measured in a screenshot, a y of 20
+/// centres them 18pt down, so 28 centres them on the 52px bar at 26pt.
 #[cfg(target_os = "macos")]
 fn without_title_strip<R: Runtime>(
     builder: WebviewWindowBuilder<'_, R, AppHandle<R>>,
@@ -106,7 +110,7 @@ fn without_title_strip<R: Runtime>(
     builder
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
-        .traffic_light_position(tauri::LogicalPosition::new(20.0, 20.0))
+        .traffic_light_position(tauri::LogicalPosition::new(20.0, 28.0))
 }
 
 /// The native theme for `appearance`. `None` lets macOS decide.
