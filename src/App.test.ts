@@ -55,12 +55,22 @@ describe('app.css', () => {
     expect(vars(':root:not([data-theme]) {')).toEqual(forced)
   })
 
-  // A scrollbar that appears only on tall tabs narrows them and shifts the
-  // centred tab bar. jsdom has no layout, so the rule itself is what we check.
+  // jsdom has no layout, so these check the rules themselves.
+  const rule = (selector: RegExp) => {
+    const start = css.search(selector)
+    expect(start, String(selector)).toBeGreaterThan(-1)
+    return css.slice(start, css.indexOf('}', start))
+  }
+
+  // A scrollbar that appears only on tall tabs would make them narrower than
+  // the others.
   it('always reserves the scrollbar track so every tab has the same width', () => {
-    const start = css.search(/^html\s*\{/m)
-    expect(start, 'html rule').toBeGreaterThan(-1)
-    const body = css.slice(start, css.indexOf('}', start))
-    expect(body).toMatch(/overflow-y:\s*scroll\s*;/)
+    expect(rule(/^\.scroll-area\s*\{/m)).toMatch(/overflow-y:\s*scroll\s*;/)
+  })
+
+  // The window has no title strip, so a page scrollbar would run up beside
+  // the tab bar. Only the area under the bar may scroll.
+  it('keeps the page still so the scrollbar starts under the tab bar', () => {
+    expect(rule(/^html,\s*body\s*\{/m)).toMatch(/overflow:\s*hidden\s*;/)
   })
 })

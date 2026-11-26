@@ -62,13 +62,30 @@
   }
 }
 
+/* The page itself never scrolls. The window has no title strip, so a page
+   scrollbar would run up beside the tab bar. App.svelte puts the tab bar on
+   top of #app and the tabs in .scroll-area below it, and only that scrolls. */
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
 /* Settings is taller than the window and the other tabs are not. Without a
-   permanent scrollbar track, Settings would be narrower and the tab bar would
-   move between tabs. scrollbar-gutter would do this too, but it needs macOS
-   15.2 and the app sets no minimum macOS version. Beside overflow-y: scroll,
-   overflow-x: clip computes to hidden on the root; the viewport scrolls
-   either way, so sticky footers keep working. */
-html {
+   permanent scrollbar track, Settings would be narrower than the others.
+   scrollbar-gutter would do this too, but it needs macOS 15.2 and the app
+   sets no minimum macOS version. Beside overflow-y: scroll, overflow-x: clip
+   computes to hidden; the area scrolls either way, so sticky footers, which
+   stick to it, keep working. */
+.scroll-area {
+  flex: 1;
+  min-height: 0;
   overflow-x: clip;
   overflow-y: scroll;
   scrollbar-color: var(--color-muted-2) var(--color-paper);
@@ -82,7 +99,6 @@ html {
 
 body {
   margin: 0;
-  overflow-x: clip;
   background: var(--color-paper);
   color: var(--color-ink);
   font-family: var(--font-body);

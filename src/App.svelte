@@ -86,26 +86,28 @@
       >
     {/each}
   </div>
-  {#if opened.clean}
-    <div role="tabpanel" id="panel-clean" aria-labelledby="tab-clean" hidden={active !== 'clean'}>
-      <Preview />
-    </div>
-  {/if}
-  {#if opened.settings}
-    <div
-      role="tabpanel"
-      id="panel-settings"
-      aria-labelledby="tab-settings"
-      hidden={active !== 'settings'}
-    >
-      <SettingsView bind:this={settingsView} />
-    </div>
-  {/if}
-  {#if opened.about}
-    <div role="tabpanel" id="panel-about" aria-labelledby="tab-about" hidden={active !== 'about'}>
-      <About />
-    </div>
-  {/if}
+  <div class="scroll-area">
+    {#if opened.clean}
+      <div role="tabpanel" id="panel-clean" aria-labelledby="tab-clean" hidden={active !== 'clean'}>
+        <Preview />
+      </div>
+    {/if}
+    {#if opened.settings}
+      <div
+        role="tabpanel"
+        id="panel-settings"
+        aria-labelledby="tab-settings"
+        hidden={active !== 'settings'}
+      >
+        <SettingsView bind:this={settingsView} />
+      </div>
+    {/if}
+    {#if opened.about}
+      <div role="tabpanel" id="panel-about" aria-labelledby="tab-about" hidden={active !== 'about'}>
+        <About />
+      </div>
+    {/if}
+  </div>
 {/if}
 
 <style>
@@ -113,14 +115,12 @@
      its drag handle. The traffic lights float over its left end:
      windows.rs insets them 20px and they end near 74px, so the tabs start
      clear of them, or at the content's left edge when that is further in.
-     The bar stays put so the page never scrolls under the buttons. The
-     hairline runs edge to edge. The current tab is ink over a 2px orange
-     rule. */
+     Only the .scroll-area below scrolls (see app.css), so the bar never
+     moves and the scrollbar starts under it. The hairline runs edge to edge.
+     The current tab is ink over a 2px orange rule. */
   .tabs {
     --traffic-lights: 92px;
-    position: sticky;
-    top: 0;
-    z-index: var(--z-sticky);
+    flex: none;
     display: flex;
     gap: var(--space-lg);
     padding-inline: max(var(--gutter), calc((100% - var(--container)) / 2 + var(--gutter)));
@@ -130,10 +130,6 @@
     );
     background: var(--color-paper);
     border-bottom: var(--rule-hair) solid var(--color-rule);
-  }
-  /* Keyboard focus scrolls a field into view below the bar, not under it. */
-  :global(html) {
-    scroll-padding-top: 53px;
   }
   .tabs button {
     position: relative;
