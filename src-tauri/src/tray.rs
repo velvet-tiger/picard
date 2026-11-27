@@ -312,14 +312,11 @@ fn restart_to_update<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         _ => Err("Picard is still starting. Try again in a moment.".to_string()),
     };
     if let Err(reason) = &restarted {
-        alert::show(
-            app,
-            Alert {
-                title: "Picard could not restart".to_string(),
-                body: reason.clone(),
-                actions: None,
-            },
-        );
+        alert::show(Alert {
+            title: "Picard could not restart".to_string(),
+            body: reason.clone(),
+            clean_button: false,
+        });
     }
     restarted
 }

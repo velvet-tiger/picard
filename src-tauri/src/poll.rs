@@ -25,10 +25,9 @@ use anyhow::{Context, Result};
 use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Manager, Runtime};
-use tauri_plugin_notification::{Action, ActionType, NotificationExt};
 
 use crate::alert::{self, Alert};
-use crate::windows::{self, Tab};
+use crate::windows;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -43,37 +42,6 @@ use crate::state::Shared;
 use crate::tray::{MenuView, Tray};
 use crate::updater;
 use crate::volume::{self, UnavailableRoot, UuidCache, Volume};
-
-/// The notification action type registered in `register_clean_action`.
-const LOW_SPACE_ACTIONS: &str = "picard-low-space";
-const CLEAN_ACTION: &str = "clean";
-/// What the plugin reports for a click on the notification itself.
-const TAP_ACTION: &str = "tap";
-
-/// Adds a Clean… button to Picard's notifications. The button, or a click on
-/// the notification itself, opens the Preview window, so nothing is deleted
-/// without the user seeing the list first.
-pub fn register_clean_action<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
-    let notifications = app.notification();
-    let clean = Action::builder(CLEAN_ACTION, "Clean…").build();
-    notifications
-        .register_action_types(vec![
-            ActionType::builder(LOW_SPACE_ACTIONS)
-                .actions(vec![clean])
-                .build(),
-        ])
-        .context("registering notification actions")?;
-    let handle = app.clone();
-    notifications
-        .on_action(move |performed| {
-            if matches!(performed.action_id(), CLEAN_ACTION | TAP_ACTION)
-                && let Err(e) = windows::open(&handle, Tab::Clean)
-            {
-                log::error!("could not open the Clean window from a notification: {e}");
-            }
-        })
-        .context("listening for notification actions")
-}
 
 /// Why the loop woke up early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -740,18 +708,14 @@ async fn scan_one<R: Runtime>(
     }
 }
 
-/// Shows a notification with the Clean… button. It replaces Picard's earlier
-/// notifications; `alert` says why.
-fn notify<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
+/// Shows a notification with the Clean… button, in place of the previous one.
+fn notify(title: &str, body: &str) {
     log::info!("alert: {title}: {body}");
-    alert::show(
-        app,
-        Alert {
-            title: title.to_string(),
-            body: body.to_string(),
-            actions: Some(LOW_SPACE_ACTIONS),
-        },
-    );
+    alert::show(Alert {
+        title: title.to_string(),
+        body: body.to_string(),
+        clean_button: true,
+    });
 }
 
 impl<R: Runtime> Poller<R> {
@@ -1146,7 +1110,7 @@ impl<R: Runtime> Poller<R> {
             let found = scan_one(app.clone(), shared, config, mount, mark).await;
             let cleanable = found.and_then(|f| f.first().map(|v| v.total_bytes));
             if let Some((title, body)) = message(cleanable) {
-                notify(&app, &title, &body);
+                notify(&title, &body);
             }
         });
     }
@@ -1241,7 +1205,7 @@ impl<R: Runtime> Poller<R> {
     }
 
     fn notify(&self, title: &str, body: &str) {
-        notify(&self.app, title, body);
+        notify(title, body);
     }
 
     /// Shows `view` in the menu and tells the open window to reload its disk

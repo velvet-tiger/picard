@@ -27,7 +27,6 @@ toml = "1.1.8"
 anyhow = "1.0.104"
 globset = "0.4.20"
 notify = "8.2.0"
-tauri-plugin-notification = "2"
 walkdir = "2.5.0"
 rayon = "1.12.0"
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -40,10 +39,12 @@ tauri-plugin-dialog = "2"
 tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
 trash = "5.2.9"
 
-# Only to clear delivered notifications (alert.rs). mac-notification-sys, under
-# tauri-plugin-notification, already links this version.
+# Notifications go through UNUserNotificationCenter directly (alert.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSUserNotification"] }
+objc2 = "0.6.5"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSError", "NSSet", "NSString"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "bitflags", "block2", "UNNotification", "UNNotificationAction", "UNNotificationCategory", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 
 [dev-dependencies]
 filetime = "0.2.29"
