@@ -6,9 +6,29 @@ All notable changes to Picard are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-28
+
 ### Added
 
+- Clean shows a headroom meter for each volume. The meter shows free space now, the space the selected items would free, the space still found, and the volume's low-space threshold.
 - `tool_caches` can now prune Go's caches. `go_build` runs `go clean -cache`, and `go_modules` runs `go clean -modcache`. Both are on by default once you add the task. After a module prune, Go downloads modules again, so set `go_modules = false` if you build Go offline. `[tools]` accepts a `go` path, and Picard now also looks for tools in `/usr/local/go/bin`, where the official Go installer puts `go`.
+
+### Changed
+
+- Picard now needs macOS 11.0 or later.
+- Alerts use the macOS notification centre. Each alert replaces the one before it. Picard asks for notification permission after you accept the first-run warning.
+- The window has no title strip. The tab bar is the top of the window, and you drag the window by it.
+- The window is redesigned in the Rim theme.
+
+### Fixed
+
+- The traffic lights sit centred on the tab bar. Only the content below the bar scrolls.
+- Unanswered alerts could pile up and hang the menu and window. Each new alert now removes Picard's earlier notifications first.
+- Config paths with `..` components are refused. A path such as `~/../..` can no longer resolve to an unexpected folder.
+
+### Security
+
+- `url` is updated to 2.5.9 to fix advisory AIKIDO-2026-464139.
 
 ## [1.0.0] - 2026-11-08
 
@@ -237,6 +257,7 @@ and removes build output and finished work when a drive runs low.
 - Disk image volume test (a918137).
 - Vitest tests for `api.ts`, Preview and Settings (5eeb28a).
 
+[1.1.0]: https://github.com/velvet-tiger/picard/releases/tag/v1.1.0
 [1.0.0]: https://github.com/velvet-tiger/picard/releases/tag/v1.0.0
 [0.10.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.10.0
 [0.9.0]: https://github.com/velvet-tiger/picard/releases/tag/v0.9.0
