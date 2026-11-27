@@ -1,4 +1,5 @@
 mod about;
+mod alert;
 pub mod cli;
 mod commands;
 mod config;
@@ -43,7 +44,6 @@ pub fn run() {
                 .rotation_strategy(RotationStrategy::KeepSome(LOG_FILES_KEPT))
                 .build(),
         )
-        .plugin(tauri_plugin_notification::init())
         // Used only from Rust (updater.rs); its JS commands are not granted.
         // The endpoint and public key come from tauri.conf.json.
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -94,10 +94,7 @@ pub fn run() {
             }
 
             let tray = tray::Tray::install(app.handle())?;
-            // Without the button, alerts still work; only the shortcut to Clean is lost.
-            if let Err(e) = poll::register_clean_action(app.handle()) {
-                log::error!("{e:#}");
-            }
+            alert::install(app.handle());
 
             // Capacity 16 is plenty: the loop drains the queue on every wake.
             let (tx, rx) = mpsc::channel(16);
@@ -149,6 +146,7 @@ pub fn run() {
                         return;
                     }
                 }
+                alert::request_permission();
                 tauri::async_runtime::spawn(poller.run(rx));
                 tauri::async_runtime::spawn(updater::run_in_background(handle, shared, updates));
             });
