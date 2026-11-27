@@ -27,6 +27,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_notification::{Action, ActionType, NotificationExt};
 
+use crate::alert::{self, Alert};
 use crate::windows::{self, Tab};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -739,19 +740,18 @@ async fn scan_one<R: Runtime>(
     }
 }
 
-/// Shows a notification with the Clean… button.
+/// Shows a notification with the Clean… button. It replaces Picard's earlier
+/// notifications; `alert` says why.
 fn notify<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
     log::info!("alert: {title}: {body}");
-    if let Err(e) = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .action_type_id(LOW_SPACE_ACTIONS)
-        .show()
-    {
-        log::error!("could not show notification {title:?}: {e}");
-    }
+    alert::show(
+        app,
+        Alert {
+            title: title.to_string(),
+            body: body.to_string(),
+            actions: Some(LOW_SPACE_ACTIONS),
+        },
+    );
 }
 
 impl<R: Runtime> Poller<R> {

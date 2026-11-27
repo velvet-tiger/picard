@@ -15,8 +15,8 @@ use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Runtime};
-use tauri_plugin_notification::NotificationExt;
 
+use crate::alert::{self, Alert};
 use crate::disk::{self, DiskSpace};
 use crate::poll;
 use crate::state::Shared;
@@ -311,15 +311,15 @@ fn restart_to_update<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         (Some(updates), Some(shared)) => updates.restart(app, &shared),
         _ => Err("Picard is still starting. Try again in a moment.".to_string()),
     };
-    if let Err(reason) = &restarted
-        && let Err(e) = app
-            .notification()
-            .builder()
-            .title("Picard could not restart")
-            .body(reason)
-            .show()
-    {
-        log::error!("could not show the restart notification: {e}");
+    if let Err(reason) = &restarted {
+        alert::show(
+            app,
+            Alert {
+                title: "Picard could not restart".to_string(),
+                body: reason.clone(),
+                actions: None,
+            },
+        );
     }
     restarted
 }

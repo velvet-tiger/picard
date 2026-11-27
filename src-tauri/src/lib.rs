@@ -1,4 +1,5 @@
 mod about;
+mod alert;
 pub mod cli;
 mod commands;
 mod config;

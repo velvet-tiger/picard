@@ -2885,6 +2885,7 @@ dependencies = [
  "libc",
  "log",
  "notify",
+ "objc2-foundation",
  "rayon",
  "serde",
  "serde_json",
